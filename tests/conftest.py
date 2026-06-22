@@ -312,6 +312,17 @@ def waitpkg_bin(test_fc_session_root_path):
 
 
 @pytest.fixture(scope="session")
+def alloc_bench_bin(test_fc_session_root_path):
+    """Build a memory allocation benchmark tool."""
+    alloc_bench_bin_path = os.path.join(test_fc_session_root_path, "alloc_bench")
+    build_tools.gcc_compile(
+        "host_tools/alloc_bench.c",
+        alloc_bench_bin_path,
+    )
+    yield alloc_bench_bin_path
+
+
+@pytest.fixture(scope="session")
 def msr_reader_bin(test_fc_session_root_path):
     """Build a binary that reads msrs"""
     msr_reader_bin_path = os.path.join(test_fc_session_root_path, "msr_reader")
