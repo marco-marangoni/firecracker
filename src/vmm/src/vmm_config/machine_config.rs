@@ -35,9 +35,9 @@ pub enum MachineConfigError {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HugePageConfig {
     /// Back guest memory by 4K pages, no hugepage behavior
-    #[default]
     None,
     /// Use madvise(MADV_HUGEPAGE) for transparent huge pages
+    #[default]
     Transparent,
     /// Back guest memory by 2MB hugetlbfs pages
     #[serde(rename = "2M")]
@@ -275,6 +275,13 @@ impl MachineConfig {
         }
 
         let mem_size_mib = update.mem_size_mib.unwrap_or(self.mem_size_mib);
+        // Always round up to the next 2MB multiple (i.e. next even MiB value).
+        let mem_size_mib = if mem_size_mib == 0 {
+            0
+        } else {
+            (mem_size_mib + 1) & !1
+        };
+        assert_eq!(mem_size_mib % 2, 0);
         let page_config = update.huge_pages.unwrap_or(self.huge_pages);
 
         if mem_size_mib == 0 || !page_config.is_valid_mem_size(mem_size_mib) {
