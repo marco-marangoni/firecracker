@@ -64,6 +64,14 @@ name = "uffd_fault_all_handler"
 path = "examples/uffd/fault_all_handler.rs"
 
 [[example]]
+name = "uffd_on_demand_2mib_handler"
+path = "examples/uffd/on_demand_2mib_handler.rs"
+
+[[example]]
+name = "uffd_on_demand_512kib_handler"
+path = "examples/uffd/on_demand_512kib_handler.rs"
+
+[[example]]
 name = "seccomp_harmless"
 path = "examples/seccomp/harmless.rs"
 
