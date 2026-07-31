@@ -1,0 +1,184 @@
+Subject: [PATCH] POC: prefetch adjacent ready pages from kvm
+---
+Index: arch/x86/include/asm/kvm_host.h
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+--- a/arch/x86/include/asm/kvm_host.h	(revision 502d801f0ab03e4f32f9a33d203154ce84887921)
++++ b/arch/x86/include/asm/kvm_host.h	(revision 2eb6dd80cc3699bfeecfa68a0dc28f82f54e927a)
+@@ -1722,6 +1722,9 @@
+ 	u64 pf_fast;
+ 	u64 pf_mmio_spte_created;
+ 	u64 pf_guest;
++	u64 pf_prefetch_called;
++	u64 pf_prefetch_pages;
++	u64 pf_prefetch_mapped;
+ 	u64 tlb_flush;
+ 	u64 invlpg;
+
+Index: arch/x86/kvm/mmu/mmu.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+--- a/arch/x86/kvm/mmu/mmu.c	(revision 502d801f0ab03e4f32f9a33d203154ce84887921)
++++ b/arch/x86/kvm/mmu/mmu.c	(revision 2eb6dd80cc3699bfeecfa68a0dc28f82f54e927a)
+@@ -119,8 +119,6 @@
+ static int tdp_root_level __read_mostly;
+ static int max_tdp_level __read_mostly;
+
+-#define PTE_PREFETCH_NUM		8
+-
+ #include <trace/events/kvm.h>
+
+ /* make pte_list_desc fit well in cache lines */
+Index: arch/x86/kvm/mmu/mmu_internal.h
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/arch/x86/kvm/mmu/mmu_internal.h b/arch/x86/kvm/mmu/mmu_internal.h
+--- a/arch/x86/kvm/mmu/mmu_internal.h	(revision 502d801f0ab03e4f32f9a33d203154ce84887921)
++++ b/arch/x86/kvm/mmu/mmu_internal.h	(revision 2eb6dd80cc3699bfeecfa68a0dc28f82f54e927a)
+@@ -16,6 +16,10 @@
+
+ /* Page table builder macros common to shadow (host) PTEs and guest PTEs. */
+ #define __PT_BASE_ADDR_MASK GENMASK_ULL(51, 12)
++
++/* Number of adjacent SPTEs to prefetch when handling a page fault. */
++#define PTE_PREFETCH_NUM		8
++
+ #define __PT_LEVEL_SHIFT(level, bits_per_level)	\
+ 	(PAGE_SHIFT + ((level) - 1) * (bits_per_level))
+ #define __PT_INDEX(address, level, bits_per_level) \
+Index: arch/x86/kvm/mmu/tdp_mmu.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+--- a/arch/x86/kvm/mmu/tdp_mmu.c	(revision 502d801f0ab03e4f32f9a33d203154ce84887921)
++++ b/arch/x86/kvm/mmu/tdp_mmu.c	(revision 2eb6dd80cc3699bfeecfa68a0dc28f82f54e927a)
+@@ -1209,6 +1209,90 @@
+ static int tdp_mmu_split_huge_page(struct kvm *kvm, struct tdp_iter *iter,
+ 				   struct kvm_mmu_page *sp, bool shared);
+
++/*
++ * Prefetch adjacent SPTEs after handling a TDP page fault.  Scans empty SPTEs
++ * in the same page table around the faulting entry and, for each one whose
++ * host page is already present (non-blocking GUP), atomically installs an EPT
++ * mapping.  This eliminates future VM-exits for pages that were populated in
++ * the host (e.g. via a large UFFDIO_COPY) but not yet mapped in EPT.
++ */
++static void tdp_mmu_pte_prefetch(struct kvm_vcpu *vcpu,
++				 struct kvm_page_fault *fault,
++				 struct tdp_iter *iter)
++{
++	struct kvm_mmu_page *sp = sptep_to_sp(rcu_dereference(iter->sptep));
++	struct kvm_memory_slot *slot = fault->slot;
++	struct page *pages[PTE_PREFETCH_NUM];
++	unsigned int access = sp->role.access;
++	int start_idx, i;
++	gfn_t start_gfn;
++	int nr_pages;
++	u64 *sptep;
++
++	if (sp_ad_disabled(sp))
++		return;
++
++	if (unlikely(vcpu->kvm->mmu_invalidate_in_progress))
++		return;
++
++	/*
++	 * Determine the prefetch window: PTE_PREFETCH_NUM entries aligned
++	 * around the faulting SPTE within the same page table.
++	 */
++	start_idx = spte_index(rcu_dereference(iter->sptep)) &
++		    ~(PTE_PREFETCH_NUM - 1);
++
++	/* For direct (TDP) level-1 SPs: gfn = sp->gfn + index */
++	start_gfn = sp->gfn + start_idx;
++
++	/*
++	 * Non-blocking GUP: only resolves pages already present in host
++	 * page tables.  Returns 0 if none are available.
++	 */
++	nr_pages = kvm_prefetch_pages(slot, start_gfn, pages, PTE_PREFETCH_NUM);
++	if (nr_pages <= 0)
++		return;
++
++	vcpu->stat.pf_prefetch_called++;
++	vcpu->stat.pf_prefetch_pages += nr_pages;
++
++	sptep = sp->spt + start_idx;
++	for (i = 0; i < nr_pages; i++, sptep++) {
++		u64 old_spte = READ_ONCE(*sptep);
++		gfn_t gfn = start_gfn + i;
++		u64 new_spte;
++
++		/* Skip entries that are already present or the faulting entry. */
++		if (is_shadow_present_pte(old_spte) ||
++		    sptep == rcu_dereference(iter->sptep)) {
++			kvm_release_page_dirty(pages[i]);
++			continue;
++		}
++
++		/* Skip entries that aren't the standard non-present value. */
++		if (old_spte != SHADOW_NONPRESENT_VALUE) {
++			kvm_release_page_dirty(pages[i]);
++			continue;
++		}
++
++		make_spte(vcpu, sp, slot, access, gfn, page_to_pfn(pages[i]),
++			  old_spte, true /* prefetch */, false, true, &new_spte);
++
++		/*
++		 * Atomically install the SPTE only if it's still empty.
++		 * If another thread raced us, just move on.
++		 */
++		if (try_cmpxchg64(sptep, &old_spte, new_spte)) {
++			handle_changed_spte(vcpu->kvm, sp, gfn,
++					    SHADOW_NONPRESENT_VALUE, new_spte,
++					    PG_LEVEL_4K, true);
++			vcpu->stat.pf_prefetch_mapped++;
++		}
++
++		kvm_release_page_dirty(pages[i]);
++	}
++}
++
+ /*
+  * Handle a TDP page fault (NPT/EPT violation/misconfiguration) by installing
+  * page tables and SPTEs to translate the faulting guest physical address.
+@@ -1297,6 +1381,10 @@
+ map_target_level:
+ 	ret = tdp_mmu_map_handle_target_level(vcpu, fault, &iter);
+
++	if (ret == RET_PF_FIXED && fault->goal_level == PG_LEVEL_4K &&
++	    !fault->prefetch && fault->slot)
++		tdp_mmu_pte_prefetch(vcpu, fault, &iter);
++
+ retry:
+ 	rcu_read_unlock();
+ 	return ret;
+Index: arch/x86/kvm/x86.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+--- a/arch/x86/kvm/x86.c	(revision 502d801f0ab03e4f32f9a33d203154ce84887921)
++++ b/arch/x86/kvm/x86.c	(revision 2eb6dd80cc3699bfeecfa68a0dc28f82f54e927a)
+@@ -270,6 +270,9 @@
+ 	STATS_DESC_COUNTER(VCPU, pf_fast),
+ 	STATS_DESC_COUNTER(VCPU, pf_mmio_spte_created),
+ 	STATS_DESC_COUNTER(VCPU, pf_guest),
++	STATS_DESC_COUNTER(VCPU, pf_prefetch_called),
++	STATS_DESC_COUNTER(VCPU, pf_prefetch_pages),
++	STATS_DESC_COUNTER(VCPU, pf_prefetch_mapped),
+ 	STATS_DESC_COUNTER(VCPU, tlb_flush),
+ 	STATS_DESC_COUNTER(VCPU, invlpg),
+ 	STATS_DESC_COUNTER(VCPU, exits),
