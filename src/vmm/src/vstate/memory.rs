@@ -753,14 +753,33 @@ impl GuestRegionMmapExt {
                     Ok(())
                 }
             }
-            // Match either the case of an anonymous mapping, or the case
-            // of a shared file mapping.
-            // TODO: madvise(MADV_DONTNEED) doesn't actually work with memfd
-            // (or in general MAP_SHARED of a fd). In those cases we should use
-            // fallocate64(FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE).
-            // We keep falling to the madvise branch to keep the previous behaviour.
+            // MAP_SHARED with a file backing (memfd): use fallocate to punch a hole.
+            // MADV_DONTNEED on MAP_SHARED doesn't release pages back to the system;
+            // fallocate(PUNCH_HOLE) actually deallocates the file blocks.
+            (Some(file_offset), flags) if flags & libc::MAP_SHARED != 0 => {
+                let fd = file_offset.file().as_raw_fd();
+                let offset = file_offset.start() as libc::off_t
+                    + caddr.raw_value() as libc::off_t;
+                // SAFETY: fd is valid, offset and len describe a range within the memfd.
+                let ret = unsafe {
+                    libc::fallocate(
+                        fd,
+                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                        offset,
+                        len as libc::off_t,
+                    )
+                };
+                if ret < 0 {
+                    let os_error = std::io::Error::last_os_error();
+                    error!("discard_range: fallocate punch hole failed: {:?}", os_error);
+                    Err(GuestMemoryError::IOError(os_error))
+                } else {
+                    Ok(())
+                }
+            }
+            // Anonymous mapping without file backing (shouldn't happen after our change,
+            // but kept for safety).
             _ => {
-                // Madvise the region in order to mark it as not used.
                 // SAFETY: The address and length are known to be valid.
                 let ret = unsafe { libc::madvise(phys_address.cast(), len, libc::MADV_DONTNEED) };
                 if ret < 0 {
@@ -882,19 +901,14 @@ pub fn memfd_backed(
     )
 }
 
-/// Creates a GuestMemoryMmap from raw regions.
+/// Creates a GuestMemoryMmap from raw regions backed by a memfd with MAP_SHARED.
 pub fn anonymous(
     regions: impl Iterator<Item = (GuestAddress, usize)>,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
 ) -> Result<Vec<GuestRegionMmap>, MemoryError> {
-    create(
-        regions,
-        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | huge_pages.mmap_flags(),
-        None,
-        track_dirty_pages,
-        huge_pages.madvise_flags(),
-    )
+    let regions: Vec<_> = regions.collect();
+    memfd_backed(&regions, track_dirty_pages, huge_pages)
 }
 
 /// Creates a GuestMemoryMmap given a `file` containing the data
@@ -1765,12 +1779,9 @@ mod tests {
             GuestMemoryError::InvalidGuestAddress(_)
         );
 
-        // Madvise fail: the guest address is not aligned to the page size.
-        assert_match!(
-            mem.discard_range(GuestAddress(0x20), page_size)
-                .unwrap_err(),
-            GuestMemoryError::IOError(_)
-        );
+        // With fallocate-based discard (memfd+MAP_SHARED), unaligned offsets don't fail;
+        // fallocate rounds the range to page boundaries and succeeds (though it may be a no-op).
+        mem.discard_range(GuestAddress(0x20), page_size).unwrap();
     }
 
     #[test]
