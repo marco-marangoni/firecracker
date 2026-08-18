@@ -3,11 +3,14 @@
 """Performance benchmark for snapshot restore."""
 
 import re
+import shutil
 import signal
+import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 
 import pytest
 
@@ -19,7 +22,61 @@ USEC_IN_MSEC = 1000
 NS_IN_MSEC = 1_000_000
 ITERATIONS = 30
 
+# Configuration for the `sync_snapshot_files` create-latency comparison.
+#
+# This test must run against a disk-backed filesystem (see the
+# `snapshot_chroot_on_disk` fixture): devctr mounts the default jailer chroot
+# base (/srv) as tmpfs, where fsync is a no-op (mm/shmem.c -> noop_fsync), so
+# the flag would show no effect there.
+#
+# On the real (EBS-backed ext4) filesystem, fsync costs roughly ~4s/GiB, so we
+# keep the guest memory modest and the iteration count low to bound runtime:
+# each `sync` iteration blocks for ~mem_size * 4s/GiB.
+SYNC_TEST_MEM_MIB = 4 * 1024
+SYNC_TEST_VCPUS = 4
+SYNC_TEST_ITERATIONS = 5
+
 pytestmark = pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+
+
+@pytest.fixture
+def snapshot_chroot_on_disk(worker_id):
+    """Yield a jailer chroot base on a real (non-tmpfs) filesystem.
+
+    devctr mounts /srv (the default chroot base) as tmpfs, where fsync is a
+    no-op, so the `sync_snapshot_files` flag has nothing to measure. The repo is
+    bind-mounted into the container from the host disk, so the backing directory
+    lives under build/, which is EBS-backed ext4 and honours fsync.
+
+    The chroot is exposed via a short symlink at the filesystem root: the jailer
+    appends `<exec>/<uuid>/root/run/firecracker.socket` to the base, and AF_UNIX
+    socket paths are capped at 108 bytes, so the long build/ path would overflow
+    `sun_path` ("AF_UNIX path too long").
+
+    Cleanup is done up-front rather than at teardown: `microvm_factory` reads each
+    VM's log from under this chroot during its own teardown, and fixtures finalize
+    in reverse setup order, so deleting here at teardown would race and remove the
+    logs first. The framework removes each VM's chroot dir on kill; we only clear
+    any stale leftovers before the run.
+    """
+    backing = Path(__file__).resolve().parents[3] / "build" / f"jailer_disk_{worker_id}"
+    short = Path(f"/jd_{worker_id}")
+
+    # Clear leftovers from a previous run (safe: no VM is using them yet).
+    shutil.rmtree(backing, ignore_errors=True)
+    short.unlink(missing_ok=True)
+
+    backing.mkdir(parents=True, exist_ok=True)
+    fstype = subprocess.check_output(
+        ["findmnt", "-no", "FSTYPE", "--target", str(backing)], text=True
+    ).strip()
+    assert (
+        fstype != "tmpfs"
+    ), f"{backing} is on tmpfs ({fstype}); fsync would be a no-op and the test is meaningless"
+
+    short.symlink_to(backing)
+    yield short
+
 
 
 @lru_cache
@@ -300,4 +357,70 @@ def test_snapshot_create_latency(
         fc_metrics = vm.flush_metrics()
 
         value = fc_metrics["latencies_us"][metric] / USEC_IN_MSEC
+        metrics.put_metric("latency", value, "Milliseconds")
+
+
+@pytest.mark.nonci
+@pytest.mark.parametrize(
+    "sync_snapshot_files", [True, False], ids=["sync", "nosync"]
+)
+def test_snapshot_create_sync_latency(
+    microvm_factory,
+    guest_kernel,
+    rootfs,
+    pci_enabled,
+    metrics,
+    sync_snapshot_files,
+    snapshot_chroot_on_disk,
+):
+    """Measure full-snapshot creation latency with the snapshot-file fsync on/off.
+
+    The ``sync_snapshot_files`` flag controls whether the snapshot state file
+    and the (guest-memory-sized) memory file are ``fsync``'d before the
+    ``PUT /snapshot/create`` request returns. This test takes repeated full
+    snapshots of a large VM for both settings and emits the internal
+    ``full_create_snapshot`` latency, tagged with a ``sync_snapshot_files``
+    dimension.
+
+    The microVM is jailed on a disk-backed filesystem (``snapshot_chroot_on_disk``)
+    rather than the default tmpfs ``/srv``, otherwise ``fsync`` is a no-op and the
+    flag has no measurable effect.
+
+    Run both parametrizations and compare the ``latency`` metric: the ``nosync``
+    variant should be dramatically faster, since it skips the fsync of the large
+    memory file. Note the block-device fsync in ``prepare_save`` happens for
+    both settings, so this delta isolates exactly what the flag controls.
+    """
+    vm = microvm_factory.build(
+        guest_kernel,
+        rootfs,
+        monitor_memory=False,
+        pci=pci_enabled,
+        jailer_kwargs={"chroot_base": snapshot_chroot_on_disk},
+    )
+    vm.spawn()
+    vm.basic_config(
+        vcpu_count=SYNC_TEST_VCPUS,
+        mem_size_mib=SYNC_TEST_MEM_MIB,
+    )
+    vm.start()
+    vm.pin_threads(0)
+
+    metrics.set_dimensions(
+        {
+            **vm.dimensions,
+            "performance_test": "test_snapshot_create_sync_latency",
+            "snapshot_type": str(SnapshotType.FULL),
+            "sync_snapshot_files": str(sync_snapshot_files),
+        }
+    )
+
+    for _ in range(SYNC_TEST_ITERATIONS):
+        vm.make_snapshot(
+            SnapshotType.FULL,
+            sync_snapshot_files=sync_snapshot_files,
+        )
+        fc_metrics = vm.flush_metrics()
+
+        value = fc_metrics["latencies_us"]["full_create_snapshot"] / USEC_IN_MSEC
         metrics.put_metric("latency", value, "Milliseconds")
