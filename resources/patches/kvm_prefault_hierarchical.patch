@@ -1,0 +1,258 @@
+Subject: [PATCH] POC: prefetch hierarchically
+POC: prefetch adjacent ready pages from kvm
+---
+Index: arch/x86/include/asm/kvm_host.h
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+--- a/arch/x86/include/asm/kvm_host.h	(revision 502d801f0ab03e4f32f9a33d203154ce84887921)
++++ b/arch/x86/include/asm/kvm_host.h	(revision 2eb6dd80cc3699bfeecfa68a0dc28f82f54e927a)
+@@ -1722,6 +1722,9 @@
+ 	u64 pf_fast;
+ 	u64 pf_mmio_spte_created;
+ 	u64 pf_guest;
++	u64 pf_prefetch_called;
++	u64 pf_prefetch_pages;
++	u64 pf_prefetch_mapped;
+ 	u64 tlb_flush;
+ 	u64 invlpg;
+ 
+Index: arch/x86/kvm/mmu/mmu.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+--- a/arch/x86/kvm/mmu/mmu.c	(revision 502d801f0ab03e4f32f9a33d203154ce84887921)
++++ b/arch/x86/kvm/mmu/mmu.c	(revision 2eb6dd80cc3699bfeecfa68a0dc28f82f54e927a)
+@@ -119,8 +119,6 @@
+ static int tdp_root_level __read_mostly;
+ static int max_tdp_level __read_mostly;
+ 
+-#define PTE_PREFETCH_NUM		8
+-
+ #include <trace/events/kvm.h>
+ 
+ /* make pte_list_desc fit well in cache lines */
+Index: arch/x86/kvm/mmu/mmu_internal.h
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/arch/x86/kvm/mmu/mmu_internal.h b/arch/x86/kvm/mmu/mmu_internal.h
+--- a/arch/x86/kvm/mmu/mmu_internal.h	(revision 502d801f0ab03e4f32f9a33d203154ce84887921)
++++ b/arch/x86/kvm/mmu/mmu_internal.h	(revision 07c28e381c266e9154114ef82e7800acb61f1974)
+@@ -16,6 +16,16 @@
+ 
+ /* Page table builder macros common to shadow (host) PTEs and guest PTEs. */
+ #define __PT_BASE_ADDR_MASK GENMASK_ULL(51, 12)
++
++/* Number of adjacent SPTEs to prefetch when handling a page fault. */
++#define PTE_PREFETCH_NUM		8
++
++/*
++ * Maximum order (log2 of the number of 4KiB pages) for hierarchical buddy
++ * prefetch.  Order 9 == 512 pages == 2MiB, i.e. a full level-1 TDP page table.
++ */
++#define PTE_PREFETCH_MAX_ORDER		9
++
+ #define __PT_LEVEL_SHIFT(level, bits_per_level)	\
+ 	(PAGE_SHIFT + ((level) - 1) * (bits_per_level))
+ #define __PT_INDEX(address, level, bits_per_level) \
+Index: arch/x86/kvm/mmu/tdp_mmu.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+--- a/arch/x86/kvm/mmu/tdp_mmu.c	(revision 502d801f0ab03e4f32f9a33d203154ce84887921)
++++ b/arch/x86/kvm/mmu/tdp_mmu.c	(revision 07c28e381c266e9154114ef82e7800acb61f1974)
+@@ -1209,6 +1209,157 @@
+ static int tdp_mmu_split_huge_page(struct kvm *kvm, struct tdp_iter *iter,
+ 				   struct kvm_mmu_page *sp, bool shared);
+ 
++/*
++ * Try to prefetch and map a contiguous run of @count empty SPTEs starting at
++ * index @start_idx within @sp.  Uses non-blocking GUP so only host pages that
++ * are already present are resolved; mapping stops at the first page in the run
++ * that is not present in the host.
++ *
++ * Returns the number of leading pages in the run that were present in the host.
++ * A return value == @count means the entire run is backed and mapped (modulo
++ * SPTEs that were already present or lost a race); anything less indicates a
++ * hole and that expansion to a larger order should stop.
++ */
++static int tdp_mmu_prefetch_range(struct kvm_vcpu *vcpu,
++				  struct kvm_page_fault *fault,
++				  struct kvm_mmu_page *sp,
++				  int start_idx, int count)
++{
++	struct kvm_memory_slot *slot = fault->slot;
++	unsigned int access = sp->role.access;
++	int present = 0;
++	int done = 0;
++
++	/*
++	 * Walk the run in PTE_PREFETCH_NUM-sized batches to keep the on-stack
++	 * page array small; a full 2MiB run would otherwise need 512 struct
++	 * page pointers.
++	 */
++	while (done < count) {
++		struct page *pages[PTE_PREFETCH_NUM];
++		int batch = min(count - done, (int)PTE_PREFETCH_NUM);
++		gfn_t batch_gfn = sp->gfn + start_idx + done;
++		int nr, i;
++
++		nr = kvm_prefetch_pages(slot, batch_gfn, pages, batch);
++		if (nr <= 0)
++			break;
++
++		vcpu->stat.pf_prefetch_pages += nr;
++
++		for (i = 0; i < nr; i++) {
++			u64 *sptep = sp->spt + start_idx + done + i;
++			u64 old_spte = READ_ONCE(*sptep);
++			gfn_t gfn = batch_gfn + i;
++			u64 new_spte;
++
++			/*
++			 * Skip entries that are already present or that hold a
++			 * non-standard value (MMIO, frozen, ...).  The host page
++			 * still counts as present for the purpose of deciding
++			 * whether to expand to a larger order.
++			 */
++			if (is_shadow_present_pte(old_spte) ||
++			    old_spte != SHADOW_NONPRESENT_VALUE) {
++				kvm_release_page_dirty(pages[i]);
++				continue;
++			}
++
++			make_spte(vcpu, sp, slot, access, gfn,
++				  page_to_pfn(pages[i]), old_spte,
++				  true /* prefetch */, false, true, &new_spte);
++
++			/*
++			 * Atomically install the SPTE only if it's still empty.
++			 * If another thread raced us, just move on.
++			 */
++			if (try_cmpxchg64(sptep, &old_spte, new_spte)) {
++				handle_changed_spte(vcpu->kvm, sp, gfn,
++						    SHADOW_NONPRESENT_VALUE,
++						    new_spte, PG_LEVEL_4K, true);
++				vcpu->stat.pf_prefetch_mapped++;
++			}
++
++			kvm_release_page_dirty(pages[i]);
++		}
++
++		present += nr;
++		done += batch;
++
++		/* A short GUP result means a hole in host presence. */
++		if (nr < batch)
++			break;
++	}
++
++	return present;
++}
++
++/*
++ * Hierarchically prefetch adjacent SPTEs after handling a TDP page fault.
++ *
++ * Rather than probing a fixed window, expand the mapped region in power-of-two
++ * (buddy) steps around the faulting page: 8KiB, 16KiB, 32KiB, ... up to 2MiB
++ * (PTE_PREFETCH_MAX_ORDER).  At each order, probe the sibling half of the
++ * current naturally-aligned block that does not contain the faulting page, and
++ * only advance to the next larger order when every page in that sibling half is
++ * already present in the host.
++ *
++ * This mirrors how mTHP and userfaultfd hand back naturally aligned,
++ * power-of-two sized chunks: as soon as a buddy half is only partially
++ * populated we stop, avoiding pointless GUP attempts on unpopulated memory
++ * while still opportunistically mapping whole chunks of any size in one fault.
++ *
++ * A full level-1 TDP page table covers exactly 512 pages (2MiB) aligned to
++ * 2MiB, so the largest order stays within a single page table.
++ */
++static void tdp_mmu_pte_prefetch(struct kvm_vcpu *vcpu,
++				 struct kvm_page_fault *fault,
++				 struct tdp_iter *iter)
++{
++	struct kvm_mmu_page *sp = sptep_to_sp(rcu_dereference(iter->sptep));
++	int fault_idx;
++	int order;
++
++	if (sp_ad_disabled(sp))
++		return;
++
++	if (unlikely(vcpu->kvm->mmu_invalidate_in_progress))
++		return;
++
++	fault_idx = spte_index(rcu_dereference(iter->sptep));
++
++	vcpu->stat.pf_prefetch_called++;
++
++	for (order = 1; order <= PTE_PREFETCH_MAX_ORDER; order++) {
++		int block_size = 1 << order;
++		int block_start = fault_idx & ~(block_size - 1);
++		int prev_size = 1 << (order - 1);
++		int prev_start = fault_idx & ~(prev_size - 1);
++		int sibling_start;
++		int present;
++
++		/*
++		 * The order-(k-1) block containing the faulting page is exactly
++		 * one aligned half of the order-k block.  The pages to newly
++		 * probe are therefore the other (sibling) half: prev_size pages.
++		 */
++		if (prev_start == block_start)
++			sibling_start = block_start + prev_size; /* upper half */
++		else
++			sibling_start = block_start;		 /* lower half */
++
++		present = tdp_mmu_prefetch_range(vcpu, fault, sp,
++						 sibling_start, prev_size);
++
++		/*
++		 * Stop growing as soon as the sibling half isn't fully backed;
++		 * a larger buddy block cannot be fully present either.
++		 */
++		if (present < prev_size)
++			break;
++	}
++}
++
+ /*
+  * Handle a TDP page fault (NPT/EPT violation/misconfiguration) by installing
+  * page tables and SPTEs to translate the faulting guest physical address.
+@@ -1297,6 +1448,10 @@
+ map_target_level:
+ 	ret = tdp_mmu_map_handle_target_level(vcpu, fault, &iter);
+ 
++	if (ret == RET_PF_FIXED && fault->goal_level == PG_LEVEL_4K &&
++	    !fault->prefetch && fault->slot)
++		tdp_mmu_pte_prefetch(vcpu, fault, &iter);
++
+ retry:
+ 	rcu_read_unlock();
+ 	return ret;
+Index: arch/x86/kvm/x86.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+--- a/arch/x86/kvm/x86.c	(revision 502d801f0ab03e4f32f9a33d203154ce84887921)
++++ b/arch/x86/kvm/x86.c	(revision 2eb6dd80cc3699bfeecfa68a0dc28f82f54e927a)
+@@ -270,6 +270,9 @@
+ 	STATS_DESC_COUNTER(VCPU, pf_fast),
+ 	STATS_DESC_COUNTER(VCPU, pf_mmio_spte_created),
+ 	STATS_DESC_COUNTER(VCPU, pf_guest),
++	STATS_DESC_COUNTER(VCPU, pf_prefetch_called),
++	STATS_DESC_COUNTER(VCPU, pf_prefetch_pages),
++	STATS_DESC_COUNTER(VCPU, pf_prefetch_mapped),
+ 	STATS_DESC_COUNTER(VCPU, tlb_flush),
+ 	STATS_DESC_COUNTER(VCPU, invlpg),
+ 	STATS_DESC_COUNTER(VCPU, exits),
