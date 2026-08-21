@@ -179,13 +179,10 @@ impl MsixConfig {
     ///
     /// Must be called after the GSI routes have been set up (see [KvmVm::set_gsi_routes]).
     pub fn enable_unmasked_vectors(&self) -> Result<(), InterruptError> {
-        if self.enabled && !self.masked {
-            for (idx, table_entry) in self.table_entries.iter().enumerate() {
-                if !table_entry.masked() {
-                    self.vectors.vectors[idx].enable(&self.vectors.vm.common.fd)?;
-                }
-            }
-        }
+        // PoC: vectors are enabled lazily on their first `trigger`, so nothing is
+        // eagerly registered with KVM here. The restore path still calls this to
+        // preserve the existing contract; the actual irqfd registration is
+        // deferred until an interrupt is triggered for the vector.
         Ok(())
     }
 

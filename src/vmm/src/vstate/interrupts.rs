@@ -103,9 +103,19 @@ impl MsixVectorGroup {
 
     /// Trigger an interrupt for a vector in the group
     pub fn trigger(&self, index: usize) -> Result<(), InterruptError> {
-        self.notifier(index)
-            .ok_or(InterruptError::InvalidVectorIndex(index))?
-            .write(1)?;
+        let vector = self
+            .vectors
+            .get(index)
+            .ok_or(InterruptError::InvalidVectorIndex(index))?;
+
+        // PoC: lazily enable the vector (register its irqfd with KVM) the first
+        // time it is triggered, rather than eagerly enabling it during MSI-X
+        // config updates. `MsixVector::enable` is idempotent via the internal
+        // `enabled` flag, so subsequent triggers skip re-registration and go
+        // straight to writing the eventfd.
+        vector.enable(&self.vm.common.fd)?;
+
+        vector.event_fd.write(1)?;
         METRICS.interrupts.triggers.inc();
         Ok(())
     }
@@ -183,13 +193,12 @@ impl MsixVectorGroup {
             .set_gsi_routes()
             .map_err(|err| std::io::Error::other(format!("MSI-X update: {err}")))?;
 
-        // Enables unmasked. Must be done after set_gsi_routes to avoid panic on kernel
-        // which does not have commit a80ced6ea514 (KVM: SVM: fix panic on out-of-bounds guest IRQ).
-        for (idx, vector) in vectors.iter().enumerate() {
-            if !table_entries[idx].masked() {
-                vector.enable(&self.vm.common.fd)?;
-            }
-        }
+        // PoC: unmasked vectors are no longer eagerly enabled here. The irqfd is
+        // registered with KVM lazily on the first `trigger` for the vector. This
+        // also sidesteps the historical need to enable after `set_gsi_routes` to
+        // avoid a panic on kernels missing commit a80ced6ea514
+        // (KVM: SVM: fix panic on out-of-bounds guest IRQ), since by the time an
+        // interrupt is triggered the routes are already in place.
 
         Ok(())
     }
