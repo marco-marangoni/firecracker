@@ -55,7 +55,7 @@ pub struct CreateSnapshotParams {
 
 /// Default value for [CreateSnapshotParams::sync_snapshot_files].
 fn default_sync_snapshot_files() -> bool {
-    true
+    false
 }
 
 /// Allows for changing the mapping between tap devices and host devices
