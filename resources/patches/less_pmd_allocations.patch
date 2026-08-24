@@ -1,0 +1,32 @@
+Subject: [PATCH] Avoid useless PMD allocations
+---
+Index: mm/huge_memory.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+--- a/mm/huge_memory.c	(revision 1b18df17f7ed90b7c4250e8572171df2abaa36c1)
++++ b/mm/huge_memory.c	(revision 319736a784e4bb94ed3c8392f0843f5871deff32)
+@@ -1332,6 +1332,21 @@
+ 	pgtable_t pgtable;
+ 	vm_fault_t ret = 0;
+ 
++	/*
++	 * If userfaultfd is tracking missing pages, deliver the fault to
++	 * userspace before allocating anything.  Otherwise a PMD-order write
++	 * fault allocates and zeroes a full huge folio only to free it again
++	 * under the page table lock once VM_UFFD_MISSING is noticed below,
++	 * wasting a 2MiB clear on every such fault -- e.g. userfaultfd-based
++	 * snapshot restore of THP-backed guest memory.  vm_flags is stable
++	 * under mmap_lock (held for the fault), and handle_userfault()
++	 * re-validates that the PMD is still missing, so this early, unlocked
++	 * check is safe.  The locked check below is retained as a backstop for
++	 * a racing UFFDIO_REGISTER between here and the pmd_lock().
++	 */
++	if (userfaultfd_missing(vma))
++		return handle_userfault(vmf, VM_UFFD_MISSING);
++
+ 	folio = vma_alloc_anon_folio_pmd(vma, vmf->address);
+ 	if (unlikely(!folio))
+ 		return VM_FAULT_FALLBACK;
