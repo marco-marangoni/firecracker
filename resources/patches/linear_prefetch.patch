@@ -1,0 +1,287 @@
+Subject: [PATCH] Linear prefetch
+---
+Index: arch/x86/include/asm/kvm_host.h
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+--- a/arch/x86/include/asm/kvm_host.h	(revision 502d801f0ab03e4f32f9a33d203154ce84887921)
++++ b/arch/x86/include/asm/kvm_host.h	(revision 9124c27ccdd54def167ee5b1e47e45ee11f24477)
+@@ -897,6 +897,19 @@
+ 	 */
+ 	struct kvm_mmu_memory_cache mmu_external_spt_cache;
+ 
++	/*
++	 * Scratch array of SPTE_ENT_PER_PAGE (512) page pointers used to hold
++	 * the result of a single wide GUP during TDP fault-time prefetch.  One
++	 * page, allocated per-vCPU in kvm_mmu_create().
++	 *
++	 * Lock-free: accessed only by the owning vCPU thread from the fault
++	 * path (kvm_tdp_mmu_map()), which never runs concurrently with itself
++	 * (serialized by vcpu->mutex / the loaded-vCPU model) and is
++	 * non-reentrant and non-sleeping while the array is live.  Must not be
++	 * used from any non-vCPU context (e.g. zap/mmu-notifier workers).
++	 */
++	struct page **mmu_prefetch_pages;
++
+ 	/*
+ 	 * QEMU userspace and the guest each have their own FPU state.
+ 	 * In vcpu_run, we switch between the user and guest FPU contexts.
+@@ -1722,6 +1735,10 @@
+ 	u64 pf_fast;
+ 	u64 pf_mmio_spte_created;
+ 	u64 pf_guest;
++	u64 pf_prefetch_called;
++	u64 pf_prefetch_pages;
++	u64 pf_prefetch_mapped;
++	u64 pf_prefetch_unused;
+ 	u64 tlb_flush;
+ 	u64 invlpg;
+ 
+Index: arch/x86/kvm/mmu/mmu.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+--- a/arch/x86/kvm/mmu/mmu.c	(revision 502d801f0ab03e4f32f9a33d203154ce84887921)
++++ b/arch/x86/kvm/mmu/mmu.c	(revision 9124c27ccdd54def167ee5b1e47e45ee11f24477)
+@@ -119,8 +119,6 @@
+ static int tdp_root_level __read_mostly;
+ static int max_tdp_level __read_mostly;
+ 
+-#define PTE_PREFETCH_NUM		8
+-
+ #include <trace/events/kvm.h>
+ 
+ /* make pte_list_desc fit well in cache lines */
+@@ -636,6 +634,11 @@
+ 	kvm_mmu_free_memory_cache(&vcpu->arch.mmu_shadowed_info_cache);
+ 	kvm_mmu_free_memory_cache(&vcpu->arch.mmu_external_spt_cache);
+ 	kvm_mmu_free_memory_cache(&vcpu->arch.mmu_page_header_cache);
++
++	if (vcpu->arch.mmu_prefetch_pages) {
++		free_page((unsigned long)vcpu->arch.mmu_prefetch_pages);
++		vcpu->arch.mmu_prefetch_pages = NULL;
++	}
+ }
+ 
+ static void mmu_free_pte_list_desc(struct pte_list_desc *pte_list_desc)
+@@ -6783,6 +6786,17 @@
+ {
+ 	int ret;
+ 
++	/*
++	 * Scratch space for fault-time prefetch: one page holds
++	 * SPTE_ENT_PER_PAGE (512) struct page pointers on 64-bit.  Freed in
++	 * mmu_free_memory_caches() via kvm_mmu_destroy().
++	 */
++	BUILD_BUG_ON(SPTE_ENT_PER_PAGE * sizeof(struct page *) > PAGE_SIZE);
++	vcpu->arch.mmu_prefetch_pages =
++		(struct page **)__get_free_page(GFP_KERNEL_ACCOUNT);
++	if (!vcpu->arch.mmu_prefetch_pages)
++		return -ENOMEM;
++
+ 	vcpu->arch.mmu_pte_list_desc_cache.kmem_cache = pte_list_desc_cache;
+ 	vcpu->arch.mmu_pte_list_desc_cache.gfp_zero = __GFP_ZERO;
+ 
+Index: arch/x86/kvm/mmu/mmu_internal.h
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/arch/x86/kvm/mmu/mmu_internal.h b/arch/x86/kvm/mmu/mmu_internal.h
+--- a/arch/x86/kvm/mmu/mmu_internal.h	(revision 502d801f0ab03e4f32f9a33d203154ce84887921)
++++ b/arch/x86/kvm/mmu/mmu_internal.h	(revision 9124c27ccdd54def167ee5b1e47e45ee11f24477)
+@@ -16,6 +16,10 @@
+ 
+ /* Page table builder macros common to shadow (host) PTEs and guest PTEs. */
+ #define __PT_BASE_ADDR_MASK GENMASK_ULL(51, 12)
++
++/* Number of adjacent SPTEs to prefetch when handling a page fault. */
++#define PTE_PREFETCH_NUM		8
++
+ #define __PT_LEVEL_SHIFT(level, bits_per_level)	\
+ 	(PAGE_SHIFT + ((level) - 1) * (bits_per_level))
+ #define __PT_INDEX(address, level, bits_per_level) \
+Index: arch/x86/kvm/mmu/tdp_mmu.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+--- a/arch/x86/kvm/mmu/tdp_mmu.c	(revision 502d801f0ab03e4f32f9a33d203154ce84887921)
++++ b/arch/x86/kvm/mmu/tdp_mmu.c	(revision 9124c27ccdd54def167ee5b1e47e45ee11f24477)
+@@ -1209,6 +1209,141 @@
+ static int tdp_mmu_split_huge_page(struct kvm *kvm, struct tdp_iter *iter,
+ 				   struct kvm_mmu_page *sp, bool shared);
+ 
++/*
++ * Prefetch and map the run of host-present pages immediately following the
++ * faulting page, within the faulting 2MiB region (a single leaf TDP page
++ * table).  One non-blocking GUP resolves the whole forward run in a single host
++ * page-table walk into a per-vCPU scratch array; empty SPTEs in the run are
++ * filled and already-present ones are skipped.
++ *
++ * Only forward neighbours are prefetched.  Guest access streams are dominated
++ * by ascending walks, and pages preceding the fault have typically been faulted
++ * (and mapped) already, so probing backwards is mostly wasted work.  Faulting
++ * into the middle of a populated chunk simply prefetches the tail; the leading
++ * pages were handled by their own earlier faults.
++ *
++ * The run is bounded on two sides so a single GUP covers exactly the useful
++ * span: it is capped at the first already-present SPTE (a cheap sp->spt[] scan,
++ * so we never pin pages that are already mapped), and kvm_prefetch_pages()
++ * itself stops at the first host hole.  The run therefore ends at whichever
++ * comes first -- the edge of the backing chunk (mTHP/userfaultfd) or an
++ * already-mapped region ahead of the fault.
++ *
++ * A full leaf TDP page table covers exactly SPTE_ENT_PER_PAGE (512) pages
++ * (2MiB) aligned to 2MiB, so the run stays within a single page table.
++ */
++static void tdp_mmu_pte_prefetch(struct kvm_vcpu *vcpu,
++				 struct kvm_page_fault *fault,
++				 struct tdp_iter *iter)
++{
++	struct kvm_mmu_page *sp = sptep_to_sp(rcu_dereference(iter->sptep));
++	struct page **pages = vcpu->arch.mmu_prefetch_pages;
++	struct kvm_memory_slot *slot = fault->slot;
++	unsigned int access = sp->role.access;
++	gfn_t start_gfn, slot_end;
++	int start, count, nr, i;
++
++	if (sp_ad_disabled(sp))
++		return;
++
++	/*
++	 * If addresses are being invalidated, skip prefetching to avoid racing
++	 * with the invalidation and mapping a stale translation.
++	 */
++	if (unlikely(vcpu->kvm->mmu_invalidate_in_progress))
++		return;
++
++	if (WARN_ON_ONCE(!pages))
++		return;
++
++	/*
++	 * Prefetch forward only: from the page after the fault to the end of
++	 * the leaf page table, clamped to the memslot.  kvm_prefetch_pages()
++	 * refuses the whole request (returns 0) if it would run past the end of
++	 * the slot, so asking for more than the slot has left would create a
++	 * prefetch dead zone near the slot boundary.
++	 */
++	start = spte_index(rcu_dereference(iter->sptep)) + 1;
++	if (start >= SPTE_ENT_PER_PAGE)
++		return;			/* fault on the last entry: nothing ahead */
++
++	start_gfn = sp->gfn + start;
++	slot_end = slot->base_gfn + slot->npages;
++	if (start_gfn >= slot_end)
++		return;			/* fault at the slot's last page */
++
++	count = min_t(gfn_t, SPTE_ENT_PER_PAGE - start, slot_end - start_gfn);
++
++	/*
++	 * Cap the run at the first already-present (or non-standard) SPTE.
++	 * Scanning sp->spt[] is just sequential reads of a cache-resident page,
++	 * far cheaper than pinning pages we'd immediately skip; it bounds the
++	 * GUP to the unmapped frontier ahead of the fault and avoids re-pinning
++	 * an already-mapped region when a fault lands behind a prefetched run.
++	 * The scan is only a bound -- the install loop re-checks each SPTE, so a
++	 * concurrent map into the range is still handled correctly.
++	 */
++	for (i = 0; i < count; i++) {
++		u64 spte = READ_ONCE(sp->spt[start + i]);
++
++		if (is_shadow_present_pte(spte) || spte != SHADOW_NONPRESENT_VALUE)
++			break;
++	}
++	count = i;
++	if (!count)
++		return;
++
++	vcpu->stat.pf_prefetch_called++;
++
++	/*
++	 * Non-blocking GUP over the forward run in one host page-table walk.
++	 * Returns the number of leading pages present in the host and stops at
++	 * the first hole, so the run ends at the edge of the backing chunk.
++	 */
++	nr = kvm_prefetch_pages(slot, start_gfn, pages, count);
++	if (nr <= 0)
++		return;
++
++	vcpu->stat.pf_prefetch_pages += nr;
++
++	for (i = 0; i < nr; i++) {
++		u64 *sptep = sp->spt + start + i;
++		u64 old_spte = READ_ONCE(*sptep);
++		gfn_t gfn = start_gfn + i;
++		u64 new_spte;
++
++		/*
++		 * Skip entries that are already present or hold a non-standard
++		 * value (MMIO, frozen, ...).  We didn't write the page, so
++		 * release it clean.  Count it as a pinned-but-unused prefetch.
++		 */
++		if (is_shadow_present_pte(old_spte) || old_spte != SHADOW_NONPRESENT_VALUE) {
++			kvm_release_page_clean(pages[i]);
++			vcpu->stat.pf_prefetch_unused++;
++			continue;
++		}
++
++		make_spte(vcpu, sp, slot, access, gfn,
++			  page_to_pfn(pages[i]), old_spte,
++			  true /* prefetch */, false, true, &new_spte);
++
++		/*
++		 * Atomically install the SPTE only if it's still empty.  If
++		 * another thread raced us, the pin was wasted -- count it.
++		 */
++		if (try_cmpxchg64(sptep, &old_spte, new_spte)) {
++			handle_changed_spte(vcpu->kvm, sp, gfn,
++					    SHADOW_NONPRESENT_VALUE,
++					    new_spte, PG_LEVEL_4K, true);
++			vcpu->stat.pf_prefetch_mapped++;
++		} else {
++			vcpu->stat.pf_prefetch_unused++;
++		}
++
++		kvm_release_page_dirty(pages[i]);
++	}
++}
++
+ /*
+  * Handle a TDP page fault (NPT/EPT violation/misconfiguration) by installing
+  * page tables and SPTEs to translate the faulting guest physical address.
+@@ -1297,6 +1432,10 @@
+ map_target_level:
+ 	ret = tdp_mmu_map_handle_target_level(vcpu, fault, &iter);
+ 
++	if (ret == RET_PF_FIXED && fault->goal_level == PG_LEVEL_4K &&
++	    !fault->prefetch && fault->slot)
++		tdp_mmu_pte_prefetch(vcpu, fault, &iter);
++
+ retry:
+ 	rcu_read_unlock();
+ 	return ret;
+Index: arch/x86/kvm/x86.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+--- a/arch/x86/kvm/x86.c	(revision 502d801f0ab03e4f32f9a33d203154ce84887921)
++++ b/arch/x86/kvm/x86.c	(revision 9124c27ccdd54def167ee5b1e47e45ee11f24477)
+@@ -270,6 +270,10 @@
+ 	STATS_DESC_COUNTER(VCPU, pf_fast),
+ 	STATS_DESC_COUNTER(VCPU, pf_mmio_spte_created),
+ 	STATS_DESC_COUNTER(VCPU, pf_guest),
++	STATS_DESC_COUNTER(VCPU, pf_prefetch_called),
++	STATS_DESC_COUNTER(VCPU, pf_prefetch_pages),
++	STATS_DESC_COUNTER(VCPU, pf_prefetch_mapped),
++	STATS_DESC_COUNTER(VCPU, pf_prefetch_unused),
+ 	STATS_DESC_COUNTER(VCPU, tlb_flush),
+ 	STATS_DESC_COUNTER(VCPU, invlpg),
+ 	STATS_DESC_COUNTER(VCPU, exits),
