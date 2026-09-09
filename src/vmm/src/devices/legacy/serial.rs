@@ -483,6 +483,74 @@ mod tests {
         assert_eq!(invalid_reads_after_2, invalid_reads_after);
     }
 
+    /// Reproduces the lost-input race behind FC-OPS-3173 (`test_serial_console_login`
+    /// timing out with only journald `printk` output in `rx_str`).
+    ///
+    /// Linux's `serial8250_console_write()` masks all interrupts (IER = 0) while it
+    /// writes a `printk` message to the UART, then restores IER and relies on the
+    /// hardware to re-assert the RX interrupt if data arrived in the meantime
+    /// ("the receive ready bit will still be set; it is not cleared on read").
+    /// If the host injects input into the FIFO while IER is masked, the emulated
+    /// UART must raise the RDA interrupt when IER is restored, otherwise the guest
+    /// is never notified and the bytes sit in the FIFO forever.
+    #[test]
+    fn test_rx_interrupt_reasserted_when_ier_restored() {
+        const IER: u64 = 1;
+        const IIR: u64 = 2;
+        const LSR: u64 = 5;
+        const IER_RDA: u8 = 0x01;
+        const IIR_RDA: u8 = 0x04;
+        const IIR_NO_INT: u8 = 0x01;
+        const LSR_DR: u8 = 0x01;
+
+        let intr_evt = EventFdTrigger::new(EventFd::new(libc::EFD_NONBLOCK).unwrap());
+        let intr_evt_reader = intr_evt.try_clone().unwrap();
+        let mut serial = SerialDevice {
+            serial: Serial::with_events(
+                intr_evt,
+                SerialEventsWrapper {
+                    buffer_ready_event_fd: None,
+                },
+                test_serial_out_sink(),
+            ),
+            input: None::<std::io::Stdin>,
+        };
+        let mut reg = [0u8; 1];
+
+        // Driver startup: enable the received-data-available interrupt.
+        serial.write(0, IER, &[IER_RDA]);
+
+        // 1. serial8250_console_write(): save IER, then mask everything.
+        serial.read(0, IER, &mut reg);
+        let saved_ier = reg[0];
+        serial.write(0, IER, &[0]);
+
+        // 2. Meanwhile the host injects the user's input ("id\n").
+        serial.serial.raw_input(b"id\n").unwrap();
+        // Data is in the FIFO and LSR says so...
+        serial.read(0, LSR, &mut reg);
+        assert_ne!(reg[0] & LSR_DR, 0);
+        // ...but, correctly, no interrupt while IER is masked.
+        assert_eq!(
+            intr_evt_reader.read().unwrap_err().raw_os_error(),
+            Some(libc::EAGAIN)
+        );
+
+        // 3. Console write finishes and restores IER.
+        serial.write(0, IER, &[saved_ier]);
+
+        // Real 16550 hardware asserts INTR here because RDA is now enabled and
+        // the RX FIFO is non-empty. The guest never reads the FIFO otherwise.
+        assert_eq!(
+            intr_evt_reader.read().ok(),
+            Some(1),
+            "RDA interrupt was not re-asserted after IER restore: guest input is lost"
+        );
+        serial.read(0, IIR, &mut reg);
+        assert_eq!(reg[0] & IIR_NO_INT, 0, "IIR should report a pending interrupt");
+        assert_ne!(reg[0] & IIR_RDA, 0, "IIR should identify the RDA interrupt");
+    }
+
     #[test]
     fn test_restore_from_state() {
         let mut serial = SerialDevice::new(None, test_serial_out_sink(), None).unwrap();

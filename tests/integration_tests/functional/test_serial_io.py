@@ -5,6 +5,7 @@
 import fcntl
 import os
 import platform
+import re
 import signal
 import termios
 import time
@@ -135,6 +136,91 @@ def test_serial_console_login(uvm):
     serial.rx(microvm.distro.shell_prompt)
     serial.tx("id")
     serial.rx("uid=0(root) gid=0(root) groups=0(root)")
+
+
+# A printk line as it appears in the screen log: "[   12.345678] xxxx\r\r\n".
+# serial8250_console_write() emits each message atomically under the port lock,
+# so these never get split, but they may split the shell's own output.
+KMSG_LINE_RE = re.compile(r"\[ *\d+\.\d+\] x*\r*\n")
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_serial_input_during_console_printk(uvm):
+    """
+    Serial input must not be lost while the guest kernel writes to the console.
+
+    serial8250_console_write() masks the UART interrupts (IER=0) for the
+    duration of a printk and restores them afterwards, relying on the UART to
+    re-assert the RX interrupt if data arrived meanwhile. Flood the console
+    with printk messages so that IER is masked most of the time, and check
+    that input injected from the host is still processed by the guest.
+
+    Regression test for the intermittent `test_serial_console_login` /
+    `test_serial_after_snapshot` failures where journald output raced with
+    the test's input (FC-OPS-3173).
+    """
+    vm = uvm
+    vm.help.enable_console()
+    vm.spawn(serial_out_path=None)
+    vm.memory_monitor = None
+    # 1 vCPU: the same vCPU that writes the printk would have to take the RX
+    # interrupt, which is the configuration the flaky tests use.
+    vm.basic_config(vcpu_count=1)
+    vm.add_net_iface()
+    vm.start()
+
+    serial = Serial(vm)
+    serial.open()
+    serial.rx(vm.distro.shell_prompt)
+
+    # Lift the per-fd rate limit on /dev/kmsg and start a background flood of
+    # 200-byte printk messages. Each one keeps IER masked for the whole
+    # console write of that message.
+    vm.ssh.check_output("echo on > /proc/sys/kernel/printk_devkmsg")
+    vm.ssh.check_output(
+        'nohup sh -c \'msg=$(head -c 200 /dev/zero | tr "\\0" x); '
+        "while :; do echo $msg; done > /dev/kmsg' >/dev/null 2>&1 </dev/null &"
+    )
+    # Give the flood time to start before injecting input.
+    time.sleep(0.5)
+
+    # Serial.rx_char() reads one byte per poll(), which cannot keep up with
+    # the flood. Read the console log in chunks instead, starting from the
+    # current end of the file.
+    log_fd = os.open(vm.screen_log, os.O_RDONLY)
+    os.lseek(log_fd, 0, os.SEEK_END)
+
+    def rx_until(token, timeout):
+        """Read the console until `token` shows up in the non-printk output."""
+        buf = ""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            chunk = os.read(log_fd, 1 << 16)
+            if not chunk:
+                time.sleep(0.05)
+                continue
+            buf += chunk.decode("utf-8", errors="ignore")
+            if token in KMSG_LINE_RE.sub("", buf):
+                return True
+            # Keep the tail only; a printk line is < 256 bytes so the token
+            # cannot straddle more than that.
+            buf = buf[-4096:]
+        return False
+
+    trials = 10
+    lost = []
+    for i in range(trials):
+        # The echoed command line reads `echo pi''ng<i>`, so the token can
+        # only come from the command actually being executed.
+        serial.tx(f"echo pi''ng{i}")
+        # Under the printk flood the shell is slow, but a response within a
+        # few seconds is normal. No echo at all means the input was never
+        # delivered to the guest.
+        if not rx_until(f"ping{i}", timeout=5):
+            lost.append(i)
+
+    vm.ssh.check_output("pkill -f 'while :'")
+    assert not lost, f"guest lost serial input in {len(lost)}/{trials} trials: {lost}"
 
 
 def get_total_mem_size(pid):
