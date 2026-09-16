@@ -37,8 +37,8 @@ backend). The UFFD protocol is unchanged.
   `AtomicBitmap` (device writes), at host page (4 KiB) granularity. On success
   Firecracker's bitmap is reset; on failure the KVM bitmap is folded back into
   it (`store_dirty_bitmap`) so no dirty information is lost.
-- **Correction (see the third design document).** The bullet below is wrong for
-  the `firecracker` binary. `Vmm::pause_vm` only pauses vCPUs, but
+- **Correction (see `memory-backend-design-v3.md`).** The bullet below is
+  wrong for the `firecracker` binary. `Vmm::pause_vm` only pauses vCPUs, but
   `ApiServerAdapter::handle_request`
   (`src/firecracker/src/api_server_adapter.rs`) stops running the event loop
   after a `Pause` and blocks on the API channel until `Resume`, so device
