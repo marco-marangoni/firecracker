@@ -257,6 +257,15 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
 
     /// Prepare the device for saving its state
     fn prepare_save(&mut self) {}
+
+    /// Called right before dirty page tracking is reset while the microVM keeps running, e.g.
+    /// when an external memory backend consumes the dirty ranges for a pre-copy pass.
+    ///
+    /// Devices that mark guest memory dirty ahead of writing it (see `IoVecBufferMut`) must drop
+    /// such pre-marked, not yet written buffers here, so that they are parsed, and marked, again
+    /// after the reset and the eventual write is not lost from the next dirty set. Snapshots get
+    /// the same guarantee from `prepare_save`.
+    fn prepare_dirty_tracking_reset(&mut self) {}
 }
 
 impl fmt::Debug for dyn VirtioDevice {

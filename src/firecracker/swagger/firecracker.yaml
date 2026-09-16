@@ -1488,6 +1488,15 @@ definitions:
           Which huge pages configuration should be used to back guest memory.
           "None" uses regular 4K pages. "Transparent" enables THP via
           madvise(MADV_HUGEPAGE). "2M" uses explicit hugetlbfs 2MB pages.
+      mem_backend:
+        $ref: "#/definitions/MemoryBackend"
+        description: >-
+          Memory backend process to share the guest memory with. Only
+          `backend_type: MemoryBackend` is valid here. When set, guest memory is
+          backed by a memfd that is handed to the process listening on
+          `backend_path` before the microVM starts, and guest memory snapshots
+          are taken by that process (see `PUT /snapshot/create`). Not persisted
+          in snapshots.
 
   MemoryBackend:
     type: object
@@ -1500,6 +1509,7 @@ definitions:
         enum:
           - File
           - Uffd
+          - MemoryBackend
       backend_path:
         type: string
         description: Based on 'backend_type' it is either
@@ -1507,6 +1517,10 @@ definitions:
           2) Path to the UDS where a process is listening for a UFFD initialization
           control payload and open file descriptor that it can use to serve this
           process's guest memory page faults
+          3) Path to the UDS where a memory backend process is listening. It
+          receives the memfd backing the guest memory and, on snapshot load, the
+          UFFD to populate it, and is then responsible for extracting the guest
+          memory when a snapshot is created.
 
   Metrics:
     type: object
@@ -1664,12 +1678,16 @@ definitions:
   SnapshotCreateParams:
     type: object
     required:
-      - mem_file_path
       - snapshot_path
     properties:
       mem_file_path:
         type: string
-        description: Path to the file that will contain the guest memory.
+        description:
+          Path to the file that will contain the guest memory. Exactly one of
+          `mem_file_path` and `mem_backend` must be specified. Not allowed while
+          a memory backend process is connected to the microVM.
+      mem_backend:
+        $ref: "#/definitions/SnapshotCreateMemoryBackend"
       snapshot_path:
         type: string
         description: Path to the file that will contain the microVM state.
@@ -1723,6 +1741,21 @@ definitions:
         type: string
         description:
           The new path for the backing Unix Domain Socket.
+
+  SnapshotCreateMemoryBackend:
+    type: object
+    required:
+      - backend_type
+    properties:
+      backend_type:
+        type: string
+        enum:
+          - MemoryBackend
+        description:
+          Hand the guest memory over to the memory backend process connected to
+          this microVM instead of writing it to a file. Firecracker writes the
+          microVM state to `snapshot_path`, sends the memory ranges to copy to
+          the backend and waits for it to finish.
 
   SnapshotLoadParams:
     type: object

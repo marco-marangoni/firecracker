@@ -103,11 +103,23 @@ impl UffdHandler {
             serde_json::from_str::<Vec<GuestRegionUffdMapping>>(&body).unwrap_or_else(|_| {
                 panic!("Cannot deserialize memory mappings. Received body: {body}")
             });
+        let uffd = unsafe { Uffd::from_raw_fd(file.into_raw_fd()) };
+        Self::new(mappings, uffd, backing_buffer, size)
+    }
+
+    /// Creates a handler serving page faults for `mappings` through `uffd`, with page contents
+    /// taken from the `size` bytes at `backing_buffer` (a mapping of the snapshot memory file).
+    pub fn new(
+        mappings: Vec<GuestRegionUffdMapping>,
+        uffd: Uffd,
+        backing_buffer: *const u8,
+        size: usize,
+    ) -> Self {
         let memsize: usize = mappings.iter().map(|r| r.size).sum();
         // Page size is the same for all memory regions, so just grab the first one
         let first_mapping = mappings.first().unwrap_or_else(|| {
             panic!(
-                "Cannot get the first mapping. Mappings size is {}. Received body: {body}",
+                "Cannot get the first mapping. Mappings size is {}.",
                 mappings.len()
             )
         });
@@ -117,14 +129,17 @@ impl UffdHandler {
         assert_eq!(memsize, size);
         assert!(page_size.is_power_of_two());
 
-        let uffd = unsafe { Uffd::from_raw_fd(file.into_raw_fd()) };
-
         Self {
             mem_regions: mappings,
             page_size,
             backing_buffer,
             uffd,
         }
+    }
+
+    /// The userfaultfd this handler serves.
+    pub fn uffd(&self) -> &Uffd {
+        &self.uffd
     }
 
     pub fn read_event(&mut self) -> Result<Option<Event>, Error> {

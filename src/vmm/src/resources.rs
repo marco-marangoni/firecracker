@@ -14,8 +14,8 @@ use crate::logger::{LoggerConfig, info};
 use crate::mmds;
 use crate::mmds::data_store::{Mmds, MmdsVersion};
 use crate::mmds::ns::MmdsNetworkStack;
-use crate::utils::mib_to_bytes;
 use crate::utils::net::ipv4addr::is_link_local_valid;
+use crate::utils::{mib_to_bytes, u32_mib_to_bytes};
 use crate::vmm_config::TokenBucketConfig;
 use crate::vmm_config::balloon::*;
 use crate::vmm_config::boot_source::{
@@ -33,7 +33,7 @@ use crate::vmm_config::pmem::{PmemBuilder, PmemConfig, PmemConfigError};
 use crate::vmm_config::serial::SerialConfig;
 use crate::vmm_config::vsock::*;
 use crate::vstate::memory;
-use crate::vstate::memory::{GuestRegionMmap, MemoryError};
+use crate::vstate::memory::{GuestMemfd, GuestRegionMmap, MemoryError};
 
 /// Errors encountered when configuring microVM resources.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -477,61 +477,79 @@ impl VmResources {
         Ok(())
     }
 
-    /// Allocates the given guest memory regions.
+    /// Whether guest memory must be backed by a shared memfd.
     ///
-    /// If vhost-user-blk devices are in use, allocates memfd-backed shared memory, otherwise
-    /// prefers anonymous memory for performance reasons.
-    fn allocate_memory_regions(
-        &self,
-        regions: &[(GuestAddress, usize)],
-    ) -> Result<Vec<GuestRegionMmap>, MemoryError> {
+    /// This is the case if a vhost-user-blk device is in use (the backend needs to map the guest
+    /// memory) or if a memory backend process is configured (it receives the memfd). Otherwise
+    /// anonymous memory is preferred for performance reasons: page faults are more expensive for
+    /// shared memory mappings, including memfd.
+    fn memfd_backed(&self) -> bool {
         let vhost_user_device_used = self
             .block
             .devices
             .iter()
             .any(|b| b.lock().expect("Poisoned lock").is_vhost_user());
 
-        // Page faults are more expensive for shared memory mapping, including  memfd.
-        // For this reason, we only back guest memory with a memfd
-        // if a vhost-user-blk device is configured in the VM, otherwise we fall back to
-        // an anonymous private memory.
-        //
-        // The vhost-user-blk branch is not currently covered by integration tests in Rust,
-        // because that would require running a backend process. If in the future we converge to
-        // a single way of backing guest memory for vhost-user and non-vhost-user cases,
-        // that would not be worth the effort.
-        if vhost_user_device_used {
-            memory::memfd_backed(
-                regions,
-                self.machine_config.track_dirty_pages,
-                self.machine_config.huge_pages,
-            )
-        } else {
-            memory::anonymous(
+        vhost_user_device_used || self.machine_config.mem_backend.is_some()
+    }
+
+    /// Allocates the guest memory in a configuration most appropriate for these [`VmResources`].
+    ///
+    /// Returns the DRAM regions and, if guest memory is memfd-backed, the memfd from which the
+    /// hotpluggable region must later be allocated with [`Self::allocate_memory_region`]. The
+    /// memfd is sized to hold both the DRAM and the hotpluggable memory, so that all regions of
+    /// the microVM live in a single memfd whose layout is the one of a snapshot memory file.
+    pub fn allocate_guest_memory(
+        &self,
+    ) -> Result<(Vec<GuestRegionMmap>, Option<GuestMemfd>), MemoryError> {
+        let regions =
+            crate::arch::arch_memory_regions(mib_to_bytes(self.machine_config.mem_size_mib));
+
+        if !self.memfd_backed() {
+            let regions = memory::anonymous(
                 regions.iter().copied(),
                 self.machine_config.track_dirty_pages,
                 self.machine_config.huge_pages,
-            )
+            )?;
+            return Ok((regions, None));
         }
+
+        let dram_size = regions
+            .iter()
+            .try_fold(0u64, |acc, &(_, size)| acc.checked_add(size as u64))
+            .ok_or(MemoryError::OffsetTooLarge)?;
+        let hotplug_size = self
+            .memory_hotplug
+            .as_ref()
+            .map_or(0, |cfg| u32_mib_to_bytes(cfg.total_size_mib));
+        let total_size = dram_size
+            .checked_add(hotplug_size)
+            .ok_or(MemoryError::OffsetTooLarge)?;
+
+        let mut memfd = GuestMemfd::new(total_size, self.machine_config.huge_pages)?;
+        let regions = memfd.allocate(&regions, self.machine_config.track_dirty_pages)?;
+        Ok((regions, Some(memfd)))
     }
 
-    /// Allocates guest memory in a configuration most appropriate for these [`VmResources`].
-    pub fn allocate_guest_memory(&self) -> Result<Vec<GuestRegionMmap>, MemoryError> {
-        let regions =
-            crate::arch::arch_memory_regions(mib_to_bytes(self.machine_config.mem_size_mib));
-        self.allocate_memory_regions(&regions)
-    }
-
-    /// Allocates a single guest memory region.
+    /// Allocates a single guest memory region (the hotpluggable one), from `memfd` if the guest
+    /// memory is memfd-backed.
     pub fn allocate_memory_region(
         &self,
+        memfd: Option<&mut GuestMemfd>,
         start: GuestAddress,
         size: usize,
     ) -> Result<GuestRegionMmap, MemoryError> {
-        Ok(self
-            .allocate_memory_regions(&[(start, size)])?
-            .pop()
-            .unwrap())
+        let mut regions = match memfd {
+            Some(memfd) => {
+                memfd.allocate(&[(start, size)], self.machine_config.track_dirty_pages)?
+            }
+            None => memory::anonymous(
+                std::iter::once((start, size)),
+                self.machine_config.track_dirty_pages,
+                self.machine_config.huge_pages,
+            )?,
+        };
+        Ok(regions.pop().unwrap())
     }
 }
 
@@ -1443,6 +1461,7 @@ mod tests {
     fn test_update_machine_config() {
         let mut vm_resources = default_vm_resources();
         let mut aux_vm_config = MachineConfigUpdate {
+            mem_backend: None,
             vcpu_count: Some(32),
             mem_size_mib: Some(512),
             smt: Some(false),

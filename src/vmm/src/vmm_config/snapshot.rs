@@ -26,12 +26,26 @@ pub enum SnapshotType {
 /// 1) A file that contains the guest memory to be loaded,
 /// 2) An UDS where a custom page-fault handler process is listening for the UFFD set up by
 ///    Firecracker to handle its guest memory page faults.
-#[derive(Debug, PartialEq, Eq, Deserialize)]
+/// 3) An UDS where a memory backend process is listening: it receives the memfd backing the
+///    guest memory and the UFFD to populate it, and is then responsible for extracting guest
+///    memory for snapshots (see `docs/snapshotting/memory-backend-design.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub enum MemBackendType {
     /// Guest memory contents will be loaded from a file.
     File,
     /// Guest memory will be served through UFFD by a separate process.
     Uffd,
+    /// Guest memory is shared with a memory backend process, which also serves it through UFFD
+    /// when restoring from a snapshot.
+    MemoryBackend,
+}
+
+/// Selects the memory backend in `PUT /snapshot/create`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateSnapshotMemBackend {
+    /// Must be `MemoryBackend`: the connected memory backend process copies the guest memory.
+    pub backend_type: MemBackendType,
 }
 
 /// Stores the configuration that will be used for creating a snapshot.
@@ -44,8 +58,14 @@ pub struct CreateSnapshotParams {
     pub snapshot_type: SnapshotType,
     /// Path to the file that will contain the microVM state.
     pub snapshot_path: PathBuf,
-    /// Path to the file that will contain the guest memory.
-    pub mem_file_path: PathBuf,
+    /// Path to the file that will contain the guest memory. Mutually exclusive with
+    /// `mem_backend`; one of the two is required.
+    #[serde(default)]
+    pub mem_file_path: Option<PathBuf>,
+    /// Hand the guest memory over to the connected memory backend process instead of writing
+    /// it to a file. Mutually exclusive with `mem_file_path`.
+    #[serde(default)]
+    pub mem_backend: Option<CreateSnapshotMemBackend>,
     /// Whether to fsync the snapshot state and guest memory files.
     /// Activated virtio-block devices are always fsync'd, independently of this.
     #[serde(default = "default_sync_snapshot_files")]
@@ -165,7 +185,7 @@ pub struct LoadSnapshotConfig {
 }
 
 /// Stores the configuration used for managing snapshot memory.
-#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemBackendConfig {
     /// Path to the backend used to handle the guest memory.

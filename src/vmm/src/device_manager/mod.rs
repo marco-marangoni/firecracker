@@ -401,6 +401,16 @@ impl DeviceManager {
         });
     }
 
+    /// Let every activated VirtIO device know that dirty page tracking is about to be reset
+    /// while the microVM keeps running. See `VirtioDevice::prepare_dirty_tracking_reset`.
+    pub fn prepare_dirty_tracking_reset(&self) {
+        self.for_each_virtio_device_mut(|_, device| {
+            if device.is_activated() {
+                device.prepare_dirty_tracking_reset();
+            }
+        });
+    }
+
     /// Get a VirtIO device of type `virtio_type` with ID `device_id`
     pub fn get_virtio_device(
         &self,

@@ -19,7 +19,7 @@ use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::vcpu::get_manufacturer_id_from_host;
-use crate::builder::{self, BuildMicrovmFromSnapshotError};
+use crate::builder::{self, BuildMicrovmFromSnapshotError, MemBackendSetup};
 use crate::cpu_config::templates::StaticCpuTemplate;
 #[cfg(target_arch = "x86_64")]
 use crate::cpu_config::x86_64::cpuid::CpuidTrait;
@@ -40,7 +40,7 @@ use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, Mach
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
-    self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
+    self, GuestMemfd, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
 };
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
@@ -160,6 +160,14 @@ pub enum CreateSnapshotError {
     SerializeMicrovmState(#[from] crate::snapshot::SnapshotError),
     /// Cannot perform {0} on the snapshot backing file: {1}
     SnapshotBackingFile(&'static str, io::Error),
+    /// Exactly one of `mem_file_path` and `mem_backend` (with `backend_type: MemoryBackend`) must be specified
+    InvalidMemoryDestination,
+    /// A memory backend is connected: guest memory must be snapshotted through it (`mem_backend`), not to `mem_file_path`
+    MemBackendConnected,
+    /// No memory backend is connected to this microVM
+    MemBackendNotConnected,
+    /// Cannot snapshot guest memory through the memory backend: {0}
+    MemBackend(#[from] crate::mem_backend::MemBackendSnapshotError),
 }
 
 /// Snapshot version
@@ -171,6 +179,30 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
+    // Validate the memory destination before touching anything.
+    let mem_destination = match (&params.mem_file_path, &params.mem_backend) {
+        (Some(_), Some(_)) | (None, None) => {
+            return Err(CreateSnapshotError::InvalidMemoryDestination);
+        }
+        (Some(path), None) => {
+            // While a memory backend is connected it owns the dirty page tracking, and a
+            // Firecracker-made dump would consume it behind its back.
+            if vmm.mem_backend.is_some() {
+                return Err(CreateSnapshotError::MemBackendConnected);
+            }
+            Some(path)
+        }
+        (None, Some(backend)) => {
+            if backend.backend_type != MemBackendType::MemoryBackend {
+                return Err(CreateSnapshotError::InvalidMemoryDestination);
+            }
+            if vmm.mem_backend.is_none() {
+                return Err(CreateSnapshotError::MemBackendNotConnected);
+            }
+            None
+        }
+    };
+
     let microvm_state = vmm
         .save_state(vm_info)
         .map_err(CreateSnapshotError::MicrovmState)?;
@@ -181,20 +213,30 @@ pub fn create_snapshot(
         params.sync_snapshot_files,
     )?;
 
+    match mem_destination {
+        Some(mem_file_path) => {
+            let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
+                CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
+                    "snapshot requires KVM".into(),
+                ))
+            })?;
+            kvm_vm.snapshot_memory_to_file(
+                mem_file_path,
+                params.snapshot_type,
+                params.sync_snapshot_files,
+            )?;
+        }
+        None => vmm.snapshot_memory_to_backend(params.snapshot_type)?,
+    }
+
+    // We need to mark queues as dirty again for all activated devices. The reason we
+    // do it here is that we don't mark pages as dirty during runtime
+    // for queue objects.
     let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
         CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
             "snapshot requires KVM".into(),
         ))
     })?;
-    kvm_vm.snapshot_memory_to_file(
-        &params.mem_file_path,
-        params.snapshot_type,
-        params.sync_snapshot_files,
-    )?;
-
-    // We need to mark queues as dirty again for all activated devices. The reason we
-    // do it here is that we don't mark pages as dirty during runtime
-    // for queue objects.
     vmm.device_manager
         .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
 
@@ -441,6 +483,10 @@ pub fn restore_from_snapshot(
             cpu_template: Some(microvm_state.vm_info.cpu_template),
             track_dirty_pages: Some(track_dirty_pages),
             huge_pages: Some(params.huge_pages.resolve(microvm_state.vm_info.huge_pages)),
+            // The memory backend is a property of this instance, never of the snapshot: it is
+            // whatever this load request says, or nothing.
+            mem_backend: (params.mem_backend.backend_type == MemBackendType::MemoryBackend)
+                .then(|| params.mem_backend.clone()),
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         })
@@ -452,7 +498,7 @@ pub fn restore_from_snapshot(
     let mem_backend_path = &params.mem_backend.backend_path;
     let mem_state = &microvm_state.vm_state.memory;
 
-    let (guest_memory, uffd) = match params.mem_backend.backend_type {
+    let (guest_memory, uffd, mem_backend_setup) = match params.mem_backend.backend_type {
         MemBackendType::File => {
             if vm_resources.machine_config.huge_pages.is_hugetlbfs() {
                 return Err(RestoreFromSnapshotGuestMemoryError::File(
@@ -469,15 +515,35 @@ pub fn restore_from_snapshot(
                 )
                 .map_err(RestoreFromSnapshotGuestMemoryError::File)?,
                 None,
+                None,
             )
         }
-        MemBackendType::Uffd => guest_memory_from_uffd(
-            mem_backend_path,
-            mem_state,
-            track_dirty_pages,
-            vm_resources.machine_config.huge_pages,
-        )
-        .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
+        MemBackendType::Uffd => {
+            let (guest_memory, uffd) = guest_memory_from_uffd(
+                mem_backend_path,
+                mem_state,
+                track_dirty_pages,
+                vm_resources.machine_config.huge_pages,
+            )
+            .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?;
+            (guest_memory, uffd, None)
+        }
+        MemBackendType::MemoryBackend => {
+            let (guest_memory, uffd, memfd) = guest_memory_from_memory_backend(
+                mem_state,
+                track_dirty_pages,
+                vm_resources.machine_config.huge_pages,
+            )
+            .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?;
+            (
+                guest_memory,
+                Some(uffd),
+                Some(MemBackendSetup {
+                    path: mem_backend_path.clone(),
+                    memfd,
+                }),
+            )
+        }
     };
     builder::build_microvm_from_snapshot(
         instance_info,
@@ -485,6 +551,7 @@ pub fn restore_from_snapshot(
         microvm_state,
         guest_memory,
         uffd,
+        mem_backend_setup,
         seccomp_filters,
         vm_resources,
         params.clock_realtime,
@@ -561,6 +628,37 @@ fn guest_memory_from_uffd(
     let (guest_memory, backend_mappings) =
         create_guest_memory(mem_state, track_dirty_pages, huge_pages)?;
 
+    let uffd = create_uffd_for(&guest_memory)?;
+
+    send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
+
+    Ok((guest_memory, Some(uffd)))
+}
+
+/// Creates the guest memory for a restore through a memory backend: a single shared memfd
+/// holding all regions, populated on demand through a uffd that is registered on the (shmem
+/// backed) mapping. Both fds are handed to the memory backend by the builder once the memory
+/// has been registered with KVM.
+fn guest_memory_from_memory_backend(
+    mem_state: &GuestMemoryState,
+    track_dirty_pages: bool,
+    huge_pages: HugePageConfig,
+) -> Result<(Vec<GuestRegionMmap>, Uffd, GuestMemfd), GuestMemoryFromUffdError> {
+    let regions: Vec<_> = mem_state.regions().collect();
+    let total_size = regions
+        .iter()
+        .try_fold(0u64, |acc, &(_, size)| acc.checked_add(size as u64))
+        .ok_or(MemoryError::OffsetTooLarge)?;
+    let mut memfd = GuestMemfd::new(total_size, huge_pages)?;
+    let guest_memory = memfd.allocate(&regions, track_dirty_pages)?;
+
+    let uffd = create_uffd_for(&guest_memory)?;
+
+    Ok((guest_memory, uffd, memfd))
+}
+
+/// Creates a uffd and registers all of `guest_memory` with it in MISSING mode.
+fn create_uffd_for(guest_memory: &[GuestRegionMmap]) -> Result<Uffd, GuestMemoryFromUffdError> {
     let mut uffd_builder = UffdBuilder::new();
 
     // We only make use of this if balloon devices are present, but we can enable it unconditionally
@@ -581,9 +679,7 @@ fn guest_memory_from_uffd(
             .map_err(GuestMemoryFromUffdError::Register)?;
     }
 
-    send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
-
-    Ok((guest_memory, Some(uffd)))
+    Ok(uffd)
 }
 
 fn create_guest_memory(

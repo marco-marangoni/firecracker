@@ -88,6 +88,8 @@ pub mod dumbo;
 pub mod gdb;
 /// Logger
 pub mod logger;
+/// Protocol with an external memory backend process.
+pub mod mem_backend;
 /// microVM Metadata Service MMDS
 pub mod mmds;
 /// PCI specific emulation code.
@@ -145,6 +147,7 @@ use crate::devices::virtio::pmem::device::Pmem;
 use crate::devices::virtio::rng::Entropy;
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
 use crate::logger::{METRICS, MetricsError, log_dev_preview_warning};
+use crate::mem_backend::MemBackendConnection;
 use crate::mmds::data_store::Mmds;
 use crate::persist::{MicrovmState, MicrovmStateError, VmInfo};
 use crate::rate_limiter::BucketUpdate;
@@ -308,6 +311,8 @@ pub struct Vmm {
     pub vm: Vm,
     // Device manager
     device_manager: DeviceManager,
+    /// Connection to the external memory backend process, if one is configured.
+    pub(crate) mem_backend: Option<MemBackendConnection>,
 }
 
 impl Vmm {
@@ -788,9 +793,19 @@ impl Drop for Vmm {
 
 impl MutEventSubscriber for Vmm {
     /// Handle a read event (EPOLLIN).
-    fn process(&mut self, event: Events, _: &mut EventOps) {
+    fn process(&mut self, event: Events, ops: &mut EventOps) {
         let source = event.fd();
         let event_set = event.event_set();
+
+        if let Some(conn) = &self.mem_backend
+            && source == conn.stream().as_raw_fd()
+        {
+            if !self.process_mem_backend_event() {
+                // The backend went away (or misbehaved): stop listening on the socket.
+                let _ = ops.remove(Events::new_raw(source, EventSet::IN));
+            }
+            return;
+        }
 
         match &self.vm {
             Vm::Kvm(kvm_vm) => {
@@ -834,6 +849,11 @@ impl MutEventSubscriber for Vmm {
                     error!("Failed to register vmm exit event: {}", err);
                 }
             }
+        }
+        if let Some(conn) = &self.mem_backend
+            && let Err(err) = ops.add(Events::new(conn.stream(), EventSet::IN))
+        {
+            error!("Failed to register memory backend socket: {}", err);
         }
     }
 }

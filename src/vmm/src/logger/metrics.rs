@@ -556,6 +556,33 @@ impl PatchRequestsMetrics {
     }
 }
 
+/// Metrics related to the external memory backend process.
+#[derive(Debug, Default, Serialize)]
+pub struct MemBackendMetrics {
+    /// Number of requests received from the memory backend.
+    pub requests: SharedIncMetric,
+    /// Number of requests from the memory backend that could not be served.
+    pub request_fails: SharedIncMetric,
+    /// Number of times the memory backend disconnected.
+    pub disconnects: SharedIncMetric,
+    /// Number of snapshots handed over to the memory backend.
+    pub snapshot_requests: SharedIncMetric,
+    /// Number of snapshots the memory backend failed to take.
+    pub snapshot_fails: SharedIncMetric,
+}
+impl MemBackendMetrics {
+    /// Const default construction.
+    pub const fn new() -> Self {
+        Self {
+            requests: SharedIncMetric::new(),
+            request_fails: SharedIncMetric::new(),
+            disconnects: SharedIncMetric::new(),
+            snapshot_requests: SharedIncMetric::new(),
+            snapshot_fails: SharedIncMetric::new(),
+        }
+    }
+}
+
 /// Metrics related to deprecated user-facing API calls.
 #[derive(Debug, Default, Serialize)]
 pub struct DeprecatedApiMetrics {
@@ -1003,6 +1030,8 @@ pub struct FirecrackerMetrics {
     pub block_ser: BlockMetricsSerializeProxy,
     /// Metrics related to deprecated API calls.
     pub deprecated_api: DeprecatedApiMetrics,
+    /// Metrics related to the external memory backend.
+    pub mem_backend: MemBackendMetrics,
     /// Metrics related to API GET requests.
     pub get_api_requests: GetRequestsMetrics,
     #[serde(flatten)]
@@ -1058,6 +1087,7 @@ impl FirecrackerMetrics {
             balloon_ser: BalloonMetricsSerializeProxy {},
             block_ser: BlockMetricsSerializeProxy {},
             deprecated_api: DeprecatedApiMetrics::new(),
+            mem_backend: MemBackendMetrics::new(),
             get_api_requests: GetRequestsMetrics::new(),
             legacy_dev_ser: LegacyDevMetricsSerializeProxy {},
             latencies_us: PerformanceMetrics::new(),

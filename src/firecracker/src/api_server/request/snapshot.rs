@@ -22,6 +22,9 @@ pub const MISSING_FIELD: &str =
 /// Only specifying one of them is allowed.
 pub const TOO_MANY_FIELDS: &str =
     "too many fields: either `mem_backend` or `mem_file_path` exclusively is required";
+/// `mem_backend` in `PUT /snapshot/create` only accepts `MemoryBackend`.
+pub const CREATE_INVALID_BACKEND_TYPE: &str =
+    "invalid `mem_backend.backend_type`: only `MemoryBackend` is supported for snapshot creation";
 
 pub(crate) fn parse_put_snapshot(
     body: &Body,
@@ -54,6 +57,29 @@ pub(crate) fn parse_patch_vm_state(body: &Body) -> Result<ParsedRequest, Request
 
 fn parse_put_snapshot_create(body: &Body) -> Result<ParsedRequest, RequestError> {
     let snapshot_config = serde_json::from_slice::<CreateSnapshotParams>(body.raw())?;
+
+    match (&snapshot_config.mem_backend, &snapshot_config.mem_file_path) {
+        // Ensure `mem_file_path` and `mem_backend` fields are not present at the same time.
+        (Some(_), Some(_)) => {
+            return Err(RequestError::SerdeJson(serde_json::Error::custom(
+                TOO_MANY_FIELDS,
+            )));
+        }
+        // Ensure that one of `mem_file_path` or `mem_backend` fields is always specified.
+        (None, None) => {
+            return Err(RequestError::SerdeJson(serde_json::Error::custom(
+                MISSING_FIELD,
+            )));
+        }
+        // Only a memory backend process can take the guest memory in our stead.
+        (Some(backend), None) if backend.backend_type != MemBackendType::MemoryBackend => {
+            return Err(RequestError::SerdeJson(serde_json::Error::custom(
+                CREATE_INVALID_BACKEND_TYPE,
+            )));
+        }
+        _ => {}
+    }
+
     Ok(ParsedRequest::new_sync(VmmAction::CreateSnapshot(
         snapshot_config,
     )))
@@ -129,7 +155,8 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
 #[cfg(test)]
 mod tests {
     use vmm::vmm_config::snapshot::{
-        MemBackendConfig, MemBackendType, NetworkOverride, SnapshotLoadHugePageConfig,
+        CreateSnapshotMemBackend, MemBackendConfig, MemBackendType, NetworkOverride,
+        SnapshotLoadHugePageConfig,
     };
 
     use super::*;
@@ -149,7 +176,8 @@ mod tests {
         let expected_config = CreateSnapshotParams {
             snapshot_type: SnapshotType::Diff,
             snapshot_path: PathBuf::from("foo"),
-            mem_file_path: PathBuf::from("bar"),
+            mem_file_path: Some(PathBuf::from("bar")),
+            mem_backend: None,
             sync_snapshot_files: true,
         };
         assert_eq!(
@@ -166,7 +194,8 @@ mod tests {
         let expected_config = CreateSnapshotParams {
             snapshot_type: SnapshotType::Diff,
             snapshot_path: PathBuf::from("foo"),
-            mem_file_path: PathBuf::from("bar"),
+            mem_file_path: Some(PathBuf::from("bar")),
+            mem_backend: None,
             sync_snapshot_files: false,
         };
         assert_eq!(
@@ -181,7 +210,8 @@ mod tests {
         let expected_config = CreateSnapshotParams {
             snapshot_type: SnapshotType::Full,
             snapshot_path: PathBuf::from("foo"),
-            mem_file_path: PathBuf::from("bar"),
+            mem_file_path: Some(PathBuf::from("bar")),
+            mem_backend: None,
             sync_snapshot_files: true,
         };
         assert_eq!(
@@ -194,6 +224,43 @@ mod tests {
             "mem_file_path": "bar"
         }"#;
         parse_put_snapshot(&Body::new(invalid_body), Some("create")).unwrap_err();
+
+        // Snapshot creation through a memory backend process.
+        let body = r#"{
+            "snapshot_type": "Diff",
+            "snapshot_path": "foo",
+            "mem_backend": { "backend_type": "MemoryBackend" }
+        }"#;
+        let expected_config = CreateSnapshotParams {
+            snapshot_type: SnapshotType::Diff,
+            snapshot_path: PathBuf::from("foo"),
+            mem_file_path: None,
+            mem_backend: Some(CreateSnapshotMemBackend {
+                backend_type: MemBackendType::MemoryBackend,
+            }),
+            sync_snapshot_files: true,
+        };
+        assert_eq!(
+            vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
+            VmmAction::CreateSnapshot(expected_config)
+        );
+
+        // Neither or both memory destinations.
+        let body = r#"{ "snapshot_path": "foo" }"#;
+        parse_put_snapshot(&Body::new(body), Some("create")).unwrap_err();
+        let body = r#"{
+            "snapshot_path": "foo",
+            "mem_file_path": "bar",
+            "mem_backend": { "backend_type": "MemoryBackend" }
+        }"#;
+        parse_put_snapshot(&Body::new(body), Some("create")).unwrap_err();
+
+        // Only `MemoryBackend` can create snapshots.
+        let body = r#"{
+            "snapshot_path": "foo",
+            "mem_backend": { "backend_type": "Uffd" }
+        }"#;
+        parse_put_snapshot(&Body::new(body), Some("create")).unwrap_err();
 
         let body = r#"{
             "snapshot_path": "foo",

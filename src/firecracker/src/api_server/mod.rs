@@ -276,7 +276,8 @@ mod tests {
             Box::new(VmmAction::CreateSnapshot(CreateSnapshotParams {
                 snapshot_type: SnapshotType::Diff,
                 snapshot_path: PathBuf::new(),
-                mem_file_path: PathBuf::new(),
+                mem_file_path: Some(PathBuf::new()),
+                mem_backend: None,
                 sync_snapshot_files: true,
             })),
             start_time_us,
@@ -290,7 +291,8 @@ mod tests {
             Box::new(VmmAction::CreateSnapshot(CreateSnapshotParams {
                 snapshot_type: SnapshotType::Diff,
                 snapshot_path: PathBuf::new(),
-                mem_file_path: PathBuf::new(),
+                mem_file_path: Some(PathBuf::new()),
+                mem_backend: None,
                 sync_snapshot_files: true,
             })),
             start_time_us,

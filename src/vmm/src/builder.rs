@@ -5,6 +5,8 @@
 
 use std::fmt::Debug;
 use std::io;
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
 #[cfg(feature = "gdb")]
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -42,6 +44,9 @@ use crate::initrd::{InitrdConfig, InitrdError};
 use crate::logger::debug;
 #[cfg(target_arch = "aarch64")]
 use crate::logger::warn;
+use crate::mem_backend::{
+    FD_NAME_MEMFD, FD_NAME_UFFD, MemBackendConnection, MemBackendError, MemBackendHandshake,
+};
 use crate::persist::{MicrovmState, MicrovmStateError};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
@@ -55,7 +60,7 @@ use crate::vmm_config::machine_config::MachineConfigError;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vmm_config::pmem::PmemConfig;
 use crate::vstate::kvm::{Kvm, KvmError};
-use crate::vstate::memory::GuestRegionMmap;
+use crate::vstate::memory::{GuestMemfd, GuestMemoryExtension, GuestMemoryMmap, GuestRegionMmap};
 #[cfg(target_arch = "aarch64")]
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::VcpuError;
@@ -125,6 +130,47 @@ pub enum StartMicrovmError {
     VcpuFdCloneError(#[from] crate::vstate::vcpu::CopyKvmFdError),
     /// Error with the KvmVm object: {0}
     KvmVm(#[from] VmError),
+    /// Cannot connect to the memory backend: {0}
+    MemBackend(#[from] MemBackendError),
+}
+
+/// What is needed to connect to a memory backend once the guest memory has been registered with
+/// KVM, when restoring from a snapshot.
+#[derive(Debug)]
+pub struct MemBackendSetup {
+    /// Path of the socket the memory backend listens on.
+    pub path: PathBuf,
+    /// The memfd backing the guest memory.
+    pub memfd: GuestMemfd,
+}
+
+/// Connects to the memory backend at `path` and performs the handshake, sharing `memfd` and, if
+/// present, `uffd`.
+fn connect_mem_backend(
+    path: &Path,
+    guest_memory: &GuestMemoryMmap,
+    memfd: &GuestMemfd,
+    uffd: Option<&Uffd>,
+    track_dirty_pages: bool,
+) -> Result<MemBackendConnection, MemBackendError> {
+    let regions = guest_memory.describe_for_backend();
+    let total_size = regions.iter().map(|r| r.size).sum();
+
+    let mut fds = vec![memfd.as_raw_fd()];
+    let mut fd_names = vec![FD_NAME_MEMFD.to_string()];
+    if let Some(uffd) = uffd {
+        fds.push(uffd.as_raw_fd());
+        fd_names.push(FD_NAME_UFFD.to_string());
+    }
+
+    let handshake = MemBackendHandshake {
+        fds: fd_names,
+        page_size: crate::arch::host_page_size(),
+        track_dirty_pages,
+        total_size,
+        regions,
+    };
+    MemBackendConnection::connect(path, &handshake, &fds)
 }
 
 /// It's convenient to automatically convert `linux_loader::cmdline::Error`s
@@ -155,7 +201,7 @@ pub fn build_microvm_for_boot(
         .as_ref()
         .ok_or(StartMicrovmError::MissingKernelConfig)?;
 
-    let guest_memory = vm_resources
+    let (guest_memory, mut guest_memfd) = vm_resources
         .allocate_guest_memory()
         .map_err(StartMicrovmError::GuestMemory)?;
 
@@ -185,6 +231,7 @@ pub fn build_microvm_for_boot(
         let addr = allocate_virtio_mem_address(&vm, memory_hotplug.total_size_mib)?;
         let hotplug_memory_region = vm_resources
             .allocate_memory_region(
+                guest_memfd.as_mut(),
                 addr,
                 u64_to_usize(u32_mib_to_bytes(memory_hotplug.total_size_mib)),
             )
@@ -196,6 +243,23 @@ pub fn build_microvm_for_boot(
         Some(addr)
     } else {
         None
+    };
+
+    // Share the guest memory with the memory backend, now that all regions exist.
+    let mem_backend = match &vm_resources.machine_config.mem_backend {
+        Some(config) => {
+            let memfd = guest_memfd
+                .as_ref()
+                .expect("memfd-backed memory is allocated when a memory backend is configured");
+            Some(connect_mem_backend(
+                &config.backend_path,
+                vm.guest_memory(),
+                memfd,
+                None,
+                vm_resources.machine_config.track_dirty_pages,
+            )?)
+        }
+        None => None,
     };
 
     let kvm_vm = Arc::new(vm);
@@ -327,6 +391,7 @@ pub fn build_microvm_for_boot(
         shutdown_exit_code: None,
         vm,
         device_manager,
+        mem_backend,
     };
     let vmm = Arc::new(Mutex::new(vmm));
 
@@ -430,6 +495,7 @@ pub fn build_microvm_from_snapshot(
     microvm_state: MicrovmState,
     guest_memory: Vec<GuestRegionMmap>,
     uffd: Option<Uffd>,
+    mem_backend_setup: Option<MemBackendSetup>,
     seccomp_filters: &BpfThreadMap,
     vm_resources: &mut VmResources,
     clock_realtime: bool,
@@ -449,6 +515,21 @@ pub fn build_microvm_from_snapshot(
 
     vm.restore_memory_regions(guest_memory, &microvm_state.vm_state.memory)
         .map_err(StartMicrovmError::KvmVm)?;
+
+    // Share the guest memory (and the uffd used to populate it) with the memory backend.
+    let mem_backend = match &mem_backend_setup {
+        Some(setup) => Some(
+            connect_mem_backend(
+                &setup.path,
+                vm.guest_memory(),
+                &setup.memfd,
+                uffd.as_ref(),
+                vm_resources.machine_config.track_dirty_pages,
+            )
+            .map_err(StartMicrovmError::MemBackend)?,
+        ),
+        None => None,
+    };
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -517,6 +598,7 @@ pub fn build_microvm_from_snapshot(
         shutdown_exit_code: None,
         vm,
         device_manager,
+        mem_backend,
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -855,6 +937,7 @@ pub(crate) mod tests {
             shutdown_exit_code: None,
             vm: Vm::Kvm(Arc::new(vm)),
             device_manager: default_device_manager(),
+            mem_backend: None,
         }
     }
 
@@ -873,6 +956,7 @@ pub(crate) mod tests {
             shutdown_exit_code: None,
             vm: Vm::Kvm(vm),
             device_manager,
+            mem_backend: None,
         }
     }
 

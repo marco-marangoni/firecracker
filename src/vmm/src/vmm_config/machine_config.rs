@@ -5,6 +5,7 @@ use std::fmt::Debug;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::cpu_config::templates::{CpuTemplateType, CustomCpuTemplate, StaticCpuTemplate};
+use crate::vmm_config::snapshot::{MemBackendConfig, MemBackendType};
 
 /// The default memory size of the VM, in MiB.
 pub const DEFAULT_MEM_SIZE_MIB: usize = 128;
@@ -29,6 +30,8 @@ pub enum MachineConfigError {
     SmtNotSupported,
     /// Could not determine host kernel version when checking hugetlbfs compatibility
     KernelVersion,
+    /// Only `backend_type: MemoryBackend` is valid for the machine configuration `mem_backend`.
+    InvalidMemBackend,
 }
 
 /// Describes the possible (huge)page configurations for a microVM's memory.
@@ -128,6 +131,12 @@ pub struct MachineConfig {
     /// Configures what page size Firecracker should use to back guest memory.
     #[serde(default)]
     pub huge_pages: HugePageConfig,
+    /// Memory backend process to share the guest memory with. When set, guest memory is backed
+    /// by a memfd that is handed to the process listening on `backend_path` before the microVM
+    /// starts, and snapshots of the guest memory are taken by that process. Only
+    /// `backend_type: MemoryBackend` is valid here. Not persisted in snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_backend: Option<MemBackendConfig>,
     /// GDB socket address.
     #[cfg(feature = "gdb")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -170,6 +179,7 @@ impl Default for MachineConfig {
             cpu_template: None,
             track_dirty_pages: false,
             huge_pages: HugePageConfig::None,
+            mem_backend: None,
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         }
@@ -203,6 +213,9 @@ pub struct MachineConfigUpdate {
     /// Configures what page size Firecracker should use to back guest memory.
     #[serde(default)]
     pub huge_pages: Option<HugePageConfig>,
+    /// Memory backend process to share the guest memory with.
+    #[serde(default)]
+    pub mem_backend: Option<MemBackendConfig>,
     /// GDB socket address.
     #[cfg(feature = "gdb")]
     #[serde(default)]
@@ -227,6 +240,7 @@ impl From<MachineConfig> for MachineConfigUpdate {
             cpu_template: cfg.static_template(),
             track_dirty_pages: Some(cfg.track_dirty_pages),
             huge_pages: Some(cfg.huge_pages),
+            mem_backend: cfg.mem_backend,
             #[cfg(feature = "gdb")]
             gdb_socket_path: cfg.gdb_socket_path,
         }
@@ -287,6 +301,15 @@ impl MachineConfig {
             Some(other) => Some(CpuTemplateType::Static(other)),
         };
 
+        // Like `gdb_socket_path`, `mem_backend` is replaced rather than merged: a PUT without it
+        // clears it.
+        let mem_backend = update.mem_backend.clone();
+        if let Some(backend) = &mem_backend
+            && backend.backend_type != MemBackendType::MemoryBackend
+        {
+            return Err(MachineConfigError::InvalidMemBackend);
+        }
+
         Ok(MachineConfig {
             vcpu_count,
             mem_size_mib,
@@ -294,6 +317,7 @@ impl MachineConfig {
             cpu_template,
             track_dirty_pages: update.track_dirty_pages.unwrap_or(self.track_dirty_pages),
             huge_pages: page_config,
+            mem_backend,
             #[cfg(feature = "gdb")]
             gdb_socket_path: update.gdb_socket_path.clone(),
         })

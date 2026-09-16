@@ -866,6 +866,15 @@ impl Net {
         self.tx_rate_limiter.update_buckets(tx_bytes, tx_ops);
     }
 
+    /// Forget the RX descriptor chains parsed but not yet written to, so that they are parsed
+    /// again (and their memory marked dirty again) the next time we receive a frame.
+    fn unparse_rx_buffers(&mut self) {
+        self.queues[RX_INDEX].next_avail -=
+            Wrapping(u16::try_from(self.rx_buffer.parsed_descriptors.len()).unwrap());
+        self.rx_buffer.parsed_descriptors.clear();
+        self.rx_buffer.iovec.clear();
+    }
+
     /// Reads a frame from the TAP device inside the first descriptor held by `self.rx_buffer`.
     ///
     /// # Safety
@@ -1101,13 +1110,20 @@ impl VirtioDevice for Net {
 
         // Give potential deferred RX frame to guest
         self.rx_buffer.finish_frame(&mut self.queues[RX_INDEX]);
-        // Reset the parsed available descriptors, so we will re-parse them
-        self.queues[RX_INDEX].next_avail -=
-            Wrapping(u16::try_from(self.rx_buffer.parsed_descriptors.len()).unwrap());
-        self.rx_buffer.parsed_descriptors.clear();
-        self.rx_buffer.iovec.clear();
+        self.unparse_rx_buffers();
         self.rx_buffer.used_bytes = 0;
         self.rx_buffer.used_descriptors = 0;
+    }
+
+    fn prepare_dirty_tracking_reset(&mut self) {
+        if !self.is_activated() {
+            return;
+        }
+        // RX buffers are marked dirty when parsed, not when a frame is written into them
+        // (`IoVecBufferMut::load_descriptor_chain`). Buffers parsed before the reset and filled
+        // after it would otherwise never show up in the next dirty set. Chains already written
+        // (a deferred frame) were popped from `parsed_descriptors` and are left alone.
+        self.unparse_rx_buffers();
     }
 }
 
@@ -1356,6 +1372,62 @@ pub mod tests {
 
         // Check that the used queue didn't advance.
         assert_eq!(th.rxq.used.idx.get(), 0);
+    }
+
+    /// RX buffers are marked dirty when parsed, not when written. If dirty tracking is reset in
+    /// between (a pre-copy pass of an external memory backend), the frame eventually written into
+    /// them must still end up in the next dirty set.
+    #[test]
+    fn test_prepare_dirty_tracking_reset_re_marks_rx_buffers() {
+        use vm_memory::GuestMemoryRegion;
+        use vm_memory::bitmap::Bitmap;
+
+        use crate::vmm_config::machine_config::HugePageConfig;
+        use crate::vstate::memory::test_utils::into_region_ext;
+        use crate::vstate::memory::{GuestMemoryExtension, anonymous};
+
+        let mem = into_region_ext(
+            anonymous(
+                [(GuestAddress(0), 2 * MAX_BUFFER_SIZE)].into_iter(),
+                true,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        );
+        let mut th = TestHelper::get_default(&mem);
+        th.activate_net();
+
+        let buffer_addr = GuestAddress(th.data_addr());
+        let page_of = |addr: GuestAddress| {
+            let region = mem.find_region(addr).unwrap();
+            (addr.raw_value() - region.start_addr().raw_value()) as usize & !0xfff
+        };
+        let is_dirty = |addr: GuestAddress| {
+            let region = mem.find_region(addr).unwrap();
+            region.bitmap().dirty_at(page_of(addr))
+        };
+
+        // The guest offers an RX buffer; parsing it marks it dirty right away.
+        th.add_desc_chain(NetQueue::Rx, 0, &[(0, 4096, VIRTQ_DESC_F_WRITE)]);
+        let next_avail_before = th.net().queues[RX_INDEX].next_avail;
+        th.simulate_event(NetEvent::RxQueue);
+        assert_eq!(th.net().rx_buffer.parsed_descriptors.len(), 1);
+        assert!(is_dirty(buffer_addr));
+
+        // A pre-copy pass consumes and resets the dirty set...
+        mem.reset_dirty();
+        assert!(!is_dirty(buffer_addr));
+        // ... and lets the device know: the still empty buffer is forgotten.
+        th.net().prepare_dirty_tracking_reset();
+        assert!(th.net().rx_buffer.parsed_descriptors.is_empty());
+        assert_eq!(th.net().queues[RX_INDEX].next_avail, next_avail_before);
+
+        // When a frame arrives, the buffer is parsed again, so its page is dirty again.
+        let mut frame = inject_tap_tx_frame(&th.net(), 1000);
+        th.event_manager.run_with_timeout(100).unwrap();
+        assert!(is_dirty(buffer_addr));
+        header_set_num_buffers(frame.as_mut_slice(), 1);
+        th.check_rx_queue_resume(&frame);
     }
 
     fn rx_read_only_descriptor(mut th: TestHelper) {

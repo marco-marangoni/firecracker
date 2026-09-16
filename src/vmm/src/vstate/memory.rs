@@ -58,6 +58,8 @@ pub enum MemoryError {
     MemfdSetLen(std::io::Error),
     /// Total sum of memory regions exceeds largest possible file offset
     OffsetTooLarge,
+    /// The regions to allocate do not fit in the remaining space of the guest memfd
+    MemfdTooSmall,
     /// Cannot retrieve snapshot file metadata: {0}
     FileMetadata(std::io::Error),
     /// Memory region has zero size
@@ -438,17 +440,20 @@ impl From<&GuestMemorySlot<'_>> for kvm_userspace_memory_region {
 }
 
 impl<'a> GuestMemorySlot<'a> {
-    /// Dumps the dirty pages in this slot onto the writer
-    pub(crate) fn dump_dirty<T: WriteVolatile + std::io::Seek>(
+    /// Computes the maximal runs of dirty pages in this slot, as `(offset, len)` pairs relative
+    /// to the start of the slot, in ascending order.
+    ///
+    /// A page is dirty if it is marked in either the KVM dirty log for this slot or in
+    /// Firecracker's own bitmap (which tracks writes performed by device emulation). This is the
+    /// single definition of "dirty" shared by [`Self::dump_dirty`] and by the ranges handed to an
+    /// external memory backend, so both produce the same set of pages.
+    pub(crate) fn dirty_runs(
         &self,
-        writer: &mut T,
         kvm_bitmap: &[u64],
         page_size: usize,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<Vec<(usize, usize)>, MemoryError> {
         let firecracker_bitmap = self.slice.bitmap();
-        let mut write_size = 0;
-        let mut skip_size = 0;
-        let mut dirty_batch_start = 0;
+        let mut runs: Vec<(usize, usize)> = Vec::new();
 
         let expected_bitmap_array_len = (self.slice.len() / page_size).div_ceil(64);
         if kvm_bitmap.len() > expected_bitmap_array_len {
@@ -461,7 +466,6 @@ impl<'a> GuestMemorySlot<'a> {
             for j in 0..64 {
                 let is_kvm_page_dirty = ((v >> j) & 1u64) != 0u64;
                 let page_offset = ((i * 64) + j) * page_size;
-                let is_firecracker_page_dirty = firecracker_bitmap.dirty_at(page_offset);
 
                 // We process 64 pages at a time, however the number of pages
                 // in the slot might not be a multiple of 64. We need to break
@@ -475,42 +479,52 @@ impl<'a> GuestMemorySlot<'a> {
                     break;
                 }
 
+                let is_firecracker_page_dirty = firecracker_bitmap.dirty_at(page_offset);
+
                 if is_kvm_page_dirty || is_firecracker_page_dirty {
-                    // We are at the start of a new batch of dirty pages.
-                    if skip_size > 0 {
-                        // Seek forward over the unmodified pages.
-                        let offset = skip_size
-                            .try_into()
-                            .map_err(|_| MemoryError::SlotSizeTooLarge)?;
-                        writer
-                            .seek(SeekFrom::Current(offset))
-                            .map_err(MemoryError::SeekError)?;
-                        dirty_batch_start = page_offset;
-                        skip_size = 0;
+                    match runs.last_mut() {
+                        // Extend the current run if this page is adjacent to it.
+                        Some((start, len)) if *start + *len == page_offset => *len += page_size,
+                        _ => runs.push((page_offset, page_size)),
                     }
-                    write_size += page_size;
-                } else {
-                    // We are at the end of a batch of dirty pages.
-                    if write_size > 0 {
-                        // Dump the dirty pages.
-                        let slice = &self.slice.subslice(dirty_batch_start, write_size)?;
-                        writer.write_all_volatile(slice)?;
-                        write_size = 0;
-                    }
-                    skip_size += page_size;
                 }
             }
         }
 
-        if write_size > 0 {
-            writer.write_all_volatile(&self.slice.subslice(dirty_batch_start, write_size)?)?;
+        Ok(runs)
+    }
+
+    /// Dumps the dirty pages in this slot onto the writer
+    pub(crate) fn dump_dirty<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+        kvm_bitmap: &[u64],
+        page_size: usize,
+    ) -> Result<(), MemoryError> {
+        let runs = self.dirty_runs(kvm_bitmap, page_size)?;
+
+        // Position of the writer relative to the start of the slot.
+        let mut cursor = 0;
+        for (start, len) in runs {
+            if start > cursor {
+                // Seek forward over the unmodified pages.
+                let skip =
+                    i64::try_from(start - cursor).map_err(|_| MemoryError::SlotSizeTooLarge)?;
+                writer
+                    .seek(SeekFrom::Current(skip))
+                    .map_err(MemoryError::SeekError)?;
+            }
+            writer.write_all_volatile(&self.slice.subslice(start, len)?)?;
+            cursor = start + len;
         }
 
         // Advance the cursor even if the trailing pages are clean, so that the
         // next slot starts writing at the correct offset.
-        if skip_size > 0 {
+        if cursor < self.slice.len() {
+            let skip = i64::try_from(self.slice.len() - cursor)
+                .map_err(|_| MemoryError::SlotSizeTooLarge)?;
             writer
-                .seek(SeekFrom::Current(skip_size.try_into().unwrap()))
+                .seek(SeekFrom::Current(skip))
                 .map_err(MemoryError::SeekError)?;
         }
 
@@ -889,8 +903,27 @@ pub fn create(
     track_dirty_pages: bool,
     madvise_flags: libc::c_int,
 ) -> Result<Vec<GuestRegionMmap>, MemoryError> {
-    let mut offset = 0;
-    let file = file.map(Arc::new);
+    create_at_offset(
+        regions,
+        mmap_flags,
+        file.map(Arc::new),
+        0,
+        track_dirty_pages,
+        madvise_flags,
+    )
+}
+
+/// Creates a `Vec` of `GuestRegionMmap` with the given configuration, mapping the regions
+/// consecutively from `file` starting at `base_offset`.
+fn create_at_offset(
+    regions: impl Iterator<Item = (GuestAddress, usize)>,
+    mmap_flags: libc::c_int,
+    file: Option<Arc<File>>,
+    base_offset: u64,
+    track_dirty_pages: bool,
+    madvise_flags: libc::c_int,
+) -> Result<Vec<GuestRegionMmap>, MemoryError> {
+    let mut offset = base_offset;
     regions
         .map(|(start, size)| {
             let guest_memory = GuestRegionMmap::allocate(
@@ -933,15 +966,83 @@ pub fn memfd_backed(
         .iter()
         .try_fold(0u64, |acc, &(_, size)| acc.checked_add(size as u64))
         .ok_or(MemoryError::OffsetTooLarge)?;
-    let memfd_file = create_memfd(size, huge_pages.into())?.into_file();
+    let mut memfd = GuestMemfd::new(size, huge_pages)?;
+    memfd.allocate(regions, track_dirty_pages)
+}
 
-    create(
-        regions.iter().copied(),
-        libc::MAP_SHARED | huge_pages.mmap_flags(),
-        Some(memfd_file),
-        track_dirty_pages,
-        huge_pages.madvise_flags(),
-    )
+/// A single memfd backing all regions of a microVM's guest memory.
+///
+/// Regions are mapped MAP_SHARED at consecutive offsets in the memfd, in the order they are
+/// allocated. Because regions are allocated in ascending guest address order (DRAM first, the
+/// hotpluggable region last), the offset of each region in the memfd is the same as its offset in
+/// a snapshot memory file (see [`GuestMemoryExtension::dump`]): the memfd content *is* a full
+/// snapshot of the guest memory. This is what allows an external memory backend process holding
+/// the memfd to create snapshots that are byte-for-byte identical to Firecracker's.
+#[derive(Debug)]
+pub struct GuestMemfd {
+    file: Arc<File>,
+    size: u64,
+    next_offset: u64,
+    huge_pages: HugePageConfig,
+}
+
+impl GuestMemfd {
+    /// Creates a sealed memfd of `size` bytes from which regions can then be allocated.
+    pub fn new(size: u64, huge_pages: HugePageConfig) -> Result<Self, MemoryError> {
+        let file = create_memfd(size, huge_pages.into())?.into_file();
+        Ok(Self {
+            file: Arc::new(file),
+            size,
+            next_offset: 0,
+            huge_pages,
+        })
+    }
+
+    /// The memfd file.
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+
+    /// The total size of the memfd, in bytes.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Maps the given regions MAP_SHARED from this memfd, at the next free offsets.
+    pub fn allocate(
+        &mut self,
+        regions: &[(GuestAddress, usize)],
+        track_dirty_pages: bool,
+    ) -> Result<Vec<GuestRegionMmap>, MemoryError> {
+        let size = regions
+            .iter()
+            .try_fold(0u64, |acc, &(_, size)| acc.checked_add(size as u64))
+            .ok_or(MemoryError::OffsetTooLarge)?;
+        let end = self
+            .next_offset
+            .checked_add(size)
+            .ok_or(MemoryError::OffsetTooLarge)?;
+        if end > self.size {
+            return Err(MemoryError::MemfdTooSmall);
+        }
+
+        let mappings = create_at_offset(
+            regions.iter().copied(),
+            libc::MAP_SHARED | self.huge_pages.mmap_flags(),
+            Some(Arc::clone(&self.file)),
+            self.next_offset,
+            track_dirty_pages,
+            self.huge_pages.madvise_flags(),
+        )?;
+        self.next_offset = end;
+        Ok(mappings)
+    }
+}
+
+impl AsRawFd for GuestMemfd {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.file.as_raw_fd()
+    }
 }
 
 /// Creates a GuestMemoryMmap from raw regions.
@@ -1032,6 +1133,55 @@ where
     /// Check whether the given guest address range falls entirely within plugged memory.
     /// Returns Err if the address is not in any region or is in an unplugged slot.
     fn check_range_plugged(&self, addr: GuestAddress, len: usize) -> Result<(), GuestMemoryError>;
+
+    /// Describes the regions of this memory for an external memory backend: the layout of the
+    /// snapshot memory file, plus the host virtual address of each region.
+    fn describe_for_backend(&self) -> Vec<MemBackendRegion>;
+
+    /// Computes the ranges of the snapshot memory file that [`Self::dump_dirty`] would write for
+    /// `dirty_bitmap`: every page dirty in the KVM dirty log or in Firecracker's own bitmap,
+    /// restricted to plugged slots. Does not reset any bitmap.
+    fn dirty_ranges(&self, dirty_bitmap: &DirtyBitmap) -> Result<Vec<MemRange>, MemoryError>;
+
+    /// Computes the ranges of the snapshot memory file that [`Self::dump`] would write: all
+    /// plugged slots.
+    fn plugged_ranges(&self) -> Vec<MemRange>;
+}
+
+/// A range of the snapshot memory file (equivalently, of the guest memfd), page aligned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemRange {
+    /// Offset of the range in the memory file.
+    pub offset: u64,
+    /// Length of the range in bytes.
+    pub len: u64,
+}
+
+/// Appends `range` to `ranges`, merging it with the last one if they are contiguous.
+fn push_range(ranges: &mut Vec<MemRange>, range: MemRange) {
+    match ranges.last_mut() {
+        Some(last) if last.offset + last.len == range.offset => last.len += range.len,
+        _ => ranges.push(range),
+    }
+}
+
+/// Description of a guest memory region as sent to an external memory backend.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemBackendRegion {
+    /// Base guest physical address of the region.
+    pub guest_addr: u64,
+    /// Region size in bytes.
+    pub size: u64,
+    /// Offset of the region in the snapshot memory file / guest memfd.
+    pub file_offset: u64,
+    /// Host virtual address at which Firecracker has mapped the region.
+    pub host_virt_addr: u64,
+    /// Type of the region.
+    pub region_type: GuestRegionType,
+    /// Size in bytes of the KVM memory slots this region is split into.
+    pub slot_size: u64,
+    /// Whether each slot is plugged (has memory backing it and is visible to the guest).
+    pub plugged: Vec<bool>,
 }
 
 /// State of a guest memory region saved to file/buffer.
@@ -1139,6 +1289,81 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         }
 
         write_result
+    }
+
+    fn describe_for_backend(&self) -> Vec<MemBackendRegion> {
+        let mut file_offset = 0;
+        self.iter()
+            .map(|region| {
+                let described = MemBackendRegion {
+                    guest_addr: region.start_addr().0,
+                    size: region.len(),
+                    file_offset,
+                    host_virt_addr: region.as_ptr() as u64,
+                    region_type: region.region_type,
+                    slot_size: region.slot_size as u64,
+                    plugged: region.plugged.lock().unwrap().iter().by_vals().collect(),
+                };
+                // When the memory is backed by a shared memfd, the layout of the memfd must be
+                // the one of the snapshot file, otherwise the ranges we hand out are meaningless
+                // to the backend.
+                debug_assert!(
+                    region
+                        .file_offset()
+                        .is_none_or(|fo| fo.start() == file_offset),
+                    "guest memory region file offset does not match snapshot layout"
+                );
+                file_offset += region.len();
+                described
+            })
+            .collect()
+    }
+
+    fn dirty_ranges(&self, dirty_bitmap: &DirtyBitmap) -> Result<Vec<MemRange>, MemoryError> {
+        let page_size = host_page_size();
+        let mut ranges = Vec::new();
+        let mut file_offset = 0u64;
+
+        for (mem_slot, plugged) in self.iter().flat_map(|region| region.slots()) {
+            if plugged {
+                let kvm_bitmap = dirty_bitmap
+                    .get(&mem_slot.slot)
+                    .ok_or(MemoryError::DirtyBitmapNotFound(mem_slot.slot))?;
+                for (start, len) in mem_slot.dirty_runs(kvm_bitmap, page_size)? {
+                    push_range(
+                        &mut ranges,
+                        MemRange {
+                            offset: file_offset + start as u64,
+                            len: len as u64,
+                        },
+                    );
+                }
+            }
+            file_offset += mem_slot.slice.len() as u64;
+        }
+
+        Ok(ranges)
+    }
+
+    fn plugged_ranges(&self) -> Vec<MemRange> {
+        let mut ranges = Vec::new();
+        let mut file_offset = 0u64;
+
+        for (mem_slot, plugged) in self.iter().flat_map(|region| region.slots()) {
+            let len = mem_slot.slice.len() as u64;
+            if plugged {
+                push_range(
+                    &mut ranges,
+                    MemRange {
+                        offset: file_offset,
+                        len,
+                    },
+                );
+            }
+            file_offset += len;
+        }
+
+        ranges
     }
 
     /// Resets all the memory region bitmaps
@@ -1275,7 +1500,7 @@ mod tests {
 
     use std::collections::HashMap;
     use std::io::{Read, Seek, Write};
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{FileExt, MetadataExt};
 
     use vmm_sys_util::tempfile::TempFile;
 
@@ -2233,7 +2458,186 @@ mod tests {
                     }
                 }
             }
+
+            /// The ranges handed to an external memory backend must describe exactly the bytes
+            /// Firecracker itself writes: applying `dirty_ranges` (resp. `plugged_ranges`) on top
+            /// of the guest memory must produce a file identical to `dump_dirty` (resp. `dump`).
+            #[test]
+            fn backend_ranges_identity(
+                region_specs in proptest::collection::vec(region_spec(), 1..=3),
+            ) {
+                let page_size = host_page_size();
+                let (guest_memory, kvm_bitmap, total_size) = build_memory(&region_specs);
+
+                for region in guest_memory.iter() {
+                    let ptr = region.get_host_address(MemoryRegionAddress(0)).unwrap();
+                    // SAFETY: ptr is valid for region.len() bytes.
+                    unsafe { std::ptr::write_bytes(ptr, 0xAB, u64_to_usize(region.len())) };
+                }
+                for (region, spec) in guest_memory.iter().zip(region_specs.iter()) {
+                    for (slot_idx, (slot, plugged)) in region.slots().enumerate() {
+                        if !plugged {
+                            continue;
+                        }
+                        for (page, dirty) in spec.fc_dirty_pages[slot_idx].iter().enumerate() {
+                            if *dirty {
+                                let addr = slot.guest_addr.0 + (page * page_size) as u64;
+                                guest_memory.write(&[0xCD], GuestAddress(addr)).unwrap();
+                            }
+                        }
+                    }
+                }
+
+                // What a backend does: copy the given ranges of the memory file (here: read
+                // through the region layout, as the backend would read the memfd) into a file.
+                // Ranges may span several regions, since the file layout is contiguous.
+                let apply_ranges = |ranges: &[MemRange]| -> Result<Vec<u8>, TestCaseError> {
+                    let layout = guest_memory.describe_for_backend();
+                    let mut image = vec![0u8; total_size];
+                    for range in ranges {
+                        prop_assert_eq!(range.offset % page_size as u64, 0);
+                        prop_assert_eq!(range.len % page_size as u64, 0);
+                        let range_end = range.offset + range.len;
+                        let mut covered = 0;
+                        for region in &layout {
+                            let start = range.offset.max(region.file_offset);
+                            let end = range_end.min(region.file_offset + region.size);
+                            if start >= end {
+                                continue;
+                            }
+                            let guest_addr = GuestAddress(region.guest_addr + (start - region.file_offset));
+                            let dst = &mut image[u64_to_usize(start)..u64_to_usize(end)];
+                            guest_memory.read(dst, guest_addr).unwrap();
+                            covered += end - start;
+                        }
+                        prop_assert_eq!(covered, range.len, "range not fully covered by regions");
+                    }
+                    Ok(image)
+                };
+
+                // Ranges must be sorted and merged.
+                let check_canonical = |ranges: &[MemRange]| -> Result<(), TestCaseError> {
+                    for w in ranges.windows(2) {
+                        prop_assert!(w[0].offset + w[0].len < w[1].offset, "ranges not merged/sorted: {:?}", w);
+                    }
+                    Ok(())
+                };
+
+                // Diff: dirty_ranges does not consume, so it can run before dump_dirty.
+                let dirty = guest_memory.dirty_ranges(&kvm_bitmap).unwrap();
+                check_canonical(&dirty)?;
+                let backend_diff = apply_ranges(&dirty)?;
+
+                let mut fc_diff_file = TempFile::new().unwrap().into_file();
+                fc_diff_file.set_len(total_size as u64).unwrap();
+                guest_memory.dump_dirty(&mut fc_diff_file, &kvm_bitmap).unwrap();
+                fc_diff_file.seek(SeekFrom::Start(0)).unwrap();
+                let mut fc_diff = vec![0u8; total_size];
+                fc_diff_file.read_exact(&mut fc_diff).unwrap();
+                prop_assert_eq!(&backend_diff, &fc_diff);
+
+                // Full.
+                let plugged = guest_memory.plugged_ranges();
+                check_canonical(&plugged)?;
+                let backend_full = apply_ranges(&plugged)?;
+
+                let mut fc_full_file = TempFile::new().unwrap().into_file();
+                fc_full_file.set_len(total_size as u64).unwrap();
+                guest_memory.dump(&mut fc_full_file).unwrap();
+                fc_full_file.seek(SeekFrom::Start(0)).unwrap();
+                let mut fc_full = vec![0u8; total_size];
+                fc_full_file.read_exact(&mut fc_full).unwrap();
+                prop_assert_eq!(&backend_full, &fc_full);
+            }
         }
+    }
+
+    /// With a shared memfd, the memfd content itself must be a full snapshot: regions are laid
+    /// out in it exactly as `dump` lays them out in a memory file, including the hotpluggable
+    /// region allocated separately, later.
+    #[test]
+    fn test_guest_memfd_layout_matches_dump() {
+        let page_size = host_page_size();
+        let dram = [
+            (GuestAddress(0), page_size * 3),
+            (GuestAddress(page_size as u64 * 8), page_size * 2),
+        ];
+        let hotplug_addr = GuestAddress(page_size as u64 * 32);
+        let hotplug_size = page_size * 4; // 4 slots of one page
+        let total = page_size * (3 + 2 + 4);
+
+        let mut memfd = GuestMemfd::new(total as u64, HugePageConfig::None).unwrap();
+        let dram_regions = memfd.allocate(&dram, false).unwrap();
+        let hotplug_region = memfd
+            .allocate(&[(hotplug_addr, hotplug_size)], false)
+            .unwrap()
+            .pop()
+            .unwrap();
+        // The memfd is full now.
+        assert!(matches!(
+            memfd.allocate(&[(GuestAddress(0), page_size)], false),
+            Err(MemoryError::MemfdTooSmall)
+        ));
+
+        let mut regions: Vec<_> = dram_regions
+            .into_iter()
+            .zip(0u32..)
+            .map(|(r, slot)| GuestRegionMmapExt::dram_from_mmap_region(r, slot))
+            .collect();
+        regions.push(
+            GuestRegionMmapExt::from_state(
+                hotplug_region,
+                &GuestMemoryRegionState {
+                    base_address: hotplug_addr.0,
+                    size: hotplug_size,
+                    region_type: GuestRegionType::Hotpluggable,
+                    plugged: vec![true, false, true, false],
+                },
+                2,
+            )
+            .unwrap(),
+        );
+        let guest_memory = GuestMemoryMmap::from_regions(regions).unwrap();
+
+        // Fill every plugged page with its page number.
+        let mut expected_file_offsets = Vec::new();
+        let mut offset = 0u64;
+        for region in guest_memory.iter() {
+            expected_file_offsets.push(offset);
+            for (slot, plugged) in region.slots() {
+                if plugged {
+                    let n = u8::try_from(offset / page_size as u64).unwrap();
+                    guest_memory
+                        .write(&vec![n; page_size], slot.guest_addr)
+                        .unwrap();
+                }
+                offset += slot.slice.len() as u64;
+            }
+        }
+
+        // The described layout matches both the memfd offsets and the dump layout.
+        let described = guest_memory.describe_for_backend();
+        for (desc, region) in described.iter().zip(guest_memory.iter()) {
+            assert_eq!(desc.file_offset, region.file_offset().unwrap().start());
+            assert_eq!(desc.host_virt_addr, region.as_ptr() as u64);
+        }
+        assert_eq!(
+            described.iter().map(|d| d.file_offset).collect::<Vec<_>>(),
+            expected_file_offsets
+        );
+        assert_eq!(described.iter().map(|d| d.size).sum::<u64>(), memfd.size());
+
+        let mut dump_file = TempFile::new().unwrap().into_file();
+        dump_file.set_len(total as u64).unwrap();
+        guest_memory.dump(&mut dump_file).unwrap();
+        dump_file.seek(SeekFrom::Start(0)).unwrap();
+        let mut dumped = vec![0u8; total];
+        dump_file.read_exact(&mut dumped).unwrap();
+
+        let mut from_memfd = vec![0u8; total];
+        memfd.file().read_exact_at(&mut from_memfd, 0).unwrap();
+
+        assert_eq!(dumped, from_memfd);
     }
 
     #[test]

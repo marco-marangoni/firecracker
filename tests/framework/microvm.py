@@ -42,6 +42,7 @@ from framework.properties import global_props
 from framework.utils_cpu_templates import get_cpu_template_name
 from framework.utils_drive import VhostUserBlkBackend, VhostUserBlkBackendType
 from framework.utils_hugepages import HugePagesConfig
+from framework.utils_mem_backend import spawn_memory_backend
 from framework.utils_uffd import spawn_pf_handler, uffd_handler
 from framework.vm_backend import VmBackend
 from host_tools.fcmetrics import FCMetricsMonitor
@@ -226,6 +227,7 @@ class Microvm:
         self.initrd_file = None
         self.boot_args = None
         self.uffd_handler = None
+        self.mem_backend = None
 
         self.fc_binary_path = Path(fc_binary_path)
         assert fc_binary_path.exists()
@@ -393,6 +395,9 @@ class Microvm:
 
         if self.uffd_handler and self.uffd_handler.is_running():
             self.uffd_handler.kill()
+
+        if self.mem_backend and self.mem_backend.is_running():
+            self.mem_backend.kill()
 
         if self.api:
             self.api.session.close()
@@ -826,6 +831,20 @@ class Microvm:
         """Configure the microVM, delegating to the configured backend."""
         return self.backend.basic_config(self, *args, **kwargs)
 
+    def use_memory_backend(self):
+        """Spawn a memory backend process and configure the microVM to share its
+        guest memory with it. Call after `basic_config` and before `start` (a PUT to
+        /machine-config resets the field).
+        """
+        self.mem_backend = spawn_memory_backend(self)
+        self.api.machine_config.patch(
+            mem_backend={
+                "backend_type": "MemoryBackend",
+                "backend_path": str(self.mem_backend.socket_path),
+            }
+        )
+        return self.mem_backend
+
     def set_cpu_template(self, cpu_template):
         """Set guest CPU template."""
         self.cpu_template_name = get_cpu_template_name(cpu_template)
@@ -999,16 +1018,29 @@ class Microvm:
         # Notify monitor that snapshot is being created
         if self.memory_monitor:
             self.memory_monitor.set_threshold_for_snapshot()
-        self.api.snapshot_create.put(
-            mem_file_path=str(mem_path),
-            snapshot_path=str(vmstate_path),
-            snapshot_type=snapshot_type.api_type,
-            sync_snapshot_files=sync_snapshot_files,
-        )
         root = Path(self.chroot())
+        if self.mem_backend is not None:
+            # The memory backend process writes the guest memory; Firecracker only
+            # writes the vmstate.
+            mem_file = self.mem_backend.next_snapshot_mem()
+            self.api.snapshot_create.put(
+                mem_backend={"backend_type": "MemoryBackend"},
+                snapshot_path=str(vmstate_path),
+                snapshot_type=snapshot_type.api_type,
+                sync_snapshot_files=sync_snapshot_files,
+            )
+            assert mem_file.exists(), self.mem_backend.log_data
+        else:
+            self.api.snapshot_create.put(
+                mem_file_path=str(mem_path),
+                snapshot_path=str(vmstate_path),
+                snapshot_type=snapshot_type.api_type,
+                sync_snapshot_files=sync_snapshot_files,
+            )
+            mem_file = root / mem_path
         return Snapshot(
             vmstate=root / vmstate_path,
-            mem=root / mem_path,
+            mem=mem_file,
             disks=self.disks,
             net_ifaces=[x["iface"] for ifname, x in self.iface.items()],
             ssh_key=self.ssh_key,
@@ -1043,17 +1075,26 @@ class Microvm:
         *,
         huge_pages: Optional[HugePagesConfig] = None,
         uffd_handler_name: str = None,
+        mem_backend: bool = False,
     ):
-        """Restore a snapshot"""
+        """Restore a snapshot
+
+        With `mem_backend=True`, the guest memory is populated by (and shared
+        with) a memory backend process instead of a plain UFFD handler or a
+        file mapping.
+        """
 
         jailed_snapshot = snapshot.copy_to_chroot(Path(self.chroot()))
 
+        assert not (uffd_handler_name and mem_backend)
         if uffd_handler_name:
             self.uffd_handler = spawn_pf_handler(
                 self,
                 uffd_handler(uffd_handler_name, binary_dir=self.fc_binary_path.parent),
                 jailed_snapshot,
             )
+        if mem_backend:
+            self.mem_backend = spawn_memory_backend(self, jailed_snapshot)
 
         jailed_mem = Path("/") / jailed_snapshot.mem.name
         jailed_vmstate = Path("/") / jailed_snapshot.vmstate.name
@@ -1075,6 +1116,11 @@ class Microvm:
             mem_backend = {
                 "backend_type": "Uffd",
                 "backend_path": str(self.uffd_handler.socket_path),
+            }
+        if self.mem_backend is not None:
+            mem_backend = {
+                "backend_type": "MemoryBackend",
+                "backend_path": str(self.mem_backend.socket_path),
             }
 
         for key, value in jailed_snapshot.meta.items():
