@@ -159,6 +159,7 @@ use crate::vmm_config::machine_config::MachineConfig;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vmm_config::mmds::MmdsConfig;
 use crate::vmm_config::net::NetworkInterfaceConfig;
+use crate::vmm_config::snapshot::{SnapshotMemoryLayout, SnapshotType};
 use crate::vmm_config::vsock::VsockDeviceConfig;
 pub use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{GuestMemoryMmap, GuestMemoryRegion};
@@ -226,6 +227,10 @@ pub enum VmmError {
     MmioDeviceManager(device_manager::mmio::MmioError),
     /// Error getting the KVM dirty bitmap. {0}
     DirtyBitmap(kvm_ioctls::Error),
+    /// Error computing dirty ranges: {0}
+    DirtyRanges(String),
+    /// No memory backend is attached to this microVM
+    NoMemBackend,
     /// I8042 error: {0}
     I8042Error(devices::legacy::I8042DeviceError),
     #[cfg(target_arch = "x86_64")]
@@ -308,6 +313,11 @@ pub struct Vmm {
     pub vm: Vm,
     // Device manager
     device_manager: DeviceManager,
+    /// Whether guest memory was handed to a memory backend (as a memfd) at boot or restore.
+    /// When set, `PUT /snapshot/create` never writes guest memory and instead reports the
+    /// ranges of the memfd that make up the snapshot, and `PUT /snapshot/dirty-ranges` is
+    /// allowed.
+    pub mem_backend_attached: bool,
 }
 
 impl Vmm {
@@ -484,6 +494,38 @@ impl Vmm {
         kvm_vm.pause_vcpus()?;
         self.instance_info.state = VmState::Paused;
         Ok(())
+    }
+
+    /// Reports (and consumes) the ranges of guest memory dirtied since the last snapshot or the
+    /// last call, for pre-copy by a memory backend. See `PUT /snapshot/dirty-ranges`.
+    ///
+    /// Only meaningful with a memory backend attached: without one, nobody but Firecracker can
+    /// turn the dirty bitmaps into bytes, and consuming them here would silently make the next
+    /// Firecracker-written diff snapshot incomplete.
+    pub fn dirty_ranges(&mut self) -> Result<SnapshotMemoryLayout, VmmError> {
+        if !self.mem_backend_attached {
+            return Err(VmmError::NoMemBackend);
+        }
+        let kvm_vm = self
+            .vm
+            .as_kvm()
+            .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
+
+        // Devices that mark guest memory dirty ahead of writing to it (virtio-net marks RX
+        // buffers when it parses them) must give those buffers back before the reset, or the
+        // later write would never show up in a dirty set.
+        self.device_manager.prepare_dirty_tracking_reset();
+
+        let layout = kvm_vm
+            .snapshot_memory_layout(SnapshotType::Diff)
+            .map_err(|err| VmmError::DirtyRanges(err.to_string()))?;
+
+        // Queue pages are not tracked at runtime; mark them so the next set includes them, as
+        // `create_snapshot` does.
+        self.device_manager
+            .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
+
+        Ok(layout)
     }
 
     /// Injects CTRL+ALT+DEL keystroke combo in the i8042 device.

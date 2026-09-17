@@ -483,12 +483,15 @@ impl VmResources {
     ///
     /// Page faults are more expensive for shared memory mappings, including memfd. For this
     /// reason, guest memory is only backed by a memfd when something outside of Firecracker
-    /// has to see it, which today means a vhost-user-blk device.
+    /// has to see it: a vhost-user-blk device, or a memory backend configured in
+    /// `machine-config`.
     fn memfd_required(&self) -> bool {
-        self.block
+        let vhost_user_device_used = self
+            .block
             .devices
             .iter()
-            .any(|b| b.lock().expect("Poisoned lock").is_vhost_user())
+            .any(|b| b.lock().expect("Poisoned lock").is_vhost_user());
+        vhost_user_device_used || self.machine_config.mem_backend.is_some()
     }
 
     /// Total size in bytes of guest memory: the given DRAM regions plus the virtio-mem
@@ -1586,6 +1589,7 @@ mod tests {
             cpu_template: Some(StaticCpuTemplate::V1N1),
             track_dirty_pages: Some(false),
             huge_pages: Some(HugePageConfig::None),
+            mem_backend: None,
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         };

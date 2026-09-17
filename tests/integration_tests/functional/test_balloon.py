@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for guest-side operations on /balloon resources."""
 
+import filecmp
 import signal
 import time
 
@@ -705,3 +706,35 @@ def test_device_reset(uvm):
     # Deflate to make sure the device is functional in both directions
     vm.api.balloon.patch(amount_mib=0)
     wait_for_balloon_actual(vm, 0)
+
+
+def test_balloon_inflate_marks_pages_dirty(uvm):
+    """
+    Pages released through the balloon read as zero afterwards, so a diff
+    snapshot taken after an inflate must contain them: rebasing it onto the
+    previous full snapshot has to give the same memory file as a full snapshot
+    taken at the same time.
+    """
+    vm = uvm
+    vm.spawn()
+    vm.memory_monitor = None
+    vm.basic_config(vcpu_count=2, mem_size_mib=256, track_dirty_pages=True)
+    vm.add_net_iface()
+    vm.api.balloon.put(
+        amount_mib=0,
+        deflate_on_oom=True,
+        stats_polling_interval_s=STATS_POLLING_INTERVAL_S,
+    )
+    vm.start()
+
+    make_guest_dirty_memory(vm.ssh, amount_mib=64)
+    base = vm.snapshot_full(mem_path="mem_base")
+    vm.resume()
+
+    vm.api.balloon.patch(amount_mib=128)
+    wait_for_balloon_actual(vm, 128, timeout_s=30)
+
+    diff = vm.snapshot_diff(mem_path="mem_diff")
+    full = vm.snapshot_full(mem_path="mem_full", vmstate_path="vmstate_full")
+    rebased = diff.rebase_snapshot(base)
+    assert filecmp.cmp(rebased.mem, full.mem, shallow=False)

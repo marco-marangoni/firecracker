@@ -32,7 +32,7 @@ use crate::logger::{debug, info};
 use crate::pci::PciSBDF;
 use crate::pci::msix::MsixTableEntry;
 use crate::persist::CreateSnapshotError;
-use crate::vmm_config::snapshot::SnapshotType;
+use crate::vmm_config::snapshot::{SnapshotMemoryLayout, SnapshotType};
 use crate::vstate::bus::Bus;
 use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorGroup};
 use crate::vstate::kvm::Kvm;
@@ -589,6 +589,30 @@ impl KvmVm {
                 Ok((mem_slot.slot, bitmap))
             })
             .collect()
+    }
+
+    /// Describes which ranges of the guest memory (in memory file / memfd offset space) a
+    /// snapshot of the given type consists of, without writing anything. This is the memory
+    /// backend counterpart of [`Self::snapshot_memory_to_file`] and consumes the dirty tracking
+    /// state in the same way: a `Diff` layout covers exactly the pages `dump_dirty` would write
+    /// and resets both bitmaps on success; a `Full` layout covers all plugged slots and resets
+    /// both bitmaps.
+    pub(crate) fn snapshot_memory_layout(
+        &self,
+        snapshot_type: SnapshotType,
+    ) -> Result<SnapshotMemoryLayout, CreateSnapshotError> {
+        match snapshot_type {
+            SnapshotType::Diff => {
+                let dirty_bitmap = self.get_dirty_bitmap()?;
+                Ok(self.guest_memory().dirty_layout(&dirty_bitmap)?)
+            }
+            SnapshotType::Full => {
+                let layout = self.guest_memory().full_layout();
+                self.reset_dirty_bitmap();
+                self.guest_memory().reset_dirty();
+                Ok(layout)
+            }
+        }
     }
 
     /// Takes a snapshot of the virtual machine running inside the given [`Vmm`] and saves it to

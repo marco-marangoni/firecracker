@@ -110,7 +110,9 @@ class Resource:
             if self._api.error_callback:
                 self._api.error_callback(method, path, str(e))
             raise
-        if res.status_code != HTTPStatus.NO_CONTENT:
+        # Most endpoints answer 204; a few answer 200 with a JSON body (e.g.
+        # `PUT /snapshot/create` with a memory backend attached).
+        if res.status_code not in (HTTPStatus.NO_CONTENT, HTTPStatus.OK):
             json = res.json()
             msg = res.content
             if "fault_message" in json:
@@ -195,6 +197,7 @@ class Api:
         self.vsock = Resource(self, "/vsock")
         self.snapshot_create = Resource(self, "/snapshot/create")
         self.snapshot_load = Resource(self, "/snapshot/load")
+        self.snapshot_dirty_ranges = Resource(self, "/snapshot/dirty-ranges")
         self.cpu_config = Resource(self, "/cpu-config")
         self.entropy = Resource(self, "/entropy")
         self.pmem = Resource(self, "/pmem", "id")

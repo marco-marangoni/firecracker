@@ -13,6 +13,17 @@ and this project adheres to
 - [#6237](https://github.com/firecracker-microvm/firecracker/pull/6237): Added
   balloon and virtio-mem memory reclamation for shared memfd-backed guest
   memory, such as memory shared with vhost-user devices.
+- [#XXXX](https://github.com/firecracker-microvm/firecracker/pull/XXXX): Added a
+  `SharedMemfd` memory backend type, in developer preview. A microVM booted with
+  `machine-config.mem_backend` or restored with
+  `snapshot/load.mem_backend.backend_type: SharedMemfd` has its guest memory
+  backed by a single memfd laid out like a memory snapshot file, which is handed
+  to the page fault handler process through the existing UFFD handshake (as an
+  additional file descriptor). `PUT /snapshot/create` then takes no
+  `mem_file_path` and answers `200 OK` with the memory ranges that make up the
+  snapshot, and the new `PUT /snapshot/dirty-ranges` endpoint returns (and
+  resets) the pages dirtied since the last snapshot for pre-copy while the guest
+  runs. See [memory backend](docs/snapshotting/shared-memfd.md).
 
 ### Changed
 
@@ -35,6 +46,16 @@ and this project adheres to
   partial huge pages either failed or kept their old contents. Because zeroing
   allocates huge pages that were not backed yet, use free page reporting or
   hinting instead of the traditional balloon with hugetlbfs.
+- [#XXXX](https://github.com/firecracker-microvm/firecracker/pull/XXXX): Memory
+  released by the balloon device (inflation, free page reporting) or by
+  virtio-mem unplug is now marked dirty, so that a subsequent diff snapshot
+  records the zeroed pages instead of leaving their previous content in a merged
+  memory file.
+- [#XXXX](https://github.com/firecracker-microvm/firecracker/pull/XXXX): The
+  example UFFD handlers in `src/firecracker/examples/uffd/` read all file
+  descriptors attached to the handshake message and can be started as memory
+  backends (`handler <socket> [mem_file] [--control-sock <path>]`); the memory
+  file argument is now optional.
 
 ### Deprecated
 
@@ -57,6 +78,13 @@ and this project adheres to
   duration of every `printk` and expects the RX interrupt to be re-asserted once
   it restores IER, so input that arrived meanwhile stayed in the FIFO and was
   never delivered to the guest.
+
+- [#XXXX](https://github.com/firecracker-microvm/firecracker/pull/XXXX): Balloon
+  inflation and virtio-mem unplug now release host memory when guest memory is
+  backed by a memfd (vhost-user devices, memory backends). The range is
+  discarded with `madvise(MADV_REMOVE)`, which punches a hole into the memfd,
+  instead of `madvise(MADV_DONTNEED)`, which has no effect on the pages of a
+  shared mapping. UFFD handlers keep receiving the `remove` event for the range.
 
 - [#6211](https://github.com/firecracker-microvm/firecracker/pull/6211): Fixed
   the rate limiter permanently throttling a device when a single request

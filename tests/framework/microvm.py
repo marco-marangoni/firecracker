@@ -227,6 +227,9 @@ class Microvm:
         self.initrd_file = None
         self.boot_args = None
         self.uffd_handler = None
+        # The `memory` object of the last `PUT /snapshot/create` /
+        # `PUT /snapshot/dirty-ranges` response, when a memory backend is attached.
+        self.last_snapshot_memory = None
 
         self.fc_binary_path = Path(fc_binary_path)
         assert fc_binary_path.exists()
@@ -976,6 +979,51 @@ class Microvm:
         if self.iface:
             self.wait_for_ssh_up()
 
+    @property
+    def mem_backend(self):
+        """The memory backend process this microVM shares its guest memory with, if any.
+
+        This is the UFFD handler started with a control socket, either for a boot
+        (`machine-config.mem_backend`) or for a restore with
+        `backend_type: SharedMemfd`.
+        """
+        if self.uffd_handler is not None and self.uffd_handler.control_socket_path:
+            return self.uffd_handler
+        return None
+
+    def spawn_mem_backend(self, handler_name: str = "on_demand") -> dict:
+        """Start an example UFFD handler as a memory backend for a boot.
+
+        Returns the `mem_backend` object to pass to `PUT /machine-config`. The
+        handler receives only the guest memory memfd during boot (there are no
+        page faults to serve), keeps it, and copies snapshot ranges out of it
+        when asked through `make_snapshot`.
+        """
+        assert self.uffd_handler is None
+        self.uffd_handler = spawn_pf_handler(
+            self,
+            uffd_handler(handler_name, binary_dir=self.fc_binary_path.parent),
+            None,
+            mem_backend=True,
+        )
+        return {
+            "backend_type": "SharedMemfd",
+            "backend_path": str(self.uffd_handler.socket_path),
+        }
+
+    def dirty_ranges(self, *, copy_to: str = None) -> dict:
+        """`PUT /snapshot/dirty-ranges`: fetch (and consume) the ranges dirtied since the
+        last snapshot or the last call, for a pre-copy pass. Requires a memory backend.
+
+        With `copy_to`, also asks the backend to copy those ranges into that file
+        (chroot-relative path), as an orchestrator would.
+        """
+        memory = self.api.snapshot_dirty_ranges.put().json()["memory"]
+        self.last_snapshot_memory = memory
+        if copy_to is not None:
+            self.mem_backend.copy(memory, str(Path("/") / copy_to))
+        return memory
+
     def pause(self):
         """Pauses the microVM"""
         self.api.vm.patch(state="Paused")
@@ -1006,12 +1054,27 @@ class Microvm:
         # Notify monitor that snapshot is being created
         if self.memory_monitor:
             self.memory_monitor.set_threshold_for_snapshot()
-        self.api.snapshot_create.put(
-            mem_file_path=str(mem_path),
-            snapshot_path=str(vmstate_path),
-            snapshot_type=snapshot_type.api_type,
-            sync_snapshot_files=sync_snapshot_files,
-        )
+        if self.mem_backend is None:
+            self.api.snapshot_create.put(
+                mem_file_path=str(mem_path),
+                snapshot_path=str(vmstate_path),
+                snapshot_type=snapshot_type.api_type,
+                sync_snapshot_files=sync_snapshot_files,
+            )
+        else:
+            # With a memory backend attached Firecracker does not write guest memory;
+            # it tells us which ranges of the shared memfd make up the snapshot, and
+            # we (the orchestrator) have the backend copy them. The VM stays paused,
+            # so the copy can happen at any time before the resume.
+            response = self.api.snapshot_create.put(
+                snapshot_path=str(vmstate_path),
+                snapshot_type=snapshot_type.api_type,
+                sync_snapshot_files=sync_snapshot_files,
+            )
+            body = response.json()
+            assert body["snapshot_type"] == snapshot_type.api_type
+            self.last_snapshot_memory = body["memory"]
+            self.mem_backend.copy(body["memory"], str(Path("/") / mem_path))
         root = Path(self.chroot())
         return Snapshot(
             vmstate=root / vmstate_path,
@@ -1050,16 +1113,30 @@ class Microvm:
         *,
         huge_pages: Optional[HugePagesConfig] = None,
         uffd_handler_name: str = None,
+        mem_backend: bool = False,
+        track_dirty_pages: bool = None,
     ):
-        """Restore a snapshot"""
+        """Restore a snapshot.
+
+        `track_dirty_pages` overrides the default of enabling dirty page tracking
+        only when restoring a diff snapshot.
+
+        With `uffd_handler_name`, guest memory is populated by that example
+        handler through UFFD. With `mem_backend` as well, the handler is started
+        as a memory backend (`backend_type: SharedMemfd`): it additionally
+        receives the guest memory memfd and can produce snapshots from it.
+        """
 
         jailed_snapshot = snapshot.copy_to_chroot(Path(self.chroot()))
 
+        if mem_backend:
+            assert uffd_handler_name, "a memory backend needs a handler"
         if uffd_handler_name:
             self.uffd_handler = spawn_pf_handler(
                 self,
                 uffd_handler(uffd_handler_name, binary_dir=self.fc_binary_path.parent),
                 jailed_snapshot,
+                mem_backend=mem_backend,
             )
 
         jailed_mem = Path("/") / jailed_snapshot.mem.name
@@ -1077,10 +1154,10 @@ class Microvm:
         for iface in jailed_snapshot.net_ifaces:
             self.add_net_iface(iface, api=False)
 
-        mem_backend = {"backend_type": "File", "backend_path": str(jailed_mem)}
+        mem_backend_config = {"backend_type": "File", "backend_path": str(jailed_mem)}
         if self.uffd_handler is not None:
-            mem_backend = {
-                "backend_type": "Uffd",
+            mem_backend_config = {
+                "backend_type": "SharedMemfd" if mem_backend else "Uffd",
                 "backend_path": str(self.uffd_handler.socket_path),
             }
 
@@ -1124,10 +1201,12 @@ class Microvm:
         if huge_pages is not None:
             optional_kwargs["huge_pages"] = huge_pages
 
+        if track_dirty_pages is None:
+            track_dirty_pages = jailed_snapshot.snapshot_type.needs_dirty_page_tracking
         self.api.snapshot_load.put(
-            mem_backend=mem_backend,
+            mem_backend=mem_backend_config,
             snapshot_path=str(jailed_vmstate),
-            enable_diff_snapshots=jailed_snapshot.snapshot_type.needs_dirty_page_tracking,
+            enable_diff_snapshots=track_dirty_pages,
             resume_vm=resume,
             **optional_kwargs,
         )
@@ -1298,16 +1377,24 @@ class MicroVMFactory:
         return vm
 
     def build_from_snapshot(
-        self, snapshot: Snapshot, uffd_handler_name=None, clock_realtime=False
+        self,
+        snapshot: Snapshot,
+        uffd_handler_name=None,
+        clock_realtime=False,
+        mem_backend=False,
+        track_dirty_pages=None,
+        resume=True,
     ):
         """Build a microvm from a snapshot"""
         vm = self.build()
         vm.spawn()
         vm.restore_from_snapshot(
             snapshot,
-            resume=True,
+            resume=resume,
             uffd_handler_name=uffd_handler_name,
             clock_realtime=clock_realtime,
+            mem_backend=mem_backend,
+            track_dirty_pages=track_dirty_pages,
         )
         return vm
 
