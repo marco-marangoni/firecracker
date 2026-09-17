@@ -485,7 +485,7 @@ pub(crate) mod tests {
             memory::create(
                 regions.iter().copied(),
                 libc::MAP_PRIVATE,
-                Some(file),
+                Some((std::sync::Arc::new(file), 0)),
                 false,
                 libc::MADV_NORMAL,
             )

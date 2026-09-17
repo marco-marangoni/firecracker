@@ -990,6 +990,29 @@ impl Net {
     }
 }
 
+impl Net {
+    /// Gives a potential deferred RX frame to the guest and returns parsed-but-unfilled RX
+    /// descriptors to the queue so that they are parsed (and marked dirty) again.
+    fn return_parsed_rx_buffers(&mut self) {
+        // We shouldn't be messing with the queue if the device is not activated.
+        // Anyways, if it isn't there's nothing to prepare; we haven't parsed any
+        // descriptors yet from it and we can't have a deferred frame.
+        if !self.is_activated() {
+            return;
+        }
+
+        // Give potential deferred RX frame to guest
+        self.rx_buffer.finish_frame(&mut self.queues[RX_INDEX]);
+        // Reset the parsed available descriptors, so we will re-parse them
+        self.queues[RX_INDEX].next_avail -=
+            Wrapping(u16::try_from(self.rx_buffer.parsed_descriptors.len()).unwrap());
+        self.rx_buffer.parsed_descriptors.clear();
+        self.rx_buffer.iovec.clear();
+        self.rx_buffer.used_bytes = 0;
+        self.rx_buffer.used_descriptors = 0;
+    }
+}
+
 impl VirtioDevice for Net {
     impl_device_type!(VirtioDeviceType::Net);
 
@@ -1092,22 +1115,13 @@ impl VirtioDevice for Net {
 
     /// Prepare saving state
     fn prepare_save(&mut self) {
-        // We shouldn't be messing with the queue if the device is not activated.
-        // Anyways, if it isn't there's nothing to prepare; we haven't parsed any
-        // descriptors yet from it and we can't have a deferred frame.
-        if !self.is_activated() {
-            return;
-        }
+        self.return_parsed_rx_buffers();
+    }
 
-        // Give potential deferred RX frame to guest
-        self.rx_buffer.finish_frame(&mut self.queues[RX_INDEX]);
-        // Reset the parsed available descriptors, so we will re-parse them
-        self.queues[RX_INDEX].next_avail -=
-            Wrapping(u16::try_from(self.rx_buffer.parsed_descriptors.len()).unwrap());
-        self.rx_buffer.parsed_descriptors.clear();
-        self.rx_buffer.iovec.clear();
-        self.rx_buffer.used_bytes = 0;
-        self.rx_buffer.used_descriptors = 0;
+    /// RX buffers are marked dirty when parsed (`IoVecBufferMut::load_descriptor_chain`), not
+    /// when a frame is written into them, so they must be re-parsed after a bitmap reset.
+    fn prepare_dirty_tracking_reset(&mut self) {
+        self.return_parsed_rx_buffers();
     }
 }
 

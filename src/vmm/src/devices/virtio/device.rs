@@ -257,6 +257,12 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
 
     /// Prepare the device for saving its state
     fn prepare_save(&mut self) {}
+
+    /// Called before the dirty page bitmaps are reset outside of a snapshot (memory backend
+    /// pre-copy). A device that marks guest memory dirty *before* writing to it must return that
+    /// memory to the guest here (so it is marked again when re-parsed), otherwise the write would
+    /// never appear in a later dirty set. Must not have snapshot-only side effects.
+    fn prepare_dirty_tracking_reset(&mut self) {}
 }
 
 impl fmt::Debug for dyn VirtioDevice {

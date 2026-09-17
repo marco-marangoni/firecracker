@@ -214,6 +214,15 @@ block I/O that the kernel completes after the pause (drained by
 > Diff snapshot support is in developer preview. See
 > [this section](#developer-preview-status) for more info.
 
+> [!NOTE]
+>
+> When a [memory backend](shared-memfd.md) is attached to the microVM,
+> `PUT /snapshot/create` does not write guest memory to `mem_file_path` (which
+> must then be omitted). It writes the microVM state file and answers `200 OK`
+> with the ranges of the shared guest memory that make up the snapshot, for the
+> backend to copy. Everything below about full and diff snapshots applies to the
+> memory file the backend produces.
+
 Now that the microVM is paused, you can create a snapshot, which can be either a
 `full`one or a `diff` one. Full snapshots always create a complete, resume-able
 snapshot of the current microVM state and memory. Diff snapshots save at least
@@ -446,14 +455,19 @@ snapshot. Accepted values are:
   for the guest memory range. Please refer to
   [this](handling-page-faults-on-snapshot-resume.md) for more details on
   handling page faults in the user space.
+- `SharedMemfd` - like `Uffd`, but guest memory is backed by a single memfd
+  which is handed to the page fault handler together with the uffd, so that the
+  handler can produce memory snapshots itself. `PUT /snapshot/create` then
+  reports the memory ranges to copy instead of writing a memory file. See
+  [memory backend](shared-memfd.md).
 
 The meaning of `backend_path` depends on the `backend_type` chosen:
 
 - if using `File`, then `backend_path` should contain the path to the snapshot's
   memory file to be loaded.
-- when using `Uffd`, `backend_path` refers to the path of the unix domain socket
-  used for communication between Firecracker and the user space process that
-  handles page faults.
+- when using `Uffd` or `SharedMemfd`, `backend_path` refers to the path of the
+  unix domain socket used for communication between Firecracker and the user
+  space process that handles page faults.
 
 The `huge_pages` field selects the host page configuration for the restored
 microVM. It accepts `Snapshot`, `None`, `Transparent`, and `2M`. `Snapshot`

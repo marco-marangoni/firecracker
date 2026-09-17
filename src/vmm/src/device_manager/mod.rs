@@ -388,6 +388,16 @@ impl DeviceManager {
         self.for_each_virtio_device_mut(|_, device| device.kick());
     }
 
+    /// Gives activated VirtIO devices the chance to hand back guest memory they marked dirty
+    /// ahead of writing to it, before the dirty bitmaps are reset outside of a snapshot.
+    pub fn prepare_dirty_tracking_reset(&self) {
+        self.for_each_virtio_device_mut(|_, device| {
+            if device.is_activated() {
+                device.prepare_dirty_tracking_reset();
+            }
+        });
+    }
+
     /// Mark queue memory dirty for activated VirtIO devices
     pub fn mark_virtio_queue_memory_dirty(&self, mem: &GuestMemoryMmap) {
         self.for_each_virtio_device_mut(|_, device| {

@@ -5,6 +5,7 @@
 
 use std::fmt::Debug;
 use std::io;
+use std::os::unix::io::AsRawFd;
 #[cfg(feature = "gdb")]
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -42,7 +43,7 @@ use crate::initrd::{InitrdConfig, InitrdError};
 use crate::logger::debug;
 #[cfg(target_arch = "aarch64")]
 use crate::logger::warn;
-use crate::persist::{MicrovmState, MicrovmStateError};
+use crate::persist::{self, MicrovmState, MicrovmStateError};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Persist;
@@ -61,12 +62,15 @@ use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::VcpuError;
 use crate::vstate::vm::{KvmVm, Vm, VmError};
 use crate::{EventManager, Vmm, VmmError};
+use vm_memory::GuestMemoryBackend;
 
 /// Errors associated with starting the instance.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum StartMicrovmError {
     /// Unable to attach block device to Vmm: {0}
     AttachBlockDevice(io::Error),
+    /// Cannot hand guest memory to the memory backend: {0}
+    MemBackend(persist::GuestMemoryFromUffdError),
     /// Could not attach device: {0}
     AttachDevice(#[from] AttachDeviceError),
     /// System configuration error: {0}
@@ -155,7 +159,7 @@ pub fn build_microvm_for_boot(
         .as_ref()
         .ok_or(StartMicrovmError::MissingKernelConfig)?;
 
-    let guest_memory = vm_resources
+    let (guest_memory, mut memfd_backing) = vm_resources
         .allocate_guest_memory()
         .map_err(StartMicrovmError::GuestMemory)?;
 
@@ -187,6 +191,7 @@ pub fn build_microvm_for_boot(
             .allocate_memory_region(
                 addr,
                 u64_to_usize(u32_mib_to_bytes(memory_hotplug.total_size_mib)),
+                memfd_backing.as_mut(),
             )
             .map_err(StartMicrovmError::GuestMemory)?;
         vm.register_hotpluggable_memory_region(
@@ -196,6 +201,28 @@ pub fn build_microvm_for_boot(
         Some(addr)
     } else {
         None
+    };
+
+    // Hand guest memory to the memory backend, if one is configured. All regions are mapped and
+    // registered with KVM at this point and no vCPU is running yet. The handshake is the UFFD
+    // one, with the memfd as its only fd: there is nothing to populate on a fresh boot.
+    let mem_backend_attached = if let Some(mem_backend) = &vm_resources.machine_config.mem_backend {
+        let backing = memfd_backing
+            .as_ref()
+            .expect("memory is memfd-backed when a memory backend is configured");
+        let mappings = persist::uffd_mappings(
+            vm.guest_memory().iter().map(|region| &region.inner),
+            vm_resources.machine_config.huge_pages,
+        );
+        persist::send_uffd_handshake(
+            &mem_backend.backend_path,
+            &mappings,
+            &[backing.file.as_raw_fd()],
+        )
+        .map_err(StartMicrovmError::MemBackend)?;
+        true
+    } else {
+        false
     };
 
     let kvm_vm = Arc::new(vm);
@@ -327,6 +354,7 @@ pub fn build_microvm_for_boot(
         shutdown_exit_code: None,
         vm,
         device_manager,
+        mem_backend_attached,
     };
     let vmm = Arc::new(Mutex::new(vmm));
 
@@ -430,6 +458,7 @@ pub fn build_microvm_from_snapshot(
     microvm_state: MicrovmState,
     guest_memory: Vec<GuestRegionMmap>,
     uffd: Option<Uffd>,
+    mem_backend_attached: bool,
     seccomp_filters: &BpfThreadMap,
     vm_resources: &mut VmResources,
     clock_realtime: bool,
@@ -517,6 +546,7 @@ pub fn build_microvm_from_snapshot(
         shutdown_exit_code: None,
         vm,
         device_manager,
+        mem_backend_attached,
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -855,6 +885,7 @@ pub(crate) mod tests {
             shutdown_exit_code: None,
             vm: Vm::Kvm(Arc::new(vm)),
             device_manager: default_device_manager(),
+            mem_backend_attached: false,
         }
     }
 
@@ -873,6 +904,7 @@ pub(crate) mod tests {
             shutdown_exit_code: None,
             vm: Vm::Kvm(vm),
             device_manager,
+            mem_backend_attached: false,
         }
     }
 
