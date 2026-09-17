@@ -26,12 +26,19 @@ pub enum SnapshotType {
 /// 1) A file that contains the guest memory to be loaded,
 /// 2) An UDS where a custom page-fault handler process is listening for the UFFD set up by
 ///    Firecracker to handle its guest memory page faults.
-#[derive(Debug, PartialEq, Eq, Deserialize)]
+/// 3) Like 2), but guest memory is backed by a single memfd which is handed to the page-fault
+///    handler together with the UFFD, so that the handler can produce memory snapshots itself.
+///    This is also the only variant accepted in `machine-config.mem_backend` (boot), where only
+///    the memfd is handed over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub enum MemBackendType {
     /// Guest memory contents will be loaded from a file.
     File,
     /// Guest memory will be served through UFFD by a separate process.
     Uffd,
+    /// Guest memory is shared with a separate process through a memfd. On restore the process
+    /// also serves page faults through UFFD.
+    SharedMemfd,
 }
 
 /// Stores the configuration that will be used for creating a snapshot.
@@ -44,8 +51,10 @@ pub struct CreateSnapshotParams {
     pub snapshot_type: SnapshotType,
     /// Path to the file that will contain the microVM state.
     pub snapshot_path: PathBuf,
-    /// Path to the file that will contain the guest memory.
-    pub mem_file_path: PathBuf,
+    /// Path to the file that will contain the guest memory. Mandatory unless a memory backend
+    /// is attached to the microVM, in which case it must be absent.
+    #[serde(default)]
+    pub mem_file_path: Option<PathBuf>,
     /// Whether to fsync the snapshot state and guest memory files.
     /// Activated virtio-block devices are always fsync'd, independently of this.
     #[serde(default = "default_sync_snapshot_files")]
@@ -165,7 +174,7 @@ pub struct LoadSnapshotConfig {
 }
 
 /// Stores the configuration used for managing snapshot memory.
-#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemBackendConfig {
     /// Path to the backend used to handle the guest memory.
@@ -189,4 +198,40 @@ pub enum VmState {
 pub struct Vm {
     /// The microVM state, which can be `paused` or `resumed`.
     pub state: VmState,
+}
+
+/// A page-aligned byte range, in guest memory file offset space (which is also the offset space
+/// of the memfd handed to a memory backend).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MemoryRange {
+    /// Offset of the first byte of the range.
+    pub offset: u64,
+    /// Length of the range in bytes.
+    pub len: u64,
+}
+
+/// Describes which bytes of the guest memory file a snapshot consists of. Returned by
+/// `PUT /snapshot/create` and `PUT /snapshot/dirty-ranges` when a memory backend is attached.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SnapshotMemoryLayout {
+    /// Size of a full guest memory file (sum of all region sizes).
+    pub total_size: u64,
+    /// Ranges whose bytes must be copied from the memfd into the memory file at the same offset.
+    /// For a full snapshot this covers all plugged memory; for a diff snapshot the dirty pages.
+    /// Sorted, merged and page-aligned.
+    pub ranges: Vec<MemoryRange>,
+    /// Ranges that must be zeroed in the memory file: the currently unplugged virtio-mem slots.
+    /// Disjoint from `ranges`.
+    pub unplugged: Vec<MemoryRange>,
+}
+
+/// Body of a successful `PUT /snapshot/create` or `PUT /snapshot/dirty-ranges` when a memory
+/// backend is attached.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SnapshotMemoryResponse {
+    /// The snapshot type, present only for `PUT /snapshot/create`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_type: Option<SnapshotType>,
+    /// The memory layout.
+    pub memory: SnapshotMemoryLayout,
 }

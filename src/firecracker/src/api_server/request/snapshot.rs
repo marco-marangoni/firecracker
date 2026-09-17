@@ -31,6 +31,7 @@ pub(crate) fn parse_put_snapshot(
         Some(request_type) => match request_type {
             "create" => parse_put_snapshot_create(body),
             "load" => parse_put_snapshot_load(body),
+            "dirty-ranges" => parse_put_snapshot_dirty_ranges(body),
             _ => Err(RequestError::InvalidPathMethod(
                 format!("/snapshot/{}", request_type),
                 Method::Put,
@@ -57,6 +58,21 @@ fn parse_put_snapshot_create(body: &Body) -> Result<ParsedRequest, RequestError>
     Ok(ParsedRequest::new_sync(VmmAction::CreateSnapshot(
         snapshot_config,
     )))
+}
+
+/// `PUT /snapshot/dirty-ranges`: the body is reserved for future options and must currently be
+/// empty or an empty JSON object.
+fn parse_put_snapshot_dirty_ranges(body: &Body) -> Result<ParsedRequest, RequestError> {
+    let raw = body.raw();
+    if !raw.is_empty() {
+        let value = serde_json::from_slice::<serde_json::Value>(raw)?;
+        if value != serde_json::json!({}) {
+            return Err(RequestError::SerdeJson(serde_json::Error::custom(
+                "PUT /snapshot/dirty-ranges takes no parameters",
+            )));
+        }
+    }
+    Ok(ParsedRequest::new_sync(VmmAction::GetDirtyRanges))
 }
 
 fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
@@ -149,7 +165,7 @@ mod tests {
         let expected_config = CreateSnapshotParams {
             snapshot_type: SnapshotType::Diff,
             snapshot_path: PathBuf::from("foo"),
-            mem_file_path: PathBuf::from("bar"),
+            mem_file_path: Some(PathBuf::from("bar")),
             sync_snapshot_files: true,
         };
         assert_eq!(
@@ -166,7 +182,7 @@ mod tests {
         let expected_config = CreateSnapshotParams {
             snapshot_type: SnapshotType::Diff,
             snapshot_path: PathBuf::from("foo"),
-            mem_file_path: PathBuf::from("bar"),
+            mem_file_path: Some(PathBuf::from("bar")),
             sync_snapshot_files: false,
         };
         assert_eq!(
@@ -181,7 +197,7 @@ mod tests {
         let expected_config = CreateSnapshotParams {
             snapshot_type: SnapshotType::Full,
             snapshot_path: PathBuf::from("foo"),
-            mem_file_path: PathBuf::from("bar"),
+            mem_file_path: Some(PathBuf::from("bar")),
             sync_snapshot_files: true,
         };
         assert_eq!(

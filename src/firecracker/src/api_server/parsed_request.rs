@@ -203,6 +203,7 @@ impl ParsedRequest {
                 }
                 VmmData::BalloonStats(stats) => Self::success_response_with_data(stats),
                 VmmData::VirtioMemStatus(data) => Self::success_response_with_data(data),
+                VmmData::SnapshotMemory(data) => Self::success_response_with_data(data),
                 VmmData::HintingStatus(hinting_status) => {
                     Self::success_response_with_data(hinting_status)
                 }
@@ -605,6 +606,9 @@ pub mod tests {
                 }
                 VmmData::BalloonStats(stats) => {
                     http_response(&serde_json::to_string(stats).unwrap(), 200)
+                }
+                VmmData::SnapshotMemory(data) => {
+                    http_response(&serde_json::to_string(&data).unwrap(), 200)
                 }
                 VmmData::VirtioMemStatus(data) => {
                     http_response(&serde_json::to_string(data).unwrap(), 200)

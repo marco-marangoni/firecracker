@@ -106,7 +106,15 @@ zeroed. Furthermore, the guest memory is `mmap`ped with the `MAP_PRIVATE` and
 `MAP_ANONYMOUS` flags, which ensure that even if a Firecracker yields some
 information through an inflate and that same physical page containing the
 information is mapped onto another Firecracker process, reads on that address
-space will see zeroes.
+space will see zeroes. When guest memory is instead backed by a shared memfd
+(vhost-user devices, [memory backends](snapshotting/shared-memfd.md)),
+`MADV_DONTNEED` would only drop Firecracker's own mappings and release nothing,
+so the range is `madvise`d with `MADV_REMOVE`, which punches a hole into the
+memfd: the pages are freed and read as zero through every mapping of it.
+
+Released pages are marked dirty, so that a diff snapshot taken afterwards
+records them as zero rather than leaving their previous content in a merged
+memory file. This requires dirty page tracking to be enabled.
 
 ## Prerequisites
 

@@ -767,7 +767,15 @@ paths:
       summary: Creates a full or diff snapshot. Post-boot only.
       description:
         Creates a snapshot of the microVM state. The microVM should be
-        in the `Paused` state.
+        in the `Paused` state. Without a memory backend attached, guest memory
+        is written to `mem_file_path` and the response is 204. With a memory
+        backend attached (see `MachineConfiguration.mem_backend` and the
+        `SharedMemfd` backend type of `/snapshot/load`), `mem_file_path` must
+        be absent, no guest memory is written, and the response is 200 with a
+        `SnapshotMemory` body telling the backend which ranges of the shared
+        memfd make up the snapshot. Because a paused microVM does not run device
+        emulation, the backend can copy those ranges at any time before the
+        microVM is resumed.
       operationId: createSnapshot
       parameters:
         - name: body
@@ -777,10 +785,40 @@ paths:
           schema:
             $ref: "#/definitions/SnapshotCreateParams"
       responses:
+        200:
+          description: Snapshot state created; memory ranges to copy (memory backend attached)
+          schema:
+            $ref: "#/definitions/SnapshotMemory"
         204:
           description: Snapshot created
         400:
           description: Snapshot cannot be created due to bad input
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
+  /snapshot/dirty-ranges:
+    put:
+      summary: Reports and resets the guest memory dirtied since the last snapshot. Post-boot only.
+      description:
+        Returns the ranges of the shared guest memory written since the last
+        snapshot or the last call to this endpoint, and resets dirty tracking,
+        so that a memory backend can perform pre-copy passes while the microVM
+        runs. Only allowed when a memory backend is attached. Callable in any
+        state; the set is not atomic with respect to concurrent guest writes.
+        The final, consistent set for a snapshot is the one returned by
+        `PUT /snapshot/create`.
+      operationId: getDirtyRanges
+      responses:
+        200:
+          description: Dirty ranges
+          schema:
+            $ref: "#/definitions/SnapshotMemory"
+        400:
+          description: No memory backend attached, or bad input
           schema:
             $ref: "#/definitions/Error"
         default:
@@ -1490,9 +1528,19 @@ definitions:
           Which huge pages configuration should be used to back guest memory.
           "None" uses regular 4K pages. "Transparent" enables THP via
           madvise(MADV_HUGEPAGE). "2M" uses explicit hugetlbfs 2MB pages.
+      mem_backend:
+        $ref: "#/definitions/MemoryBackend"
 
   MemoryBackend:
     type: object
+    description: >-
+      How guest memory is populated on restore and/or shared with an external process.
+      `File` and `Uffd` are only valid in `/snapshot/load`; `SharedMemfd` is valid there and
+      in `/machine-config` (boot). With `SharedMemfd`, guest memory is backed by a single
+      memfd laid out like a guest memory snapshot file, which is sent to the process listening
+      on `backend_path` with the same handshake message a UFFD handler receives; the fds
+      attached are `[uffd, memfd]` on restore and `[memfd]` on boot. `PUT /snapshot/create` then
+      returns the memory ranges to copy instead of writing a memory file.
     required:
       - backend_type
       - backend_path
@@ -1502,6 +1550,7 @@ definitions:
         enum:
           - File
           - Uffd
+          - SharedMemfd
       backend_path:
         type: string
         description: Based on 'backend_type' it is either
@@ -1509,6 +1558,56 @@ definitions:
           2) Path to the UDS where a process is listening for a UFFD initialization
           control payload and open file descriptor that it can use to serve this
           process's guest memory page faults
+          3) Path to the UDS where a process is listening for the same control
+          payload, accompanied by the guest memory memfd (and the UFFD on restore)
+
+  MemoryRange:
+    type: object
+    description: A page-aligned byte range in guest memory file / memfd offset space.
+    required:
+      - offset
+      - len
+    properties:
+      offset:
+        type: integer
+        format: int64
+      len:
+        type: integer
+        format: int64
+
+  SnapshotMemory:
+    type: object
+    description: >-
+      Which bytes of the shared guest memory a snapshot consists of. `ranges` are copied from the
+      memfd into the memory file at the same offset; `unplugged` (currently unplugged virtio-mem
+      slots) are zeroed in the memory file. The memory file is `total_size` bytes long.
+    required:
+      - memory
+    properties:
+      snapshot_type:
+        type: string
+        enum:
+          - Full
+          - Diff
+        description: Present in `PUT /snapshot/create` responses only.
+      memory:
+        type: object
+        required:
+          - total_size
+          - ranges
+          - unplugged
+        properties:
+          total_size:
+            type: integer
+            format: int64
+          ranges:
+            type: array
+            items:
+              $ref: "#/definitions/MemoryRange"
+          unplugged:
+            type: array
+            items:
+              $ref: "#/definitions/MemoryRange"
 
   Metrics:
     type: object
@@ -1666,12 +1765,13 @@ definitions:
   SnapshotCreateParams:
     type: object
     required:
-      - mem_file_path
       - snapshot_path
     properties:
       mem_file_path:
         type: string
-        description: Path to the file that will contain the guest memory.
+        description:
+          Path to the file that will contain the guest memory. Required unless a
+          memory backend is attached, in which case it must be absent.
       snapshot_path:
         type: string
         description: Path to the file that will contain the microVM state.

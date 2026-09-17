@@ -43,7 +43,9 @@ use crate::vmm_config::net::{
 };
 use crate::vmm_config::pmem::{PmemConfig, PmemConfigError, PmemDeviceUpdateConfig};
 use crate::vmm_config::serial::SerialConfig;
-use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, SnapshotType};
+use crate::vmm_config::snapshot::{
+    CreateSnapshotParams, LoadSnapshotParams, SnapshotMemoryResponse, SnapshotType,
+};
 use crate::vmm_config::vsock::{VsockConfigError, VsockDeviceConfig};
 use crate::vmm_config::{self, RateLimiterUpdate};
 
@@ -69,6 +71,9 @@ pub enum VmmAction {
     GetBalloonConfig,
     /// Get the ballon device latest statistics.
     GetBalloonStats,
+    /// Get (and consume) the guest memory ranges dirtied since the last snapshot or dirty-ranges
+    /// request. Only allowed with a memory backend attached.
+    GetDirtyRanges,
     /// Get complete microVM configuration in JSON format.
     GetFullVmConfig,
     /// Get MMDS contents.
@@ -248,6 +253,9 @@ pub enum VmmData {
     VirtioMemStatus(VirtioMemStatus),
     /// The status of the virtio-balloon hinting run
     HintingStatus(HintingStatus),
+    /// Which ranges of the shared guest memory make up a snapshot; returned by `snapshot/create`
+    /// and `snapshot/dirty-ranges` when a memory backend is attached.
+    SnapshotMemory(SnapshotMemoryResponse),
 }
 
 fn mmds_patch_data(
@@ -508,6 +516,7 @@ impl<'a> PrebootApiController<'a> {
             | Pause
             | Resume
             | GetBalloonStats
+            | GetDirtyRanges
             | GetMemoryHotplugStatus
             | UpdateBalloon(_)
             | UpdateBalloonStatistics(_)
@@ -720,6 +729,18 @@ impl RuntimeApiController {
                 .expect("Poisoned lock")
                 .latest_balloon_stats()
                 .map(VmmData::BalloonStats)
+                .map_err(VmmActionError::InternalVmm),
+            GetDirtyRanges => self
+                .vmm
+                .lock()
+                .expect("Poisoned lock")
+                .dirty_ranges()
+                .map(|memory| {
+                    VmmData::SnapshotMemory(SnapshotMemoryResponse {
+                        snapshot_type: None,
+                        memory,
+                    })
+                })
                 .map_err(VmmActionError::InternalVmm),
             GetFullVmConfig => Ok(VmmData::FullVmConfig(
                 self.vmm.lock().expect("Poisoned lock").full_config(),
@@ -935,7 +956,7 @@ impl RuntimeApiController {
         let vm_info = VmInfo::from(&*locked_vmm);
         let create_start_us = get_time_us(ClockType::Monotonic);
 
-        create_snapshot(&mut locked_vmm, &vm_info, create_params)?;
+        let layout = create_snapshot(&mut locked_vmm, &vm_info, create_params)?;
 
         match create_params.snapshot_type {
             SnapshotType::Full => {
@@ -959,7 +980,13 @@ impl RuntimeApiController {
                 );
             }
         }
-        Ok(VmmData::Empty)
+        Ok(match layout {
+            Some(memory) => VmmData::SnapshotMemory(SnapshotMemoryResponse {
+                snapshot_type: Some(create_params.snapshot_type),
+                memory,
+            }),
+            None => VmmData::Empty,
+        })
     }
 
     /// Updates block device properties:
@@ -1247,7 +1274,7 @@ mod tests {
             CreateSnapshotParams {
                 snapshot_type: SnapshotType::Full,
                 snapshot_path: PathBuf::new(),
-                mem_file_path: PathBuf::new(),
+                mem_file_path: Some(PathBuf::new()),
                 sync_snapshot_files: true,
             },
         )));

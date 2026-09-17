@@ -49,6 +49,7 @@ def kvm_basic_config(
     rootfs_io_engine=None,
     cpu_template=None,
     enable_entropy_device=False,
+    mem_backend: str = None,
 ):
     """Shortcut for quickly configuring a microVM.
 
@@ -65,13 +66,21 @@ def kvm_basic_config(
         reboot=k panic=1 nomodule swiotlb=noforce console=ttyS0 [pci=off]
     which differs from Firecracker's default only in the enabling of the serial console.
     Reference: file:../../src/vmm/src/vmm_config/boot_source.rs::DEFAULT_KERNEL_CMDLINE
+
+    If mem_backend is the name of an example UFFD handler (e.g. "on_demand"), that
+    handler is started as a memory backend and guest memory is shared with it at
+    boot (`machine-config.mem_backend`).
     """
+    mem_backend_config = None
+    if mem_backend is not None:
+        mem_backend_config = vm.spawn_mem_backend(mem_backend)
     vm.api.machine_config.put(
         vcpu_count=vcpu_count,
         smt=smt,
         mem_size_mib=mem_size_mib,
         track_dirty_pages=track_dirty_pages,
         huge_pages=huge_pages,
+        mem_backend=mem_backend_config,
     )
     vm.huge_pages = huge_pages
     vm.vcpus_count = vcpu_count

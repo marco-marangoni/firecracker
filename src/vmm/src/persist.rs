@@ -7,7 +7,7 @@ use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::mem::forget;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -37,7 +37,9 @@ use crate::utils::u64_to_usize;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
-use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
+use crate::vmm_config::snapshot::{
+    CreateSnapshotParams, LoadSnapshotParams, MemBackendType, SnapshotMemoryLayout,
+};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
     self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
@@ -160,17 +162,35 @@ pub enum CreateSnapshotError {
     SerializeMicrovmState(#[from] crate::snapshot::SnapshotError),
     /// Cannot perform {0} on the snapshot backing file: {1}
     SnapshotBackingFile(&'static str, io::Error),
+    /// `mem_file_path` must not be given when a memory backend is attached: Firecracker does not write guest memory in that mode
+    MemFilePathWithMemBackend,
+    /// `mem_file_path` is required when no memory backend is attached
+    MissingMemFilePath,
 }
 
 /// Snapshot version
 pub const SNAPSHOT_VERSION: Version = Version::new(12, 0, 0);
 
 /// Creates a Microvm snapshot.
+///
+/// Without a memory backend, guest memory is written to `params.mem_file_path` and `None` is
+/// returned. With a memory backend attached, no memory is written; instead the returned
+/// [`SnapshotMemoryLayout`] tells the backend which ranges of the shared memfd make up the
+/// snapshot. Either way the dirty tracking state is consumed exactly as it would be by writing
+/// the corresponding memory file.
 pub fn create_snapshot(
     vmm: &mut Vmm,
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
-) -> Result<(), CreateSnapshotError> {
+) -> Result<Option<SnapshotMemoryLayout>, CreateSnapshotError> {
+    // Validate before saving anything, so a rejected request has no side effects.
+    let mem_file_path = match (vmm.mem_backend_attached, &params.mem_file_path) {
+        (true, Some(_)) => return Err(CreateSnapshotError::MemFilePathWithMemBackend),
+        (false, None) => return Err(CreateSnapshotError::MissingMemFilePath),
+        (true, None) => None,
+        (false, Some(path)) => Some(path),
+    };
+
     let microvm_state = vmm
         .save_state(vm_info)
         .map_err(CreateSnapshotError::MicrovmState)?;
@@ -186,11 +206,17 @@ pub fn create_snapshot(
             "snapshot requires KVM".into(),
         ))
     })?;
-    kvm_vm.snapshot_memory_to_file(
-        &params.mem_file_path,
-        params.snapshot_type,
-        params.sync_snapshot_files,
-    )?;
+    let layout = match mem_file_path {
+        Some(mem_file_path) => {
+            kvm_vm.snapshot_memory_to_file(
+                mem_file_path,
+                params.snapshot_type,
+                params.sync_snapshot_files,
+            )?;
+            None
+        }
+        None => Some(kvm_vm.snapshot_memory_layout(params.snapshot_type)?),
+    };
 
     // We need to mark queues as dirty again for all activated devices. The reason we
     // do it here is that we don't mark pages as dirty during runtime
@@ -198,7 +224,7 @@ pub fn create_snapshot(
     vmm.device_manager
         .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
 
-    Ok(())
+    Ok(layout)
 }
 
 fn snapshot_state_to_file(
@@ -457,6 +483,7 @@ pub fn restore_from_snapshot(
             cpu_template: Some(microvm_state.vm_info.cpu_template),
             track_dirty_pages: Some(track_dirty_pages),
             huge_pages: Some(params.huge_pages.resolve(microvm_state.vm_info.huge_pages)),
+            mem_backend: None,
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         })
@@ -487,20 +514,23 @@ pub fn restore_from_snapshot(
                 None,
             )
         }
-        MemBackendType::Uffd => guest_memory_from_uffd(
+        MemBackendType::Uffd | MemBackendType::SharedMemfd => guest_memory_from_uffd(
             mem_backend_path,
             mem_state,
             track_dirty_pages,
             vm_resources.machine_config.huge_pages,
+            params.mem_backend.backend_type == MemBackendType::SharedMemfd,
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
     };
+    let mem_backend_attached = params.mem_backend.backend_type == MemBackendType::SharedMemfd;
     builder::build_microvm_from_snapshot(
         instance_info,
         event_manager,
         microvm_state,
         guest_memory,
         uffd,
+        mem_backend_attached,
         seccomp_filters,
         vm_resources,
         params.clock_realtime,
@@ -573,9 +603,20 @@ fn guest_memory_from_uffd(
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
+    share_memfd: bool,
 ) -> Result<(Vec<GuestRegionMmap>, Option<Uffd>), GuestMemoryFromUffdError> {
-    let (guest_memory, backend_mappings) =
-        create_guest_memory(mem_state, track_dirty_pages, huge_pages)?;
+    let (guest_memory, memfd) = if share_memfd {
+        let regions: Vec<_> = mem_state.regions().collect();
+        let (guest_memory, backing) =
+            memory::memfd_backed(&regions, track_dirty_pages, huge_pages)?;
+        (guest_memory, Some(backing.file))
+    } else {
+        (
+            memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?,
+            None,
+        )
+    };
+    let backend_mappings = uffd_mappings(guest_memory.iter(), huge_pages);
 
     let mut uffd_builder = UffdBuilder::new();
 
@@ -597,20 +638,27 @@ fn guest_memory_from_uffd(
             .map_err(GuestMemoryFromUffdError::Register)?;
     }
 
-    send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
+    // The uffd always comes first, so that a handler written for the plain UFFD protocol (which
+    // reads a single fd) keeps working; the memfd, when shared, comes last.
+    let mut fds = vec![uffd.as_raw_fd()];
+    if let Some(memfd) = &memfd {
+        fds.push(memfd.as_raw_fd());
+    }
+    send_uffd_handshake(mem_uds_path, &backend_mappings, &fds)?;
 
     Ok((guest_memory, Some(uffd)))
 }
 
-fn create_guest_memory(
-    mem_state: &GuestMemoryState,
-    track_dirty_pages: bool,
+/// Builds the handshake message for a UFFD handler / memory backend: one entry per region, in
+/// the order the regions were allocated, with `offset` being the region's offset in a guest
+/// memory file (and in the shared memfd, which has the same layout).
+pub fn uffd_mappings<'a>(
+    regions: impl Iterator<Item = &'a GuestRegionMmap>,
     huge_pages: HugePageConfig,
-) -> Result<(Vec<GuestRegionMmap>, Vec<GuestRegionUffdMapping>), GuestMemoryFromUffdError> {
-    let guest_memory = memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?;
-    let mut backend_mappings = Vec::with_capacity(guest_memory.len());
+) -> Vec<GuestRegionUffdMapping> {
+    let mut backend_mappings = Vec::new();
     let mut offset = 0;
-    for mem_region in guest_memory.iter() {
+    for mem_region in regions {
         #[allow(deprecated)]
         backend_mappings.push(GuestRegionUffdMapping {
             base_host_virt_addr: mem_region.as_ptr() as u64,
@@ -621,24 +669,29 @@ fn create_guest_memory(
         });
         offset += mem_region.size() as u64;
     }
-
-    Ok((guest_memory, backend_mappings))
+    backend_mappings
 }
 
-fn send_uffd_handshake(
+/// Connects to `mem_uds_path` and sends the handshake message together with `fds`, then keeps
+/// the connection open for the life of the process.
+///
+/// This is the one handshake Firecracker speaks. Which fds accompany it depends on how the
+/// microVM was started: `[uffd]` for a plain UFFD restore, `[uffd, memfd]` for a restore with a
+/// memory backend, `[memfd]` for a boot with a memory backend.
+pub fn send_uffd_handshake(
     mem_uds_path: &Path,
     backend_mappings: &[GuestRegionUffdMapping],
-    uffd: &impl AsRawFd,
+    fds: &[RawFd],
 ) -> Result<(), GuestMemoryFromUffdError> {
     // This is safe to unwrap() because we control the contents of the vector
     // (i.e GuestRegionUffdMapping entries).
     let backend_mappings = serde_json::to_string(backend_mappings).unwrap();
 
     let socket = UnixStream::connect(mem_uds_path)?;
-    socket.send_with_fd(
-        backend_mappings.as_bytes(),
-        // In the happy case we can close the fd since the other process has it open and is
-        // using it to serve us pages.
+    socket.send_with_fds(
+        &[backend_mappings.as_bytes()],
+        // In the happy case we can close the fds since the other process has them open and is
+        // using them to serve us pages / read our memory.
         //
         // The problem is that if other process crashes/exits, firecracker guest memory
         // will simply revert to anon-mem behavior which would lead to silent errors and
@@ -667,7 +720,7 @@ fn send_uffd_handshake(
         // Moreover, Firecracker holds a copy of the UFFD fd as well, so that even if the
         // page fault handler process does not tear down Firecracker when necessary, the
         // uffd will still be alive but with no one to serve faults, leading to guest freeze.
-        uffd.as_raw_fd(),
+        fds,
     )?;
 
     // We prevent Rust from closing the socket file descriptor to avoid a potential race condition
@@ -817,8 +870,9 @@ mod tests {
             }],
         };
 
-        let (_, uffd_regions) =
-            create_guest_memory(&mem_state, false, HugePageConfig::None).unwrap();
+        let guest_memory =
+            memory::anonymous(mem_state.regions(), false, HugePageConfig::None).unwrap();
+        let uffd_regions = uffd_mappings(guest_memory.iter(), HugePageConfig::None);
 
         assert_eq!(uffd_regions.len(), 1);
         assert_eq!(uffd_regions[0].size, 0x20000);
@@ -852,7 +906,7 @@ mod tests {
 
         let listener = UnixListener::bind(uds_path).expect("Cannot bind to socket path");
 
-        send_uffd_handshake(uds_path, &uffd_regions, &std::io::stdin()).unwrap();
+        send_uffd_handshake(uds_path, &uffd_regions, &[std::io::stdin().as_raw_fd()]).unwrap();
 
         let (stream, _) = listener.accept().expect("Cannot listen on UDS socket");
 

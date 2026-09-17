@@ -105,6 +105,14 @@ impl ApiServerAdapter {
             // again: device fds (virtqueue notifications, tap, rate limiters, timers)
             // are not polled until we break out of this loop on `Resume`.
             if request_is_pause {
+                // INVARIANT: while paused, nothing but API request handling runs on this
+                // thread, so no code path in Firecracker reads or writes guest memory or
+                // virtqueues between two API requests. Memory backends (`SharedMemfd`, see
+                // docs/snapshotting/shared-memfd.md) rely on this: they copy guest memory
+                // *after* `PUT /snapshot/create` has returned and before `Resume`, without
+                // any synchronisation with Firecracker. Servicing device fds in this loop
+                // would silently break the consistency of their snapshots.
+                //
                 // This loop only attempts to process API requests, so things like the
                 // metric flush timerfd handling are frozen as well (an explicit `FlushMetrics`
                 // request still goes through).
