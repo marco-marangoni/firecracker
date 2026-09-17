@@ -111,6 +111,14 @@ After Firecracker sends the payload (i.e. mem mappings and file descriptor), no
 other communication happens on the UDS socket (or otherwise) between Firecracker
 and the page fault handler process.
 
+The same handshake is used to hand the guest memory itself to the page fault
+handler, as a memfd, when the snapshot is loaded with
+`backend_type: SharedMemfd` (or when a freshly booted microVM is configured with
+`machine-config.mem_backend`). In that case the message is accompanied by more
+than one file descriptor: the uffd first (if any) and the memfd last. A handler
+should therefore read all file descriptors attached to the message, not just the
+first one. See [memory backend](shared-memfd.md).
+
 ### Userfaultfd interaction with balloon
 
 The balloon device allows the host to reclaim memory from a microVM. For more

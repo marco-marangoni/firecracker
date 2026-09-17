@@ -99,11 +99,14 @@ memory. In other words, memory cannot leak in or out of Firecracker if the
 driver becomes corrupted. The page frame numbers supplied by the driver are
 checked to be inside guest memory before Firecracker discards the ranges.
 Anonymous memory uses `madvise(MADV_DONTNEED)`. Shared memfd-backed memory, such
-as memory shared with vhost-user block devices, uses `madvise(MADV_REMOVE)` to
+as memory shared with vhost-user block devices or with a
+[memory backend](snapshotting/shared-memfd.md), uses `madvise(MADV_REMOVE)` to
 release the backing pages. Private snapshot-file mappings are replaced with
 anonymous mappings so later accesses cannot read the old snapshot contents.
 Discarded ranges read as zero on subsequent access until the guest writes to
-them again.
+them again. Released ranges are also marked dirty, so that a diff snapshot taken
+afterwards records them as zero rather than leaving their previous content in a
+merged memory file.
 
 > [!WARNING]
 >
