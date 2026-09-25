@@ -22,7 +22,7 @@ class UffdHandler:
 
     The same example handler binary also acts as a *memory backend*: when
     started with a control socket, it keeps the guest memory memfd Firecracker
-    hands over in the handshake and copies snapshot ranges out of it on request
+    hands over in the handshake and copies snapshot pages out of it on request
     (see `copy`). A handler started for a boot receives only the memfd and needs
     no snapshot memory file.
     """
@@ -118,7 +118,7 @@ class UffdHandler:
 
     def copy(self, memory: dict, mem_path: str):
         """Ask the handler to write the `memory` object returned by Firecracker
-        (`PUT /snapshot/create` or `PUT /snapshot/dirty-ranges`) into `mem_path`,
+        (`PUT /snapshot/create` or `PUT /snapshot/dirty-pages`) into `mem_path`,
         a path inside the handler's chroot. Creates the file at `total_size` or
         merges into an existing one.
         """
@@ -165,7 +165,7 @@ def spawn_pf_handler(vm, handler_path, jailed_snapshot, mem_backend=False):
     `jailed_snapshot` is the snapshot to populate page faults from, or `None`
     for a memory backend started for a boot. With `mem_backend`, the handler
     also listens on a control socket so the test can ask it to copy snapshot
-    ranges out of the shared guest memory.
+    pages out of the shared guest memory.
     """
     # Copy snapshot memory file into chroot of microVM.
     # Copy the valid page fault binary into chroot of microVM.

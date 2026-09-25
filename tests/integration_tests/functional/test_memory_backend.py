@@ -5,10 +5,11 @@ through a memfd and producing memory snapshots from it, byte-for-byte identical
 to the ones Firecracker writes itself.
 
 The test framework plays the orchestrator: it calls `PUT /snapshot/create` (or
-`PUT /snapshot/dirty-ranges`), receives the `memory` object and forwards it to
-the example handler's control socket, which copies the ranges out of the memfd.
+`PUT /snapshot/dirty-pages`), receives the `memory` object and forwards it to
+the example handler's control socket, which copies the set pages out of the memfd.
 """
 
+import base64
 import filecmp
 import platform
 import shutil
@@ -79,30 +80,95 @@ def boot_with_mem_backend(
     return vm
 
 
+PAGE_SIZE = 4096
+
+
+def decode_pages(memory):
+    """The `pages` bitmap of a `memory` object as bytes, or None for a `Full`."""
+    if "pages" not in memory:
+        return None
+    return base64.b64decode(memory["pages"], validate=True)
+
+
+def plugged_end(memory):
+    """End offset of the last plugged slot: the file minus a trailing unplugged range."""
+    unplugged = memory["unplugged"]
+    if (
+        unplugged
+        and unplugged[-1]["offset"] + unplugged[-1]["len"] == memory["total_size"]
+    ):
+        return unplugged[-1]["offset"]
+    return memory["total_size"]
+
+
+def in_unplugged(memory, offset):
+    """Whether `offset` lies in an `unplugged` range."""
+    return any(
+        r["offset"] <= offset < r["offset"] + r["len"] for r in memory["unplugged"]
+    )
+
+
+def page_set(memory, page):
+    """Whether `page` is to be copied: its bit is set, or this is a `Full` and it is plugged."""
+    bitmap = decode_pages(memory)
+    offset = page * memory["page_size"]
+    if bitmap is None:
+        return offset < memory["total_size"] and not in_unplugged(memory, offset)
+    return page // 8 < len(bitmap) and bool(bitmap[page // 8] & (1 << (page % 8)))
+
+
 def check_layout(memory, total_size):
     """Sanity checks on a `memory` object returned by Firecracker."""
     assert memory["total_size"] == total_size
-    for key in ("ranges", "unplugged"):
-        ranges = memory[key]
-        for rng in ranges:
-            assert rng["len"] > 0
-            assert rng["offset"] % 4096 == 0
-            assert rng["len"] % 4096 == 0
-            assert rng["offset"] + rng["len"] <= total_size
-        # sorted and merged
-        for prev, cur in zip(ranges, ranges[1:]):
-            assert prev["offset"] + prev["len"] < cur["offset"]
-    for rng in memory["ranges"]:
-        for unplugged in memory["unplugged"]:
-            assert (
-                rng["offset"] + rng["len"] <= unplugged["offset"]
-                or unplugged["offset"] + unplugged["len"] <= rng["offset"]
-            )
+    assert memory["page_size"] == PAGE_SIZE
+    unplugged = memory["unplugged"]
+    for rng in unplugged:
+        assert rng["len"] > 0
+        assert rng["offset"] % PAGE_SIZE == 0
+        assert rng["len"] % PAGE_SIZE == 0
+        assert rng["offset"] + rng["len"] <= total_size
+    # sorted and merged
+    for prev, cur in zip(unplugged, unplugged[1:]):
+        assert prev["offset"] + prev["len"] < cur["offset"]
+    bitmap = decode_pages(memory)
+    if bitmap is not None:
+        # The bitmap covers the file up to the last plugged slot, whatever is dirty.
+        covered_pages = -(-plugged_end(memory) // PAGE_SIZE)
+        assert len(bitmap) == -(-covered_pages // 8)
+        # Bits past the last plugged page, and bits of unplugged slots, are clear.
+        for page in range(covered_pages, len(bitmap) * 8):
+            assert not page_set(memory, page)
+        for rng in unplugged:
+            assert set_bytes_in(memory, rng["offset"], rng["len"]) == 0
 
 
 def covered_bytes(ranges):
     """Total number of bytes covered by a range list."""
     return sum(rng["len"] for rng in ranges)
+
+
+def set_bytes(memory):
+    """Total number of bytes to copy according to `memory`."""
+    bitmap = decode_pages(memory)
+    if bitmap is None:
+        return memory["total_size"] - covered_bytes(memory["unplugged"])
+    return sum(byte.bit_count() for byte in bitmap) * memory["page_size"]
+
+
+def set_pages(memory):
+    """Sorted list of the pages to copy."""
+    return [
+        page
+        for page in range(memory["total_size"] // memory["page_size"])
+        if page_set(memory, page)
+    ]
+
+
+def set_bytes_in(memory, offset, length):
+    """Bytes to copy within `[offset, offset + length)`."""
+    page_size = memory["page_size"]
+    first, last = offset // page_size, (offset + length) // page_size
+    return sum(1 for page in range(first, last) if page_set(memory, page)) * page_size
 
 
 def differing_pages(path_a, path_b, page_size=4096):
@@ -135,7 +201,7 @@ def test_boot_full_snapshot_restores(uvm, microvm_factory, huge_pages):
     memory = vm.last_snapshot_memory
     check_layout(memory, MEM_SIZE_MIB * 2**20)
     assert not memory["unplugged"]
-    assert covered_bytes(memory["ranges"]) == MEM_SIZE_MIB * 2**20
+    assert set_bytes(memory) == MEM_SIZE_MIB * 2**20
     assert snapshot.mem.stat().st_size == MEM_SIZE_MIB * 2**20
     vm.kill()
 
@@ -165,7 +231,7 @@ def test_diff_self_consistency(uvm, huge_pages):
     diff = vm.snapshot_diff(mem_path="mem_diff")
     diff_memory = vm.last_snapshot_memory
     check_layout(diff_memory, MEM_SIZE_MIB * 2**20)
-    dirty_bytes = covered_bytes(diff_memory["ranges"])
+    dirty_bytes = set_bytes(diff_memory)
     # The workload dirtied at least what it wrote, and not everything.
     assert 64 * 2**20 <= dirty_bytes < MEM_SIZE_MIB * 2**20
     assert diff.mem.stat().st_size == MEM_SIZE_MIB * 2**20
@@ -211,9 +277,9 @@ def test_diff_chain_restores(uvm, microvm_factory, huge_pages):
 
 
 @pytest.mark.parametrize("huge_pages", PAGE_CONFIGS)
-def test_precopy_dirty_ranges(uvm, huge_pages):
+def test_precopy_dirty_pages(uvm, huge_pages):
     """
-    Pre-copy: copy dirty ranges repeatedly while the guest runs, then pause
+    Pre-copy: copy dirty pages repeatedly while the guest runs, then pause
     and copy the final `Diff` set. The result must equal a `Full` taken right
     after. This exercises the virtio-net `prepare_dirty_tracking_reset` hook,
     since ssh traffic flows during the passes.
@@ -229,9 +295,9 @@ def test_precopy_dirty_ranges(uvm, huge_pages):
 
     for _ in range(4):
         make_guest_dirty_memory(vm.ssh, amount_mib=16)
-        memory = vm.dirty_ranges(copy_to="mem_precopy")
+        memory = vm.dirty_pages(copy_to="mem_precopy")
         check_layout(memory, MEM_SIZE_MIB * 2**20)
-        assert memory["ranges"], "a running guest dirties something"
+        assert set_bytes(memory) > 0, "a running guest dirties something"
 
     # Final pass while paused, merged into the same file.
     vm.pause()
@@ -246,19 +312,20 @@ def test_precopy_dirty_ranges(uvm, huge_pages):
     assert filecmp.cmp(precopy, full.mem, shallow=False)
 
 
-def test_dirty_ranges_are_consumed(uvm):
-    """Two back-to-back `dirty-ranges` calls on a paused guest: the second is empty."""
+def test_dirty_pages_are_consumed(uvm):
+    """Two back-to-back `dirty-pages` calls on a paused guest: the second is empty."""
     vm = boot_with_mem_backend(uvm)
     make_guest_dirty_memory(vm.ssh, amount_mib=16)
     vm.pause()
 
-    first = vm.dirty_ranges()
-    assert covered_bytes(first["ranges"]) >= 16 * 2**20
-    second = vm.dirty_ranges()
+    first = vm.dirty_pages()
+    check_layout(first, MEM_SIZE_MIB * 2**20)
+    assert set_bytes(first) >= 16 * 2**20
+    second = vm.dirty_pages()
     # Only the virtqueue pages, re-marked after every reset so that they are part of the next
     # set, remain.
-    assert covered_bytes(second["ranges"]) < 2**20
-    assert covered_bytes(second["ranges"]) == covered_bytes(vm.dirty_ranges()["ranges"])
+    assert set_bytes(second) < 2**20
+    assert set_pages(second) == set_pages(vm.dirty_pages())
 
 
 def test_pause_invariant(uvm):
@@ -397,7 +464,7 @@ def test_boot_snapshot_restores_with_uffd(uvm, microvm_factory):
     # A plain UFFD restore attaches no backend.
     assert restored.mem_backend is None
     with pytest.raises(RuntimeError, match="No memory backend"):
-        restored.api.snapshot_dirty_ranges.put()
+        restored.api.snapshot_dirty_pages.put()
     restored.kill()
 
 
@@ -439,12 +506,22 @@ def test_virtio_mem_unplugged_slots(uvm, microvm_factory):
 
     total_size = (MEM_SIZE_MIB + 512) * 2**20
 
-    # Nothing plugged yet: the whole hotplug region is unplugged.
+    # Nothing plugged yet: the whole hotplug region is unplugged. A `Full` has
+    # no bitmap: everything outside `unplugged` is copied.
     snapshot = vm.snapshot_full(mem_path="mem_unplugged")
     memory = vm.last_snapshot_memory
     check_layout(memory, total_size)
+    assert "pages" not in memory
     assert covered_bytes(memory["unplugged"]) == 512 * 2**20
-    assert covered_bytes(memory["ranges"]) == MEM_SIZE_MIB * 2**20
+    assert set_bytes(memory) == MEM_SIZE_MIB * 2**20
+
+    # A `Diff` right away: its bitmap ends with DRAM, since the hotplug region
+    # that follows is unplugged, however large it is.
+    vm.resume()
+    vm.pause()
+    memory = vm.dirty_pages()
+    check_layout(memory, total_size)
+    assert len(decode_pages(memory)) == MEM_SIZE_MIB * 2**20 // PAGE_SIZE // 8
     assert snapshot.mem.stat().st_size == total_size
     with open(snapshot.mem, "rb") as mem:
         mem.seek(MEM_SIZE_MIB * 2**20)
@@ -458,7 +535,8 @@ def test_virtio_mem_unplugged_slots(uvm, microvm_factory):
     memory = vm.last_snapshot_memory
     check_layout(memory, total_size)
     assert covered_bytes(memory["unplugged"]) == (512 - 128) * 2**20
-    assert covered_bytes(memory["ranges"]) == (MEM_SIZE_MIB + 128) * 2**20
+    assert set_bytes(memory) == (MEM_SIZE_MIB + 128) * 2**20
+    assert "pages" not in memory
     vm.kill()
 
     restored = microvm_factory.build_from_snapshot(snapshot)
@@ -512,12 +590,30 @@ def test_virtio_mem_unplug_after_use(uvm, microvm_factory):
     diff_memory = vm.last_snapshot_memory
     check_layout(diff_memory, total_size)
     assert covered_bytes(diff_memory["unplugged"]) == (512 - 128) * 2**20
+    # The unplug marked the slot dirty, but as long as it is unplugged the API
+    # describes it through `unplugged` only: no bit is set for it, and the bitmap
+    # ends with the last plugged slot however much unplugged memory follows.
+    plugged_end_offset = (MEM_SIZE_MIB + 128) * 2**20
+    assert plugged_end(diff_memory) == plugged_end_offset
+    assert len(decode_pages(diff_memory)) == plugged_end_offset // PAGE_SIZE // 8
     full = vm.snapshot_full(mem_path="mem_full", vmstate_path="vmstate_full")
     assert filecmp.cmp(diff.mem, full.mem, shallow=False)
     # The unplugged slots are zero in the file, whatever the base had there.
     with open(full.mem, "rb") as mem:
         mem.seek((MEM_SIZE_MIB + 128) * 2**20)
         assert mem.read((512 - 128) * 2**20) == bytes((512 - 128) * 2**20)
+
+    # Dirty tracking is independent of reporting: unplug the remaining slot and
+    # plug it back with no API call in between. It is plugged at the time of the
+    # call, so the marks the unplug left are reported: its pages became zero.
+    vm.resume()
+    vm.hotplug_memory(0)
+    vm.hotplug_memory(128)
+    vm.pause()
+    replugged = vm.dirty_pages()
+    check_layout(replugged, total_size)
+    assert set_bytes_in(replugged, MEM_SIZE_MIB * 2**20, 128 * 2**20) == 128 * 2**20
+    assert covered_bytes(replugged["unplugged"]) == (512 - 128) * 2**20
     vm.kill()
 
     # Restore, plug everything back and use it.
@@ -549,7 +645,7 @@ def check_diff_identity_across_inflate(vm, base, amount_mib):
     diff = vm.snapshot_diff(mem_path="mem_diff")
     diff_memory = vm.last_snapshot_memory
     check_layout(diff_memory, MEM_SIZE_MIB * 2**20)
-    assert covered_bytes(diff_memory["ranges"]) >= amount_mib * 2**20
+    assert set_bytes(diff_memory) >= amount_mib * 2**20
     full = vm.snapshot_full(mem_path="mem_full", vmstate_path="vmstate_full")
     rebased = diff.rebase_snapshot(base)
     assert filecmp.cmp(rebased.mem, full.mem, shallow=False)
@@ -679,7 +775,7 @@ def test_diff_mincore_self_consistency(uvm):
     diff = vm.make_snapshot(SnapshotType.DIFF_MINCORE, mem_path="mem_diff")
     diff_memory = vm.last_snapshot_memory
     check_layout(diff_memory, MEM_SIZE_MIB * 2**20)
-    assert covered_bytes(diff_memory["ranges"]) >= 64 * 2**20
+    assert set_bytes(diff_memory) >= 64 * 2**20
 
     full = vm.snapshot_full(mem_path="mem_full", vmstate_path="vmstate_full")
     rebased = diff.rebase_snapshot(base)
@@ -703,8 +799,9 @@ def test_two_dram_regions(uvm, microvm_factory):
     snapshot = vm.snapshot_full()
     memory = vm.last_snapshot_memory
     check_layout(memory, mem_size_mib * 2**20)
-    # Both regions are plugged and adjacent in file space: a single range.
-    assert memory["ranges"] == [{"offset": 0, "len": mem_size_mib * 2**20}]
+    # Both regions are plugged and adjacent in file space: every bit is set.
+    assert set_bytes(memory) == mem_size_mib * 2**20
+    assert memory["unplugged"] == []
     assert snapshot.mem.stat().st_size == mem_size_mib * 2**20
     vm.kill()
 
@@ -742,7 +839,7 @@ def test_snapshot_right_after_restore(uvm, microvm_factory, snapshot_type):
 
     if snapshot_type == SnapshotType.DIFF:
         diff = vm.snapshot_diff(mem_path="mem_diff")
-        dirty = covered_bytes(vm.last_snapshot_memory["ranges"])
+        dirty = set_bytes(vm.last_snapshot_memory)
         # A handful of pages, not nothing and not everything.
         assert 0 < dirty <= 2**20, dirty
         full = vm.snapshot_full(mem_path="mem_full", vmstate_path="vmstate_full")
@@ -789,14 +886,14 @@ def test_negative_api(uvm, microvm_factory, guest_kernel, rootfs):
         vm.api.actions.put(action_type="InstanceStart")
     vm.kill()
 
-    # Without a backend: mem_file_path stays mandatory, dirty-ranges is rejected.
+    # Without a backend: mem_file_path stays mandatory, dirty-pages is rejected.
     plain = microvm_factory.build(guest_kernel, rootfs)
     plain.spawn()
     plain.basic_config(vcpu_count=2, mem_size_mib=MEM_SIZE_MIB, track_dirty_pages=True)
     plain.add_net_iface()
     plain.start()
     with pytest.raises(RuntimeError, match="No memory backend"):
-        plain.api.snapshot_dirty_ranges.put()
+        plain.api.snapshot_dirty_pages.put()
     plain.pause()
     with pytest.raises(RuntimeError, match="mem_file_path"):
         plain.api.snapshot_create.put(snapshot_path="vmstate", snapshot_type="Full")

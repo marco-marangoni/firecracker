@@ -59,16 +59,149 @@ pub struct MemoryRange {
     pub len: u64,
 }
 
-/// The `memory` object returned by `PUT /snapshot/create` and `PUT /snapshot/dirty-ranges`
-/// when a memory backend is attached: which bytes of the memfd make up the snapshot.
+/// The `memory` object returned by `PUT /snapshot/create` and `PUT /snapshot/dirty-pages`
+/// when a memory backend is attached: which pages of the memfd make up the snapshot.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnapshotMemoryLayout {
     /// Size of a full guest memory file.
     pub total_size: u64,
-    /// Bytes to copy from the memfd into the memory file, at the same offset.
-    pub ranges: Vec<MemoryRange>,
+    /// Granularity of `pages`, in bytes.
+    pub page_size: u64,
+    /// Standard base64 of a bitmap with one bit per `page_size` bytes of the memory file: byte
+    /// `i`, bit `b` (least significant first) is the page at offset `(8 * i + b) * page_size`.
+    /// Set pages are to be copied into the memory file at the same offset. The bitmap covers
+    /// the file up to the end of the last plugged slot; pages past its end are clear. Absent for
+    /// a full snapshot, which consists of every page outside `unplugged`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pages: Option<String>,
     /// Bytes to zero in the memory file (unplugged virtio-mem slots).
     pub unplugged: Vec<MemoryRange>,
+}
+
+impl SnapshotMemoryLayout {
+    /// Decodes `pages`, if present. Firecracker emits standard, padded base64 (RFC 4648 §4).
+    pub fn decode_pages(&self) -> Result<Option<Vec<u8>>, std::io::Error> {
+        self.pages
+            .as_ref()
+            .map(|pages| {
+                base64_decode(pages.as_bytes()).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid base64 in `pages`",
+                    )
+                })
+            })
+            .transpose()
+    }
+
+    /// The runs of consecutive pages to copy, as `{offset, len}` byte ranges in file offset
+    /// order. For a full snapshot (no `pages`) that is everything outside `unplugged`.
+    pub fn set_runs(&self) -> Result<Vec<MemoryRange>, std::io::Error> {
+        let Some(bitmap) = self.decode_pages()? else {
+            let mut runs = Vec::new();
+            let mut cursor = 0u64;
+            for hole in &self.unplugged {
+                if hole.offset > cursor {
+                    runs.push(MemoryRange {
+                        offset: cursor,
+                        len: hole.offset - cursor,
+                    });
+                }
+                cursor = hole.offset + hole.len;
+            }
+            if self.total_size > cursor {
+                runs.push(MemoryRange {
+                    offset: cursor,
+                    len: self.total_size - cursor,
+                });
+            }
+            return Ok(runs);
+        };
+        let num_pages = self.total_size.div_ceil(self.page_size);
+        if (bitmap.len() as u64) > num_pages.div_ceil(8) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "`pages` has {} bytes, more than the {} pages of the file need",
+                    bitmap.len(),
+                    num_pages,
+                ),
+            ));
+        }
+        let mut runs: Vec<MemoryRange> = Vec::new();
+        // The bitmap ends with the last plugged slot; whatever lies past it is clear.
+        for page in 0..num_pages.min(bitmap.len() as u64 * 8) {
+            let set = bitmap[(page / 8) as usize] & (1 << (page % 8)) != 0;
+            if !set {
+                continue;
+            }
+            let offset = page * self.page_size;
+            match runs.last_mut() {
+                Some(last) if last.offset + last.len == offset => last.len += self.page_size,
+                _ => runs.push(MemoryRange {
+                    offset,
+                    len: self.page_size,
+                }),
+            }
+        }
+        Ok(runs)
+    }
+}
+
+/// Decodes standard base64 with `=` padding (RFC 4648 §4). Whitespace is not accepted. Returns
+/// `None` on any malformed input. Written out here so that the example handlers stay free of
+/// dependencies beyond what Firecracker's own examples already use.
+pub fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {
+    fn value(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some(u32::from(c - b'A')),
+            b'a'..=b'z' => Some(u32::from(c - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(c - b'0') + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    if !input.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    for (i, chunk) in input.chunks(4).enumerate() {
+        let last = i == input.len() / 4 - 1;
+        let pad = chunk.iter().rev().take_while(|&&c| c == b'=').count();
+        if pad > 2 || (pad > 0 && !last) {
+            return None;
+        }
+        let mut acc = 0u32;
+        for &c in &chunk[..4 - pad] {
+            acc = (acc << 6) | value(c)?;
+        }
+        acc <<= 6 * pad as u32;
+        let bytes = acc.to_be_bytes();
+        out.extend_from_slice(&bytes[1..4 - pad]);
+    }
+    Some(out)
+}
+
+/// Encodes to standard, padded base64. Test helper and convenience for orchestrators built on
+/// this module.
+pub fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let mut acc = 0u32;
+        for (i, &b) in chunk.iter().enumerate() {
+            acc |= u32::from(b) << (16 - 8 * i);
+        }
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(TABLE[((acc >> (18 - 6 * i)) & 0x3F) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// Requests the orchestrator can send on the handler's control socket. Unrelated to Firecracker:
@@ -77,8 +210,9 @@ pub struct SnapshotMemoryLayout {
 /// framework) do.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ControlRequest {
-    /// Copy `memory.ranges` from the memfd into `mem_path` (created at `memory.total_size` if it
-    /// does not exist, merged into otherwise) and zero `memory.unplugged` in it.
+    /// Copy the set pages of `memory.pages` from the memfd into `mem_path` (created at
+    /// `memory.total_size` if it does not exist, merged into otherwise) and zero
+    /// `memory.unplugged` in it.
     Copy {
         mem_path: PathBuf,
         memory: SnapshotMemoryLayout,
@@ -415,17 +549,18 @@ impl MemorySource<'_> {
     }
 }
 
-/// Copies `layout.ranges` from `memfd` into the file at `mem_path` at the same offsets and zeroes
-/// `layout.unplugged` there. The file is created at `layout.total_size` if it does not exist;
-/// an existing file (a full snapshot a diff is merged into) is left at its size.
+/// Copies the set pages of `layout.pages` from `memfd` into the file at `mem_path` at the same
+/// offsets and zeroes `layout.unplugged` there. The file is created at `layout.total_size` if it
+/// does not exist; an existing file (a full snapshot a diff is merged into) is left at its size.
 ///
 /// This is what turns the `memory` object of a `PUT /snapshot/create` response into a memory
-/// file byte-for-byte identical to the one Firecracker would have written.
-pub fn copy_ranges(
+/// file byte-for-byte identical to the one Firecracker would have written. Returns the number of
+/// copy operations performed.
+pub fn copy_pages(
     source: MemorySource<'_>,
     mem_path: &Path,
     layout: &SnapshotMemoryLayout,
-) -> Result<(), std::io::Error> {
+) -> Result<usize, std::io::Error> {
     let target = OpenOptions::new()
         .read(true)
         .write(true)
@@ -436,10 +571,11 @@ pub fn copy_ranges(
         target.set_len(layout.total_size)?;
     }
 
-    for range in &layout.ranges {
-        // Split the range into runs of pages that come from the same file. Ranges are
-        // host-page (4 KiB) granular even when the backing page is larger, so walk backing page
-        // *boundaries* rather than stepping `page_size` from the range start.
+    let mut copies = 0;
+    for range in layout.set_runs()? {
+        // Split the run into pieces that come from the same file. `pages` is host-page (4 KiB)
+        // granular even when the backing page is larger, so walk backing page *boundaries* rather
+        // than stepping `page_size` from the run start.
         let page_size = source.page_size as u64;
         let end = range.offset + range.len;
         let mut start = range.offset;
@@ -460,13 +596,16 @@ pub fn copy_ranges(
                 source.backing.unwrap().0
             };
             copy_range(src, &target, &run)?;
+            copies += 1;
             start = run_end;
         }
     }
+    // Firecracker never sets bits inside `unplugged`; zeroing last keeps the result right even
+    // for a peer-made layout that does.
     for range in &layout.unplugged {
         zero_range(&target, range)?;
     }
-    Ok(())
+    Ok(copies)
 }
 
 /// `copy_file_range` from `src` to `dst` at the same offset, falling back to a read/write loop
@@ -728,12 +867,11 @@ impl Runtime {
                         .as_ref()
                         .map(|file| (file, populated.as_slice())),
                 };
-                match copy_ranges(source, &mem_path, &memory) {
-                    Ok(()) => ControlResponse::Done {
+                match copy_pages(source, &mem_path, &memory) {
+                    Ok(copies) => ControlResponse::Done {
                         success: true,
                         message: format!(
-                            "copied {} ranges and zeroed {} ranges into {}",
-                            memory.ranges.len(),
+                            "copied {copies} runs and zeroed {} ranges into {}",
                             memory.unplugged.len(),
                             mem_path.display()
                         ),
@@ -1009,30 +1147,168 @@ mod tests {
         assert!(handshake.memfd.is_some());
     }
 
+    /// A layout for `total_pages` 4 KiB pages with the given page indices set.
+    fn layout(total_pages: u64, set: &[u64], unplugged: Vec<MemoryRange>) -> SnapshotMemoryLayout {
+        layout_with_page_size(4096, total_pages, set, unplugged)
+    }
+
+    fn layout_with_page_size(
+        page_size: u64,
+        total_pages: u64,
+        set: &[u64],
+        unplugged: Vec<MemoryRange>,
+    ) -> SnapshotMemoryLayout {
+        let mut bitmap = vec![0u8; total_pages.div_ceil(8) as usize];
+        for &page in set {
+            bitmap[(page / 8) as usize] |= 1 << (page % 8);
+        }
+        SnapshotMemoryLayout {
+            total_size: total_pages * page_size,
+            page_size,
+            pages: Some(base64_encode(&bitmap)),
+            unplugged,
+        }
+    }
+
+    /// A full layout for `total_pages` 4 KiB pages: no bitmap.
+    fn full_layout(total_pages: u64, unplugged: Vec<MemoryRange>) -> SnapshotMemoryLayout {
+        SnapshotMemoryLayout {
+            total_size: total_pages * 4096,
+            page_size: 4096,
+            pages: None,
+            unplugged,
+        }
+    }
+
     #[test]
-    fn test_copy_ranges_full_then_diff() {
+    fn test_base64_round_trip() {
+        for input in [
+            &b""[..],
+            b"f",
+            b"fo",
+            b"foo",
+            b"foob",
+            b"fooba",
+            b"foobar",
+            &[0x03, 0x01],
+            &[0xff; 33],
+        ] {
+            let encoded = base64_encode(input);
+            assert_eq!(encoded.len() % 4, 0);
+            assert_eq!(
+                base64_decode(encoded.as_bytes()).unwrap(),
+                input,
+                "{encoded}"
+            );
+        }
+        // RFC 4648 test vectors and the documentation example.
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(&[0x03, 0x10]), "AxA=");
+        assert_eq!(base64_decode(b"AxA=").unwrap(), [0x03, 0x10]);
+        // Malformed input.
+        for bad in ["A", "AwE", "Aw=E", "!!!!", "A===", "Aw==Aw=="] {
+            assert!(base64_decode(bad.as_bytes()).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn test_set_runs() {
+        let runs = |l: &SnapshotMemoryLayout| {
+            l.set_runs()
+                .unwrap()
+                .iter()
+                .map(|r| (r.offset, r.len))
+                .collect::<Vec<_>>()
+        };
+        // 64 KiB guest, pages 0, 1 and 12 set: the documentation example.
+        let doc = SnapshotMemoryLayout {
+            total_size: 65536,
+            page_size: 4096,
+            pages: Some("AxA=".to_string()),
+            unplugged: vec![],
+        };
+        assert_eq!(runs(&doc), vec![(0, 8192), (49152, 4096)]);
+        // Page count not a multiple of 8, last page set.
+        let l = layout(13, &[0, 12], vec![]);
+        assert_eq!(runs(&l), vec![(0, 4096), (12 * 4096, 4096)]);
+        // Empty.
+        assert!(layout(13, &[], vec![]).set_runs().unwrap().is_empty());
+        // A bitmap shorter than the file (it ends with the last plugged slot): pages past its
+        // end are clear.
+        let short = SnapshotMemoryLayout {
+            total_size: 65536,
+            page_size: 4096,
+            pages: Some("Aw==".to_string()),
+            unplugged: vec![],
+        };
+        assert_eq!(runs(&short), vec![(0, 8192)]);
+        let empty = SnapshotMemoryLayout {
+            total_size: 65536,
+            page_size: 4096,
+            pages: Some(String::new()),
+            unplugged: vec![],
+        };
+        assert!(empty.set_runs().unwrap().is_empty());
+        // A bitmap longer than the file is rejected.
+        let long = SnapshotMemoryLayout {
+            total_size: 4096,
+            page_size: 4096,
+            pages: Some("AxA=".to_string()),
+            unplugged: vec![],
+        };
+        long.set_runs().unwrap_err();
+
+        // Full: everything outside `unplugged`, as runs.
+        assert_eq!(runs(&full_layout(4, vec![])), vec![(0, 4 * 4096)]);
+        let hole = |page: u64, pages: u64| MemoryRange {
+            offset: page * 4096,
+            len: pages * 4096,
+        };
+        assert_eq!(
+            runs(&full_layout(8, vec![hole(2, 1), hole(5, 3)])),
+            vec![(0, 2 * 4096), (3 * 4096, 2 * 4096)]
+        );
+        assert_eq!(
+            runs(&full_layout(8, vec![hole(0, 2)])),
+            vec![(2 * 4096, 6 * 4096)]
+        );
+        assert!(
+            full_layout(8, vec![hole(0, 8)])
+                .set_runs()
+                .unwrap()
+                .is_empty()
+        );
+        // `pages` absent in JSON is a full layout; present is a diff.
+        let l: SnapshotMemoryLayout = serde_json::from_str(
+            r#"{"total_size":16384,"page_size":4096,"unplugged":[{"offset":12288,"len":4096}]}"#,
+        )
+        .unwrap();
+        assert!(l.pages.is_none());
+        assert_eq!(runs(&l), vec![(0, 3 * 4096)]);
+    }
+
+    #[test]
+    fn test_copy_pages_full_then_diff() {
         let memfd = memfd_with_pattern(4);
         let tmp_dir = TempDir::new().unwrap();
         let mem_path = tmp_dir.as_path().join("mem");
 
         // Full: pages 0..2 plugged, page 3 unplugged (must be zero even though the memfd has data).
-        let full = SnapshotMemoryLayout {
-            total_size: 4 * 4096,
-            ranges: vec![MemoryRange {
-                offset: 0,
-                len: 3 * 4096,
-            }],
-            unplugged: vec![MemoryRange {
+        let full = full_layout(
+            4,
+            vec![MemoryRange {
                 offset: 3 * 4096,
                 len: 4096,
             }],
-        };
+        );
         let source = MemorySource {
             memfd: &memfd,
             page_size: 4096,
             backing: None,
         };
-        copy_ranges(source, &mem_path, &full).unwrap();
+        assert_eq!(copy_pages(source, &mem_path, &full).unwrap(), 1);
         let mut expected = Vec::new();
         for page in 0..3u8 {
             expected.extend(std::iter::repeat_n(page + 1, 4096));
@@ -1042,28 +1318,35 @@ mod tests {
 
         // Modify page 1 in the "guest" and merge a diff that contains only page 1.
         memfd.write_all_at(&[0xAA; 4096], 4096).unwrap();
-        let diff = SnapshotMemoryLayout {
-            total_size: 4 * 4096,
-            ranges: vec![MemoryRange {
-                offset: 4096,
-                len: 4096,
-            }],
-            unplugged: vec![],
-        };
-        copy_ranges(source, &mem_path, &diff).unwrap();
+        let diff = layout(4, &[1], vec![]);
+        copy_pages(source, &mem_path, &diff).unwrap();
         expected[4096..2 * 4096].fill(0xAA);
         assert_eq!(std::fs::read(&mem_path).unwrap(), expected);
 
         // A diff into a fresh file yields a sparse file of total_size with only that page.
         let diff_path = tmp_dir.as_path().join("diff");
-        copy_ranges(source, &diff_path, &diff).unwrap();
+        copy_pages(source, &diff_path, &diff).unwrap();
         let mut sparse = vec![0u8; 4 * 4096];
         sparse[4096..2 * 4096].fill(0xAA);
         assert_eq!(std::fs::read(&diff_path).unwrap(), sparse);
+
+        // `unplugged` wins over a set bit in the same range (Firecracker never produces that,
+        // but zeroing last makes the copy robust to it).
+        let diff = layout(
+            4,
+            &[2],
+            vec![MemoryRange {
+                offset: 2 * 4096,
+                len: 2 * 4096,
+            }],
+        );
+        copy_pages(source, &mem_path, &diff).unwrap();
+        expected[2 * 4096..].fill(0);
+        assert_eq!(std::fs::read(&mem_path).unwrap(), expected);
     }
 
     #[test]
-    fn test_copy_ranges_unpopulated_pages_come_from_snapshot_file() {
+    fn test_copy_pages_unpopulated_pages_come_from_snapshot_file() {
         // After a restore, only the pages the handler has faulted in are in the memfd; the
         // rest of the guest memory is still in the snapshot file.
         let tmp_dir = TempDir::new().unwrap();
@@ -1092,15 +1375,9 @@ mod tests {
             backing: Some((&snapshot_file, &populated_refs)),
         };
         let mem_path = tmp_dir.as_path().join("mem");
-        let full = SnapshotMemoryLayout {
-            total_size: 4 * 4096,
-            ranges: vec![MemoryRange {
-                offset: 0,
-                len: 4 * 4096,
-            }],
-            unplugged: vec![],
-        };
-        copy_ranges(source, &mem_path, &full).unwrap();
+        let full = full_layout(4, vec![]);
+        // Pages 0 and 3 from the snapshot file, 1 and 2 from the memfd: three runs.
+        assert_eq!(copy_pages(source, &mem_path, &full).unwrap(), 3);
 
         let mut expected = snapshot.clone();
         expected[2 * 4096..3 * 4096].fill(0xEE);
@@ -1113,7 +1390,7 @@ mod tests {
             backing: None,
         };
         let boot_path = tmp_dir.as_path().join("mem_boot");
-        copy_ranges(boot_source, &boot_path, &full).unwrap();
+        assert_eq!(copy_pages(boot_source, &boot_path, &full).unwrap(), 1);
         let mut expected = vec![0u8; 4 * 4096];
         expected[4096..2 * 4096].copy_from_slice(&snapshot[4096..2 * 4096]);
         expected[2 * 4096..3 * 4096].fill(0xEE);
@@ -1121,7 +1398,7 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_ranges_unaligned_range_across_backing_pages() {
+    fn test_copy_pages_unaligned_run_across_backing_pages() {
         // Dirty ranges are 4 KiB granular while the backing page (hugetlbfs) may be larger:
         // a range starting in the middle of a backing page must still switch source at the
         // next backing page boundary.
@@ -1150,17 +1427,12 @@ mod tests {
             backing: Some((&snapshot_file, &populated_refs)),
         };
 
-        // One 4 KiB granular range from the middle of page 0 to the middle of page 2.
+        // One 4 KiB granular run from the middle of page 0 to the middle of page 2: 4 KiB pages
+        // 1..=4 of the six.
         let mem_path = tmp_dir.as_path().join("mem");
-        let layout = SnapshotMemoryLayout {
-            total_size: (3 * PAGE) as u64,
-            ranges: vec![MemoryRange {
-                offset: 4096,
-                len: (2 * PAGE) as u64,
-            }],
-            unplugged: vec![],
-        };
-        copy_ranges(source, &mem_path, &layout).unwrap();
+        let layout = layout(6, &[1, 2, 3, 4], vec![]);
+        assert_eq!(layout.page_size, 4096);
+        assert_eq!(copy_pages(source, &mem_path, &layout).unwrap(), 3);
 
         let mut expected = vec![0u8; 3 * PAGE];
         expected[4096..PAGE].copy_from_slice(&snapshot[4096..PAGE]);
@@ -1198,14 +1470,7 @@ mod tests {
         // Before the handshake, a copy must fail cleanly.
         let request = serde_json::to_vec(&ControlRequest::Copy {
             mem_path: mem_path.clone(),
-            memory: SnapshotMemoryLayout {
-                total_size: 0x2000,
-                ranges: vec![MemoryRange {
-                    offset: 0,
-                    len: 0x2000,
-                }],
-                unplugged: vec![],
-            },
+            memory: layout(2, &[0, 1], vec![]),
         })
         .unwrap();
         let send = |request: &[u8]| {

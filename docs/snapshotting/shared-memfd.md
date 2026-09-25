@@ -84,7 +84,7 @@ The array has one entry per guest memory region, in guest address order:
 | :-------------------- | :-------------------------------------------------------------------------------------------------------------------- |
 | `base_host_virt_addr` | Address of the region in Firecracker's address space. Page fault events use it; the memfd and the API do not.         |
 | `size`                | Region size in bytes.                                                                                                 |
-| `offset`              | Offset of the region in the memfd. It is also its offset in a memory snapshot file and in the ranges the API returns. |
+| `offset`              | Offset of the region in the memfd. It is also its offset in a memory snapshot file and in the bitmap the API returns. |
 | `page_size`           | Page size in bytes: 4096, or 2097152 (2 MiB) with hugetlbfs.                                                          |
 | `page_size_kib`       | Deprecated copy of `page_size`. The value is in bytes despite the name. Will be removed in 2.0.                       |
 
@@ -133,9 +133,9 @@ it. On a restore, the backend serves page faults from the snapshot file, and the
 memfd fills with what it populates and what the guest writes.
 
 From here on, Firecracker's only involvement is the API. `PUT /snapshot/create`
-and `PUT /snapshot/dirty-ranges` return byte ranges of the memfd to copy, and
-whoever made the call passes them to the backend however it likes; the example
-handler uses a second Unix socket. There is no other protocol between
+and `PUT /snapshot/dirty-pages` return a bitmap of the pages of the memfd to
+copy, and whoever made the call passes it to the backend however it likes; the
+example handler uses a second Unix socket. There is no other protocol between
 Firecracker and the backend.
 
 Sharing memory this way has a cost: guest memory is a `MAP_SHARED` mapping of
@@ -207,51 +207,93 @@ of the snapshot:
 {
   "snapshot_type": "Diff",
   "memory": {
-    "total_size": 1073741824,
-    "ranges": [
-      {
-        "offset": 0,
-        "len": 8192
-      },
-      {
-        "offset": 1048576,
-        "len": 4096
-      }
-    ],
+    "total_size": 1048576,
+    "page_size": 4096,
+    "pages": "Ax4AAAABAPwPAAAAEAAAAAwAACAA/B8A",
     "unplugged": [
       {
-        "offset": 805306368,
-        "len": 268435456
+        "offset": 786432,
+        "len": 262144
       }
     ]
   }
 }
 ```
 
+The example is a 1 MiB guest (256 pages) whose last 256 KiB is an unplugged
+virtio-mem slot. The bitmap covers the 192 plugged pages and decodes to 24
+bytes. Bit `b` of byte `i` is page `8 * i + b`, so in the usual binary notation
+the lowest page of a byte is its rightmost bit:
+
+```text
+index  pages    hex   binary    dirty pages
+    0    0-7    0x03  00000011  0-1
+    1    8-15   0x1e  00011110  9-12
+    2   16-23   0x00  00000000  -
+    3   24-31   0x00  00000000  -
+    4   32-39   0x00  00000000  -
+    5   40-47   0x01  00000001  40
+    6   48-55   0x00  00000000  -
+    7   56-63   0xfc  11111100  58-63
+    8   64-71   0x0f  00001111  64-67
+    9   72-79   0x00  00000000  -
+   10   80-87   0x00  00000000  -
+   11   88-95   0x00  00000000  -
+   12   96-103  0x10  00010000  100
+   13  104-111  0x00  00000000  -
+   14  112-119  0x00  00000000  -
+   15  120-127  0x00  00000000  -
+   16  128-135  0x0c  00001100  130-131
+   17  136-143  0x00  00000000  -
+   18  144-151  0x00  00000000  -
+   19  152-159  0x20  00100000  157
+   20  160-167  0x00  00000000  -
+   21  168-175  0xfc  11111100  170-175
+   22  176-183  0x1f  00011111  176-180
+   23  184-191  0x00  00000000  -
+```
+
+Pages 0–1, 9–12, 40, 58–67, 100, 130–131, 157 and 170–180 are to be copied.
+Pages 192–255 are unplugged and not covered by the bitmap; `unplugged` says to
+zero them. A 1 GiB guest with all its memory plugged has a 32 KiB bitmap.
+
 - `total_size` is the size of a full memory file (the sum of all region sizes,
   including the hotplug region). Create the target file at this size.
-- `ranges` are the bytes to copy from the memfd into the target, at the same
-  offset. For `Full` this is every plugged byte; for `Diff` it is exactly what a
-  Firecracker-written diff file would contain: every page dirtied since the last
-  snapshot, as tracked by KVM's dirty log (or `mincore` when `track_dirty_pages`
-  is off) and by Firecracker's own device-write tracking.
-- `unplugged` are the bytes to zero in the target: the currently unplugged
-  virtio-mem slots. Empty without virtio-mem. Zeroing them makes the result
-  identical to a fresh Firecracker-written file, including when a `Diff` is
-  merged into a full file in which a slot has been unplugged since.
+- `page_size` is the granularity of `pages`, in bytes. It is the host page size
+  (usually 4096), also when the guest memory is backed by 2 MiB hugetlbfs pages.
+- `pages` is the set of pages to copy from the memfd into the target, at the
+  same offset, as a bitmap: standard base64 (RFC 4648, with padding). Byte `i`,
+  bit `b` (least significant bit first) is the page at offset
+  `(8 * i + b) * page_size`. Read little-endian, the bytes are also an array of
+  64-bit words in which bit `j` of word `w` is page `64 * w + j`. The bitmap
+  covers the file from offset 0 up to the end of the last plugged slot,
+  `ceil(plugged_end / page_size / 8)` bytes, whatever is dirty: its length is a
+  function of the plug state alone, and unplugged memory at the end of the file
+  (an unplugged hotplug region, however large) costs nothing. Pages past its end
+  are clear, and so are the bits of unplugged slots. For `Diff` every plugged
+  page dirtied since the last snapshot is set, as tracked by KVM's dirty log (or
+  `mincore` when `track_dirty_pages` is off) and by Firecracker's own
+  device-write tracking. Pages that became zero because the guest released them
+  (balloon), or because their virtio-mem slot was unplugged and plugged again
+  since, count as dirty. **For `Full` the field is absent**: every page outside
+  `unplugged` is to be copied.
+- `unplugged` are the currently unplugged virtio-mem slots, as sorted,
+  page-aligned, non-overlapping `{offset, len}` pairs. Empty without virtio-mem.
+  **Every byte of these ranges must be zero in the snapshot produced by the
+  backend.**
 
-All ranges are sorted, merged, page-aligned and disjoint from each other.
-`copy_file_range(memfd, off, target, off, len)` for every range followed by
-zeroing `unplugged` yields a file identical to what Firecracker would have
-written. Merging a `Diff` into an existing full memory file is the same
-operation applied to that file.
+Copying every set page, followed by zeroing the `unplugged` range, yields a file
+identical to what Firecracker would have written. Merging a `Diff` into an
+existing full memory file is the same operation applied to that file.
+
+The bitmap is at most 32 KiB per GiB of guest memory (43 KiB as base64).
 
 Like writing a memory file, this consumes the dirty tracking state: the pages
 returned are no longer considered dirty. The virtqueue pages of every activated
 device are marked dirty again afterwards, as today, so that they are part of the
 next diff.
 
-### `PUT /snapshot/dirty-ranges`: pre-copy
+### `PUT /snapshot/dirty-pages`: pre-copy
 
 ```json
 {}
@@ -270,49 +312,53 @@ when written), so that the later write cannot go unnoticed.
 
 In case of a running guest, the returned pages might be modified after this API
 returns. In that case, it's guaranteed they will be returned on the next call of
-`/snapshot/dirty-ranges` or `/snapshot/create`.
+`/snapshot/dirty-pages` or `/snapshot/create`.
 
 ## Consistency
 
 In order to produce a consistent snapshot, the backend needs to adhere to some
 simple rules. These rules cannot be enforced by Firecracker.
 
-- The ranges returned by the `/snapshot/dirty-ranges` and `/snapshot/create`
-  APIs must be eventually copied into the snapshot
+- The pages returned by the `/snapshot/dirty-pages` and `/snapshot/create` APIs
+  must be eventually copied into the snapshot
+- The `unplugged` ranges returned by `/snapshot/create` must be zero in the
+  resulting memory file
 - If a response is lost (e.g. connection dropped before the body was read), that
   dirty information is gone and the next snapshot must be a `Full` snapshot
 - After the final `/snapshot/create`, the VM must not be resumed until the
-  backend has copied every dirty range out of the memfd.
+  backend has copied every set page out of the memfd.
 
 As an example, without pre-copy, the snapshot process would be something like:
 
 1. Pause the VM
 1. Call `/snapshot/create`
-1. Copy the dirty ranges into a file
+1. Copy the set pages into a new file
 1. VM can be resumed here
 
 For a backend that implements pre-copy:
 
-1. Call `/snapshot/dirty-ranges`
-1. Copy the dirty ranges into a file
-1. Repeat from step 1 until the dirty ranges are small enough or after a timeout
-   or iterations limit
+1. Call `/snapshot/dirty-pages`
+1. Copy the set pages into a file
+1. Zero unplugged ranges
+1. Repeat from step 1 until the dirty set is small enough or after a timeout or
+   iterations limit
 1. Pause the VM
 1. Call `/snapshot/create`
-1. Final copy of the dirty ranges into a file
+1. Final copy of the set pages into a file
+1. Final zero-ing of unplugged ranges
 1. VM can be resumed here
 
 Note: this algorithm doesn't make sense without dirty tracking. With mincore,
-the dirty ranges don't decrease between API calls.
+the dirty set doesn't decrease between API calls.
 
 ### What the backend should copy
 
-The `ranges` Firecracker returns say *which* pages to copy. They do not say
+The `pages` Firecracker returns say *which* pages to copy. They do not say
 *where from*, and after a restore that is not always the memfd. The rule is: the
 copy must contain what a read through Firecracker's mapping would return at that
 moment.
 
-For a backend attached at **boot** the answer is simple: all ranges can be read
+For a backend attached at **boot** the answer is simple: all pages can be read
 from the memfd. Pages the guest never touched are holes and read as zero;
 `copy_file_range` copies nothing for them, so the target file must start out
 zeroed (a freshly created file at `total_size` is).
@@ -328,8 +374,8 @@ snapshots. For example, virtIO queues might be marked as dirty before any data
 is written to them, so they might be in a dirty, uffd-register, and unpopulated
 state.
 
-For both **boot** and **resume**, as an optimization, `unplugged` ranges can be
-assumed to be zeroes; reading them from the memfd would be correct but wasteful.
+For both **boot** and **resume**, `unplugged` ranges must end up zero in the
+target.
 
 ### UFFD unregistration
 
@@ -355,7 +401,7 @@ have written there without notifying the backend.
 The example handlers in
 [`src/firecracker/examples/uffd/`](../../src/firecracker/examples/uffd/) work as
 memory backends. They require minimal external orchestration to call Firecracker
-APIs, and tell the backend which memory ranges to copy.
+APIs, and tell the backend which pages to copy.
 
 ## Limitations
 

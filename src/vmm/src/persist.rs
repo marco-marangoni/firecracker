@@ -175,7 +175,7 @@ pub const SNAPSHOT_VERSION: Version = Version::new(12, 0, 0);
 ///
 /// Without a memory backend, guest memory is written to `params.mem_file_path` and `None` is
 /// returned. With a memory backend attached, no memory is written; instead the returned
-/// [`SnapshotMemoryLayout`] tells the backend which ranges of the shared memfd make up the
+/// [`SnapshotMemoryLayout`] tells the backend which pages of the shared memfd make up the
 /// snapshot. Either way the dirty tracking state is consumed exactly as it would be by writing
 /// the corresponding memory file.
 pub fn create_snapshot(
