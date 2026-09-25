@@ -227,8 +227,8 @@ pub enum VmmError {
     MmioDeviceManager(device_manager::mmio::MmioError),
     /// Error getting the KVM dirty bitmap. {0}
     DirtyBitmap(kvm_ioctls::Error),
-    /// Error computing dirty ranges: {0}
-    DirtyRanges(String),
+    /// Error computing dirty pages: {0}
+    DirtyPages(String),
     /// No memory backend is attached to this microVM
     NoMemBackend,
     /// I8042 error: {0}
@@ -315,7 +315,7 @@ pub struct Vmm {
     device_manager: DeviceManager,
     /// Whether guest memory was handed to a memory backend (as a memfd) at boot or restore.
     /// When set, `PUT /snapshot/create` never writes guest memory and instead reports the
-    /// ranges of the memfd that make up the snapshot, and `PUT /snapshot/dirty-ranges` is
+    /// pages of the memfd that make up the snapshot, and `PUT /snapshot/dirty-pages` is
     /// allowed.
     pub mem_backend_attached: bool,
 }
@@ -496,13 +496,13 @@ impl Vmm {
         Ok(())
     }
 
-    /// Reports (and consumes) the ranges of guest memory dirtied since the last snapshot or the
-    /// last call, for pre-copy by a memory backend. See `PUT /snapshot/dirty-ranges`.
+    /// Reports (and consumes) the pages of guest memory dirtied since the last snapshot or the
+    /// last call, for pre-copy by a memory backend. See `PUT /snapshot/dirty-pages`.
     ///
     /// Only meaningful with a memory backend attached: without one, nobody but Firecracker can
     /// turn the dirty bitmaps into bytes, and consuming them here would silently make the next
     /// Firecracker-written diff snapshot incomplete.
-    pub fn dirty_ranges(&mut self) -> Result<SnapshotMemoryLayout, VmmError> {
+    pub fn dirty_pages(&mut self) -> Result<SnapshotMemoryLayout, VmmError> {
         if !self.mem_backend_attached {
             return Err(VmmError::NoMemBackend);
         }
@@ -518,7 +518,7 @@ impl Vmm {
 
         let layout = kvm_vm
             .snapshot_memory_layout(SnapshotType::Diff)
-            .map_err(|err| VmmError::DirtyRanges(err.to_string()))?;
+            .map_err(|err| VmmError::DirtyPages(err.to_string()))?;
 
         // Queue pages are not tracked at runtime; mark them so the next set includes them, as
         // `create_snapshot` does.

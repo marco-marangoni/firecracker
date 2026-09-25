@@ -17,8 +17,8 @@ and this project adheres to
   backed by a single memfd laid out like a memory snapshot file, which is handed
   to the page fault handler process through the existing UFFD handshake (as an
   additional file descriptor). `PUT /snapshot/create` then takes no
-  `mem_file_path` and answers `200 OK` with the memory ranges that make up the
-  snapshot, and the new `PUT /snapshot/dirty-ranges` endpoint returns (and
+  `mem_file_path` and answers `200 OK` with a bitmap of the pages that make up
+  the snapshot, and the new `PUT /snapshot/dirty-pages` endpoint returns (and
   resets) the pages dirtied since the last snapshot for pre-copy while the guest
   runs. See [memory backend](docs/snapshotting/shared-memfd.md).
 

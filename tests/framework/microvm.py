@@ -228,7 +228,7 @@ class Microvm:
         self.boot_args = None
         self.uffd_handler = None
         # The `memory` object of the last `PUT /snapshot/create` /
-        # `PUT /snapshot/dirty-ranges` response, when a memory backend is attached.
+        # `PUT /snapshot/dirty-pages` response, when a memory backend is attached.
         self.last_snapshot_memory = None
 
         self.fc_binary_path = Path(fc_binary_path)
@@ -996,7 +996,7 @@ class Microvm:
 
         Returns the `mem_backend` object to pass to `PUT /machine-config`. The
         handler receives only the guest memory memfd during boot (there are no
-        page faults to serve), keeps it, and copies snapshot ranges out of it
+        page faults to serve), keeps it, and copies snapshot pages out of it
         when asked through `make_snapshot`.
         """
         assert self.uffd_handler is None
@@ -1011,14 +1011,14 @@ class Microvm:
             "backend_path": str(self.uffd_handler.socket_path),
         }
 
-    def dirty_ranges(self, *, copy_to: str = None) -> dict:
-        """`PUT /snapshot/dirty-ranges`: fetch (and consume) the ranges dirtied since the
+    def dirty_pages(self, *, copy_to: str = None) -> dict:
+        """`PUT /snapshot/dirty-pages`: fetch (and consume) the pages dirtied since the
         last snapshot or the last call, for a pre-copy pass. Requires a memory backend.
 
-        With `copy_to`, also asks the backend to copy those ranges into that file
+        With `copy_to`, also asks the backend to copy those pages into that file
         (chroot-relative path), as an orchestrator would.
         """
-        memory = self.api.snapshot_dirty_ranges.put().json()["memory"]
+        memory = self.api.snapshot_dirty_pages.put().json()["memory"]
         self.last_snapshot_memory = memory
         if copy_to is not None:
             self.mem_backend.copy(memory, str(Path("/") / copy_to))
@@ -1063,7 +1063,7 @@ class Microvm:
             )
         else:
             # With a memory backend attached Firecracker does not write guest memory;
-            # it tells us which ranges of the shared memfd make up the snapshot, and
+            # it tells us which pages of the shared memfd make up the snapshot, and
             # we (the orchestrator) have the backend copy them. The VM stays paused,
             # so the copy can happen at any time before the resume.
             response = self.api.snapshot_create.put(

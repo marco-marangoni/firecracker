@@ -591,12 +591,12 @@ impl KvmVm {
             .collect()
     }
 
-    /// Describes which ranges of the guest memory (in memory file / memfd offset space) a
+    /// Describes which pages of the guest memory (in memory file / memfd offset space) a
     /// snapshot of the given type consists of, without writing anything. This is the memory
     /// backend counterpart of [`Self::snapshot_memory_to_file`] and consumes the dirty tracking
-    /// state in the same way: a `Diff` layout covers exactly the pages `dump_dirty` would write
-    /// and resets both bitmaps on success; a `Full` layout covers all plugged slots and resets
-    /// both bitmaps.
+    /// state in the same way: a `Diff` layout covers the pages `dump_dirty` would write (plus
+    /// the dirty pages of unplugged slots) and resets both bitmaps on success; a `Full` layout
+    /// covers all plugged slots and resets both bitmaps.
     pub(crate) fn snapshot_memory_layout(
         &self,
         snapshot_type: SnapshotType,

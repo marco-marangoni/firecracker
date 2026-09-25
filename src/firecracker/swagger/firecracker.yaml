@@ -772,9 +772,9 @@ paths:
         backend attached (see `MachineConfiguration.mem_backend` and the
         `SharedMemfd` backend type of `/snapshot/load`), `mem_file_path` must
         be absent, no guest memory is written, and the response is 200 with a
-        `SnapshotMemory` body telling the backend which ranges of the shared
+        `SnapshotMemory` body telling the backend which pages of the shared
         memfd make up the snapshot. Because a paused microVM does not run device
-        emulation, the backend can copy those ranges at any time before the
+        emulation, the backend can copy those pages at any time before the
         microVM is resumed.
       operationId: createSnapshot
       parameters:
@@ -786,7 +786,7 @@ paths:
             $ref: "#/definitions/SnapshotCreateParams"
       responses:
         200:
-          description: Snapshot state created; memory ranges to copy (memory backend attached)
+          description: Snapshot state created; pages to copy (memory backend attached)
           schema:
             $ref: "#/definitions/SnapshotMemory"
         204:
@@ -800,21 +800,21 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
-  /snapshot/dirty-ranges:
+  /snapshot/dirty-pages:
     put:
       summary: Reports and resets the guest memory dirtied since the last snapshot. Post-boot only.
       description:
-        Returns the ranges of the shared guest memory written since the last
-        snapshot or the last call to this endpoint, and resets dirty tracking,
-        so that a memory backend can perform pre-copy passes while the microVM
-        runs. Only allowed when a memory backend is attached. Callable in any
-        state; the set is not atomic with respect to concurrent guest writes.
+        Returns a bitmap of the pages of the shared guest memory written since
+        the last snapshot or the last call to this endpoint, and resets dirty
+        tracking, so that a memory backend can perform pre-copy passes while the
+        microVM runs. Only allowed when a memory backend is attached. Callable in
+        any state; the set is not atomic with respect to concurrent guest writes.
         The final, consistent set for a snapshot is the one returned by
         `PUT /snapshot/create`.
-      operationId: getDirtyRanges
+      operationId: getDirtyPages
       responses:
         200:
-          description: Dirty ranges
+          description: Dirty pages
           schema:
             $ref: "#/definitions/SnapshotMemory"
         400:
@@ -1540,7 +1540,7 @@ definitions:
       memfd laid out like a guest memory snapshot file, which is sent to the process listening
       on `backend_path` with the same handshake message a UFFD handler receives; the fds
       attached are `[uffd, memfd]` on restore and `[memfd]` on boot. `PUT /snapshot/create` then
-      returns the memory ranges to copy instead of writing a memory file.
+      returns a bitmap of the pages to copy instead of writing a memory file.
     required:
       - backend_type
       - backend_path
@@ -1578,9 +1578,10 @@ definitions:
   SnapshotMemory:
     type: object
     description: >-
-      Which bytes of the shared guest memory a snapshot consists of. `ranges` are copied from the
-      memfd into the memory file at the same offset; `unplugged` (currently unplugged virtio-mem
-      slots) are zeroed in the memory file. The memory file is `total_size` bytes long.
+      Which pages of the shared guest memory a snapshot consists of. Pages whose bit is set in
+      `pages` are copied from the memfd into the memory file at the same offset; `unplugged`
+      (currently unplugged virtio-mem slots) are zeroed in the memory file. The memory file is
+      `total_size` bytes long.
     required:
       - memory
     properties:
@@ -1594,18 +1595,32 @@ definitions:
         type: object
         required:
           - total_size
-          - ranges
+          - page_size
           - unplugged
         properties:
           total_size:
             type: integer
             format: int64
-          ranges:
-            type: array
-            items:
-              $ref: "#/definitions/MemoryRange"
+            description: Size of a full guest memory file, in bytes.
+          page_size:
+            type: integer
+            format: int64
+            description: Granularity of `pages`, in bytes (the host page size, 4096).
+          pages:
+            type: string
+            format: byte
+            description: >-
+              Standard base64 (RFC 4648, padded) of a bitmap covering the memory file from
+              offset 0 to the end of the last plugged slot (ceil(plugged_end / page_size / 8)
+              bytes, whatever is dirty). Byte i, bit b (least significant first) is the page at
+              offset (8 * i + b) * page_size; a set bit means the page must be copied. Set for at
+              least every plugged page whose content changed since the dirty tracking state was
+              last consumed, including pages released by the balloon (which read as zero). Bits
+              of unplugged slots are never set; pages past the end of the bitmap are clear.
+              Absent for a Full snapshot, which consists of every page outside `unplugged`.
           unplugged:
             type: array
+            description: Sorted, page-aligned, non-overlapping ranges to zero in the memory file.
             items:
               $ref: "#/definitions/MemoryRange"
 

@@ -71,9 +71,9 @@ pub enum VmmAction {
     GetBalloonConfig,
     /// Get the ballon device latest statistics.
     GetBalloonStats,
-    /// Get (and consume) the guest memory ranges dirtied since the last snapshot or dirty-ranges
+    /// Get (and consume) the guest memory pages dirtied since the last snapshot or dirty-pages
     /// request. Only allowed with a memory backend attached.
-    GetDirtyRanges,
+    GetDirtyPages,
     /// Get complete microVM configuration in JSON format.
     GetFullVmConfig,
     /// Get MMDS contents.
@@ -253,8 +253,8 @@ pub enum VmmData {
     VirtioMemStatus(VirtioMemStatus),
     /// The status of the virtio-balloon hinting run
     HintingStatus(HintingStatus),
-    /// Which ranges of the shared guest memory make up a snapshot; returned by `snapshot/create`
-    /// and `snapshot/dirty-ranges` when a memory backend is attached.
+    /// Which pages of the shared guest memory make up a snapshot; returned by `snapshot/create`
+    /// and `snapshot/dirty-pages` when a memory backend is attached.
     SnapshotMemory(SnapshotMemoryResponse),
 }
 
@@ -516,7 +516,7 @@ impl<'a> PrebootApiController<'a> {
             | Pause
             | Resume
             | GetBalloonStats
-            | GetDirtyRanges
+            | GetDirtyPages
             | GetMemoryHotplugStatus
             | UpdateBalloon(_)
             | UpdateBalloonStatistics(_)
@@ -730,11 +730,11 @@ impl RuntimeApiController {
                 .latest_balloon_stats()
                 .map(VmmData::BalloonStats)
                 .map_err(VmmActionError::InternalVmm),
-            GetDirtyRanges => self
+            GetDirtyPages => self
                 .vmm
                 .lock()
                 .expect("Poisoned lock")
-                .dirty_ranges()
+                .dirty_pages()
                 .map(|memory| {
                     VmmData::SnapshotMemory(SnapshotMemoryResponse {
                         snapshot_type: None,
