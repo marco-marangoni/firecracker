@@ -6,11 +6,16 @@
 //! It is constructed on top of an HTTP Server that uses Unix Domain Sockets and `EPOLL` to
 //! handle multiple connections on the same thread.
 
+pub mod mem_backend;
 pub mod parsed_request;
 pub mod request;
 
 use std::fmt::Debug;
+use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
+
+use mem_backend::{ConnectionStatus, MemBackendConnection};
 
 pub use micro_http::{Body, HttpServer, Request, Response, ServerError, StatusCode, Version};
 use parsed_request::{ParsedRequest, RequestAction};
@@ -23,7 +28,18 @@ use vmm::logger::{
 use vmm::rpc_interface::{ApiRequest, ApiResponse, VmmAction};
 use vmm::seccomp::BpfProgramRef;
 use vmm::vmm_config::snapshot::SnapshotType;
+use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::EventFd;
+
+/// How the VMM thread hands the memory backend connection to the API thread once the microVM
+/// is built: the stream on the channel, a write on the eventfd to wake the API loop.
+#[derive(Debug)]
+pub struct MemBackendHandover {
+    /// Where the stream arrives.
+    pub receiver: mpsc::Receiver<UnixStream>,
+    /// Signalled after the stream was sent.
+    pub event_fd: EventFd,
+}
 
 /// Structure associated with the API server implementation.
 #[derive(Debug)]
@@ -35,6 +51,10 @@ pub struct ApiServer {
     /// FD on which we notify the VMM that we have sent at least one
     /// `VmmRequest`.
     to_vmm_fd: EventFd,
+    /// How a memory backend connection reaches this thread, if the binary supports one.
+    mem_backend_handover: Option<MemBackendHandover>,
+    /// The memory backend connection, once received. Serviced from the same loop as HTTP.
+    mem_backend: Option<MemBackendConnection>,
 }
 
 impl ApiServer {
@@ -50,7 +70,16 @@ impl ApiServer {
             api_request_sender,
             vmm_response_receiver,
             to_vmm_fd,
+            mem_backend_handover: None,
+            mem_backend: None,
         }
+    }
+
+    /// Makes the server accept a memory backend connection through `handover` and service
+    /// `DirtyPages` requests on it (see [`mem_backend`]).
+    pub fn with_mem_backend_handover(mut self, handover: MemBackendHandover) -> Self {
+        self.mem_backend_handover = Some(handover);
+        self
     }
 
     /// Runs the Api Server.
@@ -71,6 +100,32 @@ impl ApiServer {
         // Set the api payload size limit.
         server.set_payload_max_size(api_payload_limit);
 
+        // The HTTP server's epoll is nested in one of our own, together with the memory backend
+        // handover eventfd and, later, the backend connection. Created before the seccomp filter
+        // is applied: `epoll_create1` is not in the API thread's allowlist (`epoll_ctl` and
+        // `epoll_pwait` are).
+        let epoll = Epoll::new().expect("Cannot create API epoll");
+        const HTTP: u64 = 0;
+        const HANDOVER: u64 = 1;
+        const BACKEND: u64 = 2;
+        let http_fd = server.epoll().as_raw_fd();
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                http_fd,
+                EpollEvent::new(EventSet::IN, HTTP),
+            )
+            .expect("Cannot register HTTP server epoll");
+        if let Some(handover) = &self.mem_backend_handover {
+            epoll
+                .ctl(
+                    ControlOperation::Add,
+                    handover.event_fd.as_raw_fd(),
+                    EpollEvent::new(EventSet::IN, HANDOVER),
+                )
+                .expect("Cannot register memory backend handover eventfd");
+        }
+
         // Load seccomp filters on the API thread.
         // Execution panics if filters cannot be loaded, use --no-seccomp if skipping filters
         // altogether is the desired behaviour.
@@ -89,31 +144,109 @@ impl ApiServer {
         // Store process CPU start time metric.
         process_time_reporter.report_cpu_start_time();
 
+        let mut events = [EpollEvent::default(); 3];
         loop {
-            let request_vec = match server.requests() {
-                Ok(vec) => vec,
-                Err(ServerError::ShutdownEvent) => {
-                    server.flush_outgoing_writes();
-                    debug!("shutdown request received, API server thread ending.");
-                    return;
-                }
-                Err(err) => {
-                    // print request error, but keep server running
-                    error_unrestricted!("API Server error on retrieving incoming request: {}", err);
-                    continue;
-                }
+            let event_count = match epoll.wait(-1, &mut events) {
+                Ok(count) => count,
+                Err(err) if err.raw_os_error() == Some(libc::EINTR) => 0,
+                Err(err) => panic!("API epoll wait failed: {err}"),
             };
-            for server_request in request_vec {
-                let request_processing_start_us = get_time_us(ClockType::Monotonic);
-                // Use `self.handle_request()` as the processing callback.
-                let response = server_request
-                    .process(|request| self.handle_request(request, request_processing_start_us));
-                if let Err(err) = server.respond(response) {
-                    error_unrestricted!("API Server encountered an error on response: {}", err);
-                };
+            for event in &events[..event_count] {
+                match event.data() {
+                    HTTP => {
+                        if !self.serve_http(&mut server) {
+                            return;
+                        }
+                    }
+                    HANDOVER => self.receive_mem_backend(&epoll, BACKEND),
+                    BACKEND => self.serve_mem_backend(&epoll),
+                    other => error_unrestricted!("Spurious API epoll event: {other}"),
+                }
+            }
+        }
+    }
 
-                let delta_us = get_time_us(ClockType::Monotonic) - request_processing_start_us;
-                debug!("Total previous API call duration: {} us.", delta_us);
+    /// Serves the HTTP requests the server has ready. Returns `false` on shutdown.
+    fn serve_http(&mut self, server: &mut HttpServer) -> bool {
+        let request_vec = match server.requests() {
+            Ok(vec) => vec,
+            Err(ServerError::ShutdownEvent) => {
+                server.flush_outgoing_writes();
+                debug!("shutdown request received, API server thread ending.");
+                return false;
+            }
+            Err(err) => {
+                // print request error, but keep server running
+                error_unrestricted!("API Server error on retrieving incoming request: {}", err);
+                return true;
+            }
+        };
+        for server_request in request_vec {
+            let request_processing_start_us = get_time_us(ClockType::Monotonic);
+            // Use `self.handle_request()` as the processing callback.
+            let response = server_request
+                .process(|request| self.handle_request(request, request_processing_start_us));
+            if let Err(err) = server.respond(response) {
+                error_unrestricted!("API Server encountered an error on response: {}", err);
+            };
+
+            let delta_us = get_time_us(ClockType::Monotonic) - request_processing_start_us;
+            debug!("Total previous API call duration: {} us.", delta_us);
+        }
+        true
+    }
+
+    /// Takes the memory backend connection the VMM thread handed over and starts polling it.
+    fn receive_mem_backend(&mut self, epoll: &Epoll, token: u64) {
+        let Some(handover) = &self.mem_backend_handover else {
+            return;
+        };
+        let _ = handover.event_fd.read();
+        let stream = match handover.receiver.try_recv() {
+            Ok(stream) => stream,
+            Err(_) => {
+                warn_unrestricted!("Spurious memory backend handover notification");
+                return;
+            }
+        };
+        let connection = MemBackendConnection::new(stream);
+        if let Err(err) = epoll.ctl(
+            ControlOperation::Add,
+            connection.as_raw_fd(),
+            EpollEvent::new(EventSet::IN | EventSet::READ_HANG_UP, token),
+        ) {
+            error_unrestricted!("Cannot poll the memory backend connection: {err}");
+            return;
+        }
+        info_unrestricted!("Memory backend connection attached to the API thread.");
+        self.mem_backend = Some(connection);
+    }
+
+    /// Services the memory backend connection: reads its requests, forwards them to the VMM
+    /// thread like HTTP requests, writes the replies.
+    fn serve_mem_backend(&mut self, epoll: &Epoll) {
+        let Some(mut connection) = self.mem_backend.take() else {
+            return;
+        };
+        let status = connection.process(|action| {
+            self.api_request_sender
+                .send(Box::new(action))
+                .expect("Failed to send VMM message");
+            self.to_vmm_fd.write(1).expect("Cannot update send VMM fd");
+            *self.vmm_response_receiver.recv().expect("VMM disconnected")
+        });
+        match status {
+            ConnectionStatus::Open => self.mem_backend = Some(connection),
+            ConnectionStatus::Closed => {
+                let _ = epoll.ctl(
+                    ControlOperation::Delete,
+                    connection.as_raw_fd(),
+                    EpollEvent::default(),
+                );
+                warn_unrestricted!(
+                    "Memory backend connection closed; no memory snapshots can be produced any \
+                     more for this microVM."
+                );
             }
         }
     }

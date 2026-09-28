@@ -109,7 +109,8 @@ Firecracker and the page fault handler.
 
 After Firecracker sends the payload (i.e. mem mappings and file descriptor), no
 other communication happens on the UDS socket (or otherwise) between Firecracker
-and the page fault handler process.
+and the page fault handler process when `backend_type` is `Uffd`: Firecracker
+never reads from the connection.
 
 The same handshake is used to hand the guest memory itself to the page fault
 handler, as a memfd, when the snapshot is loaded with
@@ -117,7 +118,9 @@ handler, as a memfd, when the snapshot is loaded with
 `machine-config.mem_backend`). In that case the message is accompanied by more
 than one file descriptor: the uffd first (if any) and the memfd last. A handler
 should therefore read all file descriptors attached to the message, not just the
-first one. See [memory backend](shared-memfd.md).
+first one. With `SharedMemfd` the connection also stays in use afterwards: the
+handler sends requests for the dirty pages on it and Firecracker replies. See
+[memory backend](shared-memfd.md).
 
 ### Userfaultfd interaction with balloon
 

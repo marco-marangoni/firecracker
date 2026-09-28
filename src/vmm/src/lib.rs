@@ -119,6 +119,7 @@ pub mod initrd;
 use std::collections::HashMap;
 use std::io;
 use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -159,7 +160,7 @@ use crate::vmm_config::machine_config::MachineConfig;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vmm_config::mmds::MmdsConfig;
 use crate::vmm_config::net::NetworkInterfaceConfig;
-use crate::vmm_config::snapshot::{SnapshotMemoryLayout, SnapshotType};
+use crate::vmm_config::snapshot::SnapshotMemoryLayout;
 use crate::vmm_config::vsock::VsockDeviceConfig;
 pub use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{GuestMemoryMmap, GuestMemoryRegion};
@@ -314,13 +315,22 @@ pub struct Vmm {
     // Device manager
     device_manager: DeviceManager,
     /// Whether guest memory was handed to a memory backend (as a memfd) at boot or restore.
-    /// When set, `PUT /snapshot/create` never writes guest memory and instead reports the
-    /// pages of the memfd that make up the snapshot, and `PUT /snapshot/dirty-pages` is
-    /// allowed.
+    /// When set, `PUT /snapshot/create` never writes guest memory (it saves vmstate only) and
+    /// the backend obtains the dirty pages over its connection ([`Self::dirty_pages`]).
     pub mem_backend_attached: bool,
+    /// The memory backend's connection, from the handshake until the `firecracker` binary moves
+    /// it to the API thread (see [`Self::take_mem_backend_stream`]). The VMM thread never reads
+    /// or writes it.
+    pub mem_backend_stream: Option<UnixStream>,
 }
 
 impl Vmm {
+    /// Takes the memory backend connection out of the `Vmm`, for the thread that will service
+    /// `DirtyPages` requests on it. `None` if there is no backend or it was already taken.
+    pub fn take_mem_backend_stream(&mut self) -> Option<UnixStream> {
+        self.mem_backend_stream.take()
+    }
+
     /// Gets Vmm version.
     pub fn version(&self) -> String {
         self.instance_info.vmm_version.clone()
@@ -496,8 +506,11 @@ impl Vmm {
         Ok(())
     }
 
-    /// Reports (and consumes) the pages of guest memory dirtied since the last snapshot or the
-    /// last call, for pre-copy by a memory backend. See `PUT /snapshot/dirty-pages`.
+    /// Reports (and consumes) the pages of guest memory dirtied since the last call, for a
+    /// memory backend. This answers the `DirtyPages` request a `SharedMemfd` backend sends on
+    /// its connection (see `docs/snapshotting/shared-memfd.md`); it is used both for pre-copy
+    /// passes and, after `PUT /snapshot/create` has returned on a paused microVM, for the final
+    /// set that makes up a snapshot.
     ///
     /// Only meaningful with a memory backend attached: without one, nobody but Firecracker can
     /// turn the dirty bitmaps into bytes, and consuming them here would silently make the next
@@ -517,7 +530,7 @@ impl Vmm {
         self.device_manager.prepare_dirty_tracking_reset();
 
         let layout = kvm_vm
-            .snapshot_memory_layout(SnapshotType::Diff)
+            .dirty_memory_layout()
             .map_err(|err| VmmError::DirtyPages(err.to_string()))?;
 
         // Queue pages are not tracked at runtime; mark them so the next set includes them, as

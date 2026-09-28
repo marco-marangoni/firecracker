@@ -59,45 +59,31 @@ pub struct MemoryRange {
     pub len: u64,
 }
 
-/// The `memory` object returned by `PUT /snapshot/create` and `PUT /snapshot/dirty-pages`
-/// when a memory backend is attached: which pages of the memfd make up the snapshot.
+/// Firecracker's reply to a `DirtyPages` request: the JSON header of the reply frame plus, as
+/// `pages`, its binary payload. Says which pages of the memfd were dirtied since the dirty state
+/// was last consumed, and which ranges are unplugged (to be zeroed).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnapshotMemoryLayout {
     /// Size of a full guest memory file.
     pub total_size: u64,
     /// Granularity of `pages`, in bytes.
     pub page_size: u64,
-    /// Standard base64 of a bitmap with one bit per `page_size` bytes of the memory file: byte
-    /// `i`, bit `b` (least significant first) is the page at offset `(8 * i + b) * page_size`.
-    /// Set pages are to be copied into the memory file at the same offset. The bitmap covers
-    /// the file up to the end of the last plugged slot; pages past its end are clear. Absent for
-    /// a full snapshot, which consists of every page outside `unplugged`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pages: Option<String>,
+    /// A bitmap with one bit per `page_size` bytes of the memory file: byte `i`, bit `b` (least
+    /// significant first) is the page at offset `(8 * i + b) * page_size`. Set pages are to be
+    /// copied into the memory file at the same offset. The bitmap covers the file up to the end
+    /// of the last plugged slot; pages past its end are clear. Not part of the JSON: it is the
+    /// binary payload of the frame.
+    #[serde(skip)]
+    pub pages: Vec<u8>,
     /// Bytes to zero in the memory file (unplugged virtio-mem slots).
     pub unplugged: Vec<MemoryRange>,
 }
 
 impl SnapshotMemoryLayout {
-    /// Decodes `pages`, if present. Firecracker emits standard, padded base64 (RFC 4648 §4).
-    pub fn decode_pages(&self) -> Result<Option<Vec<u8>>, std::io::Error> {
-        self.pages
-            .as_ref()
-            .map(|pages| {
-                base64_decode(pages.as_bytes()).ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "invalid base64 in `pages`",
-                    )
-                })
-            })
-            .transpose()
-    }
-
     /// The runs of consecutive pages to copy, as `{offset, len}` byte ranges in file offset
-    /// order. For a full snapshot (no `pages`) that is everything outside `unplugged`.
-    pub fn set_runs(&self) -> Result<Vec<MemoryRange>, std::io::Error> {
-        let Some(bitmap) = self.decode_pages()? else {
+    /// order: the set pages, or, for `full`, every page outside `unplugged`.
+    pub fn runs(&self, full: bool) -> Result<Vec<MemoryRange>, std::io::Error> {
+        if full {
             let mut runs = Vec::new();
             let mut cursor = 0u64;
             for hole in &self.unplugged {
@@ -116,13 +102,14 @@ impl SnapshotMemoryLayout {
                 });
             }
             return Ok(runs);
-        };
+        }
+        let bitmap = &self.pages;
         let num_pages = self.total_size.div_ceil(self.page_size);
         if (bitmap.len() as u64) > num_pages.div_ceil(8) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "`pages` has {} bytes, more than the {} pages of the file need",
+                    "bitmap has {} bytes, more than the {} pages of the file need",
                     bitmap.len(),
                     num_pages,
                 ),
@@ -146,83 +133,113 @@ impl SnapshotMemoryLayout {
         }
         Ok(runs)
     }
+
+    /// Number of set bits in the bitmap.
+    pub fn set_pages(&self) -> u64 {
+        self.pages.iter().map(|b| u64::from(b.count_ones())).sum()
+    }
 }
 
-/// Decodes standard base64 with `=` padding (RFC 4648 §4). Whitespace is not accepted. Returns
-/// `None` on any malformed input. Written out here so that the example handlers stay free of
-/// dependencies beyond what Firecracker's own examples already use.
-pub fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {
-    fn value(c: u8) -> Option<u32> {
-        match c {
-            b'A'..=b'Z' => Some(u32::from(c - b'A')),
-            b'a'..=b'z' => Some(u32::from(c - b'a') + 26),
-            b'0'..=b'9' => Some(u32::from(c - b'0') + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    if !input.len().is_multiple_of(4) {
-        return None;
-    }
-    let mut out = Vec::with_capacity(input.len() / 4 * 3);
-    for (i, chunk) in input.chunks(4).enumerate() {
-        let last = i == input.len() / 4 - 1;
-        let pad = chunk.iter().rev().take_while(|&&c| c == b'=').count();
-        if pad > 2 || (pad > 0 && !last) {
-            return None;
-        }
-        let mut acc = 0u32;
-        for &c in &chunk[..4 - pad] {
-            acc = (acc << 6) | value(c)?;
-        }
-        acc <<= 6 * pad as u32;
-        let bytes = acc.to_be_bytes();
-        out.extend_from_slice(&bytes[1..4 - pad]);
-    }
-    Some(out)
-}
+/// The frame format spoken on the handshake connection after the handshake (see
+/// `docs/snapshotting/shared-memfd.md`): `u32 json_len, u32 blob_len` (little-endian), the JSON,
+/// the blob. The handshake message itself is not framed.
+pub mod frame {
+    /// Header size.
+    pub const HEADER_LEN: usize = 8;
 
-/// Encodes to standard, padded base64. Test helper and convenience for orchestrators built on
-/// this module.
-pub fn base64_encode(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let mut acc = 0u32;
-        for (i, &b) in chunk.iter().enumerate() {
-            acc |= u32::from(b) << (16 - 8 * i);
+    /// Encodes a frame.
+    pub fn encode(json: &[u8], blob: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HEADER_LEN + json.len() + blob.len());
+        out.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+        out.extend_from_slice(json);
+        out.extend_from_slice(blob);
+        out
+    }
+
+    /// The `DirtyPages` request, as a frame.
+    pub fn dirty_pages_request() -> Vec<u8> {
+        encode(br#"{"request":"DirtyPages"}"#, &[])
+    }
+
+    /// Accumulates bytes read from the connection until a frame is complete.
+    #[derive(Debug, Default)]
+    pub struct Decoder {
+        buf: Vec<u8>,
+    }
+
+    impl Decoder {
+        pub fn feed(&mut self, bytes: &[u8]) {
+            self.buf.extend_from_slice(bytes);
         }
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(TABLE[((acc >> (18 - 6 * i)) & 0x3F) as usize] as char);
-            } else {
-                out.push('=');
+
+        /// The next complete frame as `(json, blob)`, if any.
+        pub fn next_frame(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+            if self.buf.len() < HEADER_LEN {
+                return None;
             }
+            let json_len = u32::from_le_bytes(self.buf[..4].try_into().unwrap()) as usize;
+            let blob_len = u32::from_le_bytes(self.buf[4..8].try_into().unwrap()) as usize;
+            let total = HEADER_LEN + json_len + blob_len;
+            if self.buf.len() < total {
+                return None;
+            }
+            let rest = self.buf.split_off(total);
+            let mut body = self.buf.split_off(HEADER_LEN);
+            self.buf = rest;
+            let blob = body.split_off(json_len);
+            Some((body, blob))
         }
     }
-    out
+}
+
+/// A reply frame from Firecracker, decoded.
+#[derive(Debug)]
+pub enum DirtyPagesReply {
+    Layout(SnapshotMemoryLayout),
+    Error(String),
+}
+
+impl DirtyPagesReply {
+    /// Interprets a frame: an `{"error": ...}` object is an error, anything else is the layout
+    /// header with the blob as its bitmap.
+    pub fn from_frame(json: &[u8], blob: Vec<u8>) -> Result<Self, std::io::Error> {
+        #[derive(Deserialize)]
+        struct ErrorReply {
+            error: String,
+        }
+        if let Ok(err) = serde_json::from_slice::<ErrorReply>(json) {
+            return Ok(Self::Error(err.error));
+        }
+        let mut layout: SnapshotMemoryLayout = serde_json::from_slice(json)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+        layout.pages = blob;
+        Ok(Self::Layout(layout))
+    }
 }
 
 /// Requests the orchestrator can send on the handler's control socket. Unrelated to Firecracker:
-/// how the `memory` object travels from the API response to the process holding the memfd is
-/// entirely up to the orchestrator; this is what the example handlers (and the integration test
-/// framework) do.
+/// how the orchestrator tells the backend when to take a copy and where to put it is entirely up
+/// to it; this is what the example handlers (and the integration test framework) do.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ControlRequest {
-    /// Copy the set pages of `memory.pages` from the memfd into `mem_path` (created at
-    /// `memory.total_size` if it does not exist, merged into otherwise) and zero
-    /// `memory.unplugged` in it.
-    Copy {
-        mem_path: PathBuf,
-        memory: SnapshotMemoryLayout,
-    },
+    /// Ask Firecracker for the dirty pages, then copy into `mem_path` (created at `total_size`
+    /// if it does not exist, merged into otherwise): every plugged page for `full`, the dirty
+    /// pages otherwise; and zero the unplugged ranges in it. Either way the dirty state is
+    /// consumed, so the next non-full copy is relative to this one.
+    Copy { mem_path: PathBuf, full: bool },
 }
 
 /// Reply to a [`ControlRequest`].
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ControlResponse {
-    Done { success: bool, message: String },
+    Done {
+        success: bool,
+        message: String,
+        /// Number of pages Firecracker reported dirty (set bits in the bitmap), whether or not
+        /// the copy was a full one. Lets an orchestrator observe consumption.
+        set_pages: u64,
+    },
 }
 
 /// One handshake message from Firecracker: the region mappings plus the fds that came with
@@ -549,17 +566,19 @@ impl MemorySource<'_> {
     }
 }
 
-/// Copies the set pages of `layout.pages` from `memfd` into the file at `mem_path` at the same
-/// offsets and zeroes `layout.unplugged` there. The file is created at `layout.total_size` if it
-/// does not exist; an existing file (a full snapshot a diff is merged into) is left at its size.
+/// Copies the set pages of `layout.pages` (or, for `full`, every plugged page) from `memfd` into
+/// the file at `mem_path` at the same offsets and zeroes `layout.unplugged` there. The file is
+/// created at `layout.total_size` if it does not exist; an existing file (a full snapshot a diff
+/// is merged into) is left at its size.
 ///
-/// This is what turns the `memory` object of a `PUT /snapshot/create` response into a memory
-/// file byte-for-byte identical to the one Firecracker would have written. Returns the number of
-/// copy operations performed.
+/// This is what turns Firecracker's `DirtyPages` reply into a memory file byte-for-byte
+/// identical to the one Firecracker would have written. Returns the number of copy operations
+/// performed.
 pub fn copy_pages(
     source: MemorySource<'_>,
     mem_path: &Path,
     layout: &SnapshotMemoryLayout,
+    full: bool,
 ) -> Result<usize, std::io::Error> {
     let target = OpenOptions::new()
         .read(true)
@@ -572,7 +591,7 @@ pub fn copy_pages(
     }
 
     let mut copies = 0;
-    for range in layout.set_runs()? {
+    for range in layout.runs(full)? {
         // Split the run into pieces that come from the same file. `pages` is host-page (4 KiB)
         // granular even when the backing page is larger, so walk backing page *boundaries* rather
         // than stepping `page_size` from the run start.
@@ -709,6 +728,18 @@ pub struct Runtime {
     memfd: Option<(File, usize)>,
     /// Socket on which the orchestrator sends [`ControlRequest`]s.
     control: Option<UnixListener>,
+    /// Bytes of a reply from Firecracker read so far.
+    reply_decoder: frame::Decoder,
+    /// A `Copy` request whose `DirtyPages` request is out; completed when the reply arrives.
+    pending_copy: Option<PendingCopy>,
+}
+
+/// A control request waiting for Firecracker's reply.
+#[derive(Debug)]
+struct PendingCopy {
+    conn: UnixStream,
+    mem_path: PathBuf,
+    full: bool,
 }
 
 impl Runtime {
@@ -753,6 +784,8 @@ impl Runtime {
             uffds: HashMap::default(),
             memfd: None,
             control,
+            reply_decoder: frame::Decoder::default(),
+            pending_copy: None,
         }
     }
 
@@ -820,7 +853,10 @@ impl Runtime {
         Some(fd)
     }
 
-    /// Serves one connection on the control socket: reads a request until EOF, answers, closes.
+    /// Accepts one connection on the control socket and reads its request (until the peer shuts
+    /// down its write side). A `Copy` sends a `DirtyPages` request to Firecracker and parks the
+    /// connection until the reply has been read by the poll loop, so that page faults keep being
+    /// served meanwhile.
     fn handle_control_connection(&mut self) {
         let listener = self.control.as_ref().unwrap();
         let (mut conn, _) = match listener.accept() {
@@ -835,62 +871,177 @@ impl Runtime {
             eprintln!("Failed to read control request: {err}");
             return;
         }
-        let response = match serde_json::from_slice::<ControlRequest>(&raw) {
-            Ok(request) => self.handle_control_request(request),
-            Err(err) => ControlResponse::Done {
-                success: false,
-                message: format!("invalid control request: {err}"),
-            },
+        let request = match serde_json::from_slice::<ControlRequest>(&raw) {
+            Ok(request) => request,
+            Err(err) => {
+                Self::answer_control(
+                    &mut conn,
+                    ControlResponse::Done {
+                        success: false,
+                        message: format!("invalid control request: {err}"),
+                        set_pages: 0,
+                    },
+                );
+                return;
+            }
         };
+        match request {
+            ControlRequest::Copy { mem_path, full } => {
+                if self.memfd.is_none() {
+                    Self::answer_control(
+                        &mut conn,
+                        ControlResponse::Done {
+                            success: false,
+                            message: "no memfd received from Firecracker".to_string(),
+                            set_pages: 0,
+                        },
+                    );
+                    return;
+                }
+                if self.pending_copy.is_some() {
+                    Self::answer_control(
+                        &mut conn,
+                        ControlResponse::Done {
+                            success: false,
+                            message: "a copy is already in progress".to_string(),
+                            set_pages: 0,
+                        },
+                    );
+                    return;
+                }
+                if let Err(err) = self.request_dirty_pages() {
+                    Self::answer_control(
+                        &mut conn,
+                        ControlResponse::Done {
+                            success: false,
+                            message: format!("cannot send DirtyPages request: {err}"),
+                            set_pages: 0,
+                        },
+                    );
+                    return;
+                }
+                self.pending_copy = Some(PendingCopy {
+                    conn,
+                    mem_path,
+                    full,
+                });
+            }
+        }
+    }
+
+    fn answer_control(conn: &mut UnixStream, response: ControlResponse) {
         let response = serde_json::to_vec(&response).unwrap();
         if let Err(err) = conn.write_all(&response) {
             eprintln!("Failed to write control response: {err}");
         }
     }
 
-    fn handle_control_request(&mut self, request: ControlRequest) -> ControlResponse {
-        match request {
-            ControlRequest::Copy { mem_path, memory } => {
-                let Some((memfd, page_size)) = &self.memfd else {
-                    return ControlResponse::Done {
-                        success: false,
-                        message: "no memfd received from Firecracker".to_string(),
-                    };
-                };
-                let populated: Vec<&PopulatedPages> =
-                    self.uffds.values().map(|h| &h.populated).collect();
-                let source = MemorySource {
-                    memfd,
-                    page_size: *page_size,
-                    backing: self
-                        .backing_file
-                        .as_ref()
-                        .map(|file| (file, populated.as_slice())),
-                };
-                match copy_pages(source, &mem_path, &memory) {
-                    Ok(copies) => ControlResponse::Done {
-                        success: true,
-                        message: format!(
-                            "copied {copies} runs and zeroed {} ranges into {}",
-                            memory.unplugged.len(),
-                            mem_path.display()
-                        ),
-                    },
-                    Err(err) => ControlResponse::Done {
-                        success: false,
-                        message: format!("copy into {} failed: {err}", mem_path.display()),
-                    },
-                }
-            }
+    /// Sends a `DirtyPages` request to Firecracker on the handshake connection. The reply is
+    /// read by the poll loop ([`Self::handle_stream_readable`]).
+    pub fn request_dirty_pages(&mut self) -> Result<(), std::io::Error> {
+        self.stream.write_all(&frame::dirty_pages_request())
+    }
+
+    /// Reads what Firecracker sent on the connection. Before a memfd was received that is a
+    /// handshake; afterwards it is (part of) a reply to a `DirtyPages` request. Returns a uffd fd
+    /// to add to the poll set if a handshake carried one.
+    fn handle_stream_readable(&mut self) -> Option<RawFd> {
+        if self.memfd.is_none() {
+            return self.handle_handshake();
         }
+        let mut buf = [0u8; 65536];
+        let n = match self.stream.read(&mut buf) {
+            Ok(0) => {
+                eprintln!("Firecracker closed the connection");
+                return None;
+            }
+            Ok(n) => n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => return None,
+            Err(err) => panic!("Failed to read from Firecracker: {err}"),
+        };
+        self.reply_decoder.feed(&buf[..n]);
+        while let Some((json, blob)) = self.reply_decoder.next_frame() {
+            self.handle_reply(&json, blob);
+        }
+        None
+    }
+
+    /// Completes the pending copy with Firecracker's reply.
+    fn handle_reply(&mut self, json: &[u8], blob: Vec<u8>) {
+        let Some(PendingCopy {
+            mut conn,
+            mem_path,
+            full,
+        }) = self.pending_copy.take()
+        else {
+            eprintln!("Unsolicited frame from Firecracker, ignored");
+            return;
+        };
+        let layout = match DirtyPagesReply::from_frame(json, blob) {
+            Ok(DirtyPagesReply::Layout(layout)) => layout,
+            Ok(DirtyPagesReply::Error(error)) => {
+                Self::answer_control(
+                    &mut conn,
+                    ControlResponse::Done {
+                        success: false,
+                        message: format!("Firecracker refused the DirtyPages request: {error}"),
+                        set_pages: 0,
+                    },
+                );
+                return;
+            }
+            Err(err) => {
+                Self::answer_control(
+                    &mut conn,
+                    ControlResponse::Done {
+                        success: false,
+                        message: format!("malformed reply from Firecracker: {err}"),
+                        set_pages: 0,
+                    },
+                );
+                return;
+            }
+        };
+        let (memfd, page_size) = self.memfd.as_ref().unwrap();
+        let populated: Vec<&PopulatedPages> = self.uffds.values().map(|h| &h.populated).collect();
+        let source = MemorySource {
+            memfd,
+            page_size: *page_size,
+            backing: self
+                .backing_file
+                .as_ref()
+                .map(|file| (file, populated.as_slice())),
+        };
+        let set_pages = layout.set_pages();
+        let response = match copy_pages(source, &mem_path, &layout, full) {
+            Ok(copies) => ControlResponse::Done {
+                success: true,
+                message: format!(
+                    "copied {copies} runs ({} dirty pages, full: {full}) and zeroed {} ranges \
+                     into {}",
+                    set_pages,
+                    layout.unplugged.len(),
+                    mem_path.display()
+                ),
+                set_pages,
+            },
+            Err(err) => ControlResponse::Done {
+                success: false,
+                message: format!("copy into {} failed: {err}", mem_path.display()),
+                set_pages,
+            },
+        };
+        Self::answer_control(&mut conn, response);
     }
 
     /// Polls the `UnixStream`, the control socket and the UFFD fds in a loop.
-    /// When stream is polled, a new handshake is received (a uffd to serve
-    /// and/or the guest memory memfd). When the control socket is polled, an
+    /// When stream is polled, either a new handshake is received (a uffd to
+    /// serve and/or the guest memory memfd) or, once the memfd is held, a reply
+    /// to a `DirtyPages` request. When the control socket is polled, an
     /// orchestrator request is served. When a uffd is polled, the page fault
     /// is handled by calling `pf_event_dispatch` with the corresponding
-    /// uffd object passed in.
+    /// uffd object passed in. Faults keep being served while a reply from
+    /// Firecracker is outstanding.
     pub fn run(&mut self, pf_event_dispatch: impl Fn(&mut UffdHandler)) {
         let mut pollfds = vec![];
 
@@ -928,7 +1079,7 @@ impl Runtime {
                 if pollfds[i].revents & libc::POLLIN != 0 {
                     nready -= 1;
                     if pollfds[i].fd == self.stream.as_raw_fd() {
-                        if let Some(uffd_fd) = self.handle_handshake() {
+                        if let Some(uffd_fd) = self.handle_stream_readable() {
                             pollfds.push(libc::pollfd {
                                 fd: uffd_fd,
                                 events: libc::POLLIN,
@@ -1165,58 +1316,69 @@ mod tests {
         SnapshotMemoryLayout {
             total_size: total_pages * page_size,
             page_size,
-            pages: Some(base64_encode(&bitmap)),
+            pages: bitmap,
             unplugged,
         }
     }
 
-    /// A full layout for `total_pages` 4 KiB pages: no bitmap.
+    /// A layout for `total_pages` 4 KiB pages with nothing dirty, for full copies.
     fn full_layout(total_pages: u64, unplugged: Vec<MemoryRange>) -> SnapshotMemoryLayout {
-        SnapshotMemoryLayout {
-            total_size: total_pages * 4096,
-            page_size: 4096,
-            pages: None,
-            unplugged,
-        }
+        layout(total_pages, &[], unplugged)
     }
 
     #[test]
-    fn test_base64_round_trip() {
-        for input in [
-            &b""[..],
-            b"f",
-            b"fo",
-            b"foo",
-            b"foob",
-            b"fooba",
-            b"foobar",
-            &[0x03, 0x01],
-            &[0xff; 33],
-        ] {
-            let encoded = base64_encode(input);
-            assert_eq!(encoded.len() % 4, 0);
-            assert_eq!(
-                base64_decode(encoded.as_bytes()).unwrap(),
-                input,
-                "{encoded}"
-            );
+    fn test_frame_codec() {
+        let request = frame::dirty_pages_request();
+        assert_eq!(&request[..8], &[0x18, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&request[8..], br#"{"request":"DirtyPages"}"#);
+
+        // The documentation example: 64 KiB guest, pages 0, 1 and 12 set, pages 8..12 unplugged.
+        let json =
+            br#"{"total_size":65536,"page_size":4096,"unplugged":[{"offset":32768,"len":16384}]}"#;
+        let reply = frame::encode(json, &[0x03, 0x10]);
+        assert_eq!(&reply[..8], &[0x50, 0, 0, 0, 2, 0, 0, 0]);
+
+        // Decoding one byte at a time.
+        let mut decoder = frame::Decoder::default();
+        for byte in &reply[..reply.len() - 1] {
+            decoder.feed(&[*byte]);
+            assert!(decoder.next_frame().is_none());
         }
-        // RFC 4648 test vectors and the documentation example.
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
-        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
-        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
-        assert_eq!(base64_encode(&[0x03, 0x10]), "AxA=");
-        assert_eq!(base64_decode(b"AxA=").unwrap(), [0x03, 0x10]);
-        // Malformed input.
-        for bad in ["A", "AwE", "Aw=E", "!!!!", "A===", "Aw==Aw=="] {
-            assert!(base64_decode(bad.as_bytes()).is_none(), "{bad}");
+        decoder.feed(&reply[reply.len() - 1..]);
+        let (got_json, blob) = decoder.next_frame().unwrap();
+        assert_eq!(got_json, json);
+        assert_eq!(blob, vec![0x03, 0x10]);
+        assert!(decoder.next_frame().is_none());
+
+        match DirtyPagesReply::from_frame(&got_json, blob).unwrap() {
+            DirtyPagesReply::Layout(layout) => {
+                assert_eq!(layout.total_size, 65536);
+                assert_eq!(layout.pages, vec![0x03, 0x10]);
+                assert_eq!(layout.set_pages(), 3);
+                assert_eq!(layout.unplugged.len(), 1);
+            }
+            other => panic!("{other:?}"),
         }
+        match DirtyPagesReply::from_frame(br#"{"error":"nope"}"#, vec![]).unwrap() {
+            DirtyPagesReply::Error(message) => assert_eq!(message, "nope"),
+            other => panic!("{other:?}"),
+        }
+        DirtyPagesReply::from_frame(b"garbage", vec![]).unwrap_err();
+
+        // Two frames in one feed, plus a partial third.
+        let mut all = reply.clone();
+        all.extend_from_slice(&reply);
+        all.extend_from_slice(&reply[..5]);
+        decoder.feed(&all);
+        assert!(decoder.next_frame().is_some());
+        assert!(decoder.next_frame().is_some());
+        assert!(decoder.next_frame().is_none());
     }
 
     #[test]
-    fn test_set_runs() {
-        let runs = |l: &SnapshotMemoryLayout| {
-            l.set_runs()
+    fn test_runs() {
+        let runs = |l: &SnapshotMemoryLayout, full: bool| {
+            l.runs(full)
                 .unwrap()
                 .iter()
                 .map(|r| (r.offset, r.len))
@@ -1226,67 +1388,61 @@ mod tests {
         let doc = SnapshotMemoryLayout {
             total_size: 65536,
             page_size: 4096,
-            pages: Some("AxA=".to_string()),
+            pages: vec![0x03, 0x10],
             unplugged: vec![],
         };
-        assert_eq!(runs(&doc), vec![(0, 8192), (49152, 4096)]);
+        assert_eq!(runs(&doc, false), vec![(0, 8192), (49152, 4096)]);
         // Page count not a multiple of 8, last page set.
         let l = layout(13, &[0, 12], vec![]);
-        assert_eq!(runs(&l), vec![(0, 4096), (12 * 4096, 4096)]);
+        assert_eq!(runs(&l, false), vec![(0, 4096), (12 * 4096, 4096)]);
         // Empty.
-        assert!(layout(13, &[], vec![]).set_runs().unwrap().is_empty());
+        assert!(layout(13, &[], vec![]).runs(false).unwrap().is_empty());
         // A bitmap shorter than the file (it ends with the last plugged slot): pages past its
         // end are clear.
         let short = SnapshotMemoryLayout {
             total_size: 65536,
             page_size: 4096,
-            pages: Some("Aw==".to_string()),
+            pages: vec![0x03],
             unplugged: vec![],
         };
-        assert_eq!(runs(&short), vec![(0, 8192)]);
+        assert_eq!(runs(&short, false), vec![(0, 8192)]);
         let empty = SnapshotMemoryLayout {
             total_size: 65536,
             page_size: 4096,
-            pages: Some(String::new()),
+            pages: vec![],
             unplugged: vec![],
         };
-        assert!(empty.set_runs().unwrap().is_empty());
+        assert!(empty.runs(false).unwrap().is_empty());
         // A bitmap longer than the file is rejected.
         let long = SnapshotMemoryLayout {
             total_size: 4096,
             page_size: 4096,
-            pages: Some("AxA=".to_string()),
+            pages: vec![0x03, 0x10],
             unplugged: vec![],
         };
-        long.set_runs().unwrap_err();
+        long.runs(false).unwrap_err();
 
-        // Full: everything outside `unplugged`, as runs.
-        assert_eq!(runs(&full_layout(4, vec![])), vec![(0, 4 * 4096)]);
+        // Full: everything outside `unplugged`, as runs, whatever the bitmap says.
+        assert_eq!(runs(&doc, true), vec![(0, 65536)]);
+        assert_eq!(runs(&full_layout(4, vec![]), true), vec![(0, 4 * 4096)]);
         let hole = |page: u64, pages: u64| MemoryRange {
             offset: page * 4096,
             len: pages * 4096,
         };
         assert_eq!(
-            runs(&full_layout(8, vec![hole(2, 1), hole(5, 3)])),
+            runs(&full_layout(8, vec![hole(2, 1), hole(5, 3)]), true),
             vec![(0, 2 * 4096), (3 * 4096, 2 * 4096)]
         );
         assert_eq!(
-            runs(&full_layout(8, vec![hole(0, 2)])),
+            runs(&full_layout(8, vec![hole(0, 2)]), true),
             vec![(2 * 4096, 6 * 4096)]
         );
         assert!(
             full_layout(8, vec![hole(0, 8)])
-                .set_runs()
+                .runs(true)
                 .unwrap()
                 .is_empty()
         );
-        // `pages` absent in JSON is a full layout; present is a diff.
-        let l: SnapshotMemoryLayout = serde_json::from_str(
-            r#"{"total_size":16384,"page_size":4096,"unplugged":[{"offset":12288,"len":4096}]}"#,
-        )
-        .unwrap();
-        assert!(l.pages.is_none());
-        assert_eq!(runs(&l), vec![(0, 3 * 4096)]);
     }
 
     #[test]
@@ -1308,7 +1464,7 @@ mod tests {
             page_size: 4096,
             backing: None,
         };
-        assert_eq!(copy_pages(source, &mem_path, &full).unwrap(), 1);
+        assert_eq!(copy_pages(source, &mem_path, &full, true).unwrap(), 1);
         let mut expected = Vec::new();
         for page in 0..3u8 {
             expected.extend(std::iter::repeat_n(page + 1, 4096));
@@ -1319,13 +1475,13 @@ mod tests {
         // Modify page 1 in the "guest" and merge a diff that contains only page 1.
         memfd.write_all_at(&[0xAA; 4096], 4096).unwrap();
         let diff = layout(4, &[1], vec![]);
-        copy_pages(source, &mem_path, &diff).unwrap();
+        copy_pages(source, &mem_path, &diff, false).unwrap();
         expected[4096..2 * 4096].fill(0xAA);
         assert_eq!(std::fs::read(&mem_path).unwrap(), expected);
 
         // A diff into a fresh file yields a sparse file of total_size with only that page.
         let diff_path = tmp_dir.as_path().join("diff");
-        copy_pages(source, &diff_path, &diff).unwrap();
+        copy_pages(source, &diff_path, &diff, false).unwrap();
         let mut sparse = vec![0u8; 4 * 4096];
         sparse[4096..2 * 4096].fill(0xAA);
         assert_eq!(std::fs::read(&diff_path).unwrap(), sparse);
@@ -1340,7 +1496,7 @@ mod tests {
                 len: 2 * 4096,
             }],
         );
-        copy_pages(source, &mem_path, &diff).unwrap();
+        copy_pages(source, &mem_path, &diff, false).unwrap();
         expected[2 * 4096..].fill(0);
         assert_eq!(std::fs::read(&mem_path).unwrap(), expected);
     }
@@ -1377,7 +1533,7 @@ mod tests {
         let mem_path = tmp_dir.as_path().join("mem");
         let full = full_layout(4, vec![]);
         // Pages 0 and 3 from the snapshot file, 1 and 2 from the memfd: three runs.
-        assert_eq!(copy_pages(source, &mem_path, &full).unwrap(), 3);
+        assert_eq!(copy_pages(source, &mem_path, &full, true).unwrap(), 3);
 
         let mut expected = snapshot.clone();
         expected[2 * 4096..3 * 4096].fill(0xEE);
@@ -1390,7 +1546,7 @@ mod tests {
             backing: None,
         };
         let boot_path = tmp_dir.as_path().join("mem_boot");
-        assert_eq!(copy_pages(boot_source, &boot_path, &full).unwrap(), 1);
+        assert_eq!(copy_pages(boot_source, &boot_path, &full, true).unwrap(), 1);
         let mut expected = vec![0u8; 4 * 4096];
         expected[4096..2 * 4096].copy_from_slice(&snapshot[4096..2 * 4096]);
         expected[2 * 4096..3 * 4096].fill(0xEE);
@@ -1432,7 +1588,7 @@ mod tests {
         let mem_path = tmp_dir.as_path().join("mem");
         let layout = layout(6, &[1, 2, 3, 4], vec![]);
         assert_eq!(layout.page_size, 4096);
-        assert_eq!(copy_pages(source, &mem_path, &layout).unwrap(), 3);
+        assert_eq!(copy_pages(source, &mem_path, &layout, false).unwrap(), 3);
 
         let mut expected = vec![0u8; 3 * PAGE];
         expected[4096..PAGE].copy_from_slice(&snapshot[4096..PAGE]);
@@ -1460,28 +1616,33 @@ mod tests {
         // A handler started for a boot: no memory file, control socket, only a memfd arrives.
         let fc_listener = UnixListener::bind(&fc_sock).unwrap();
         let control_listener = UnixListener::bind(&control_sock).unwrap();
-        let fc_stream = UnixStream::connect(&fc_sock).unwrap();
+        let mut fc_stream = UnixStream::connect(&fc_sock).unwrap();
         let (stream, _) = fc_listener.accept().unwrap();
         std::thread::spawn(move || {
             let mut runtime = Runtime::new(stream, None, Some(control_listener));
             runtime.run(|_: &mut UffdHandler| panic!("no faults expected"));
         });
 
-        // Before the handshake, a copy must fail cleanly.
-        let request = serde_json::to_vec(&ControlRequest::Copy {
-            mem_path: mem_path.clone(),
-            memory: layout(2, &[0, 1], vec![]),
-        })
-        .unwrap();
-        let send = |request: &[u8]| {
+        // Sends a control request; the reply is read on the returned connection.
+        let send = |request: &ControlRequest| {
             let mut conn = UnixStream::connect(&control_sock).unwrap();
-            conn.write_all(request).unwrap();
+            conn.write_all(&serde_json::to_vec(request).unwrap())
+                .unwrap();
             conn.shutdown(std::net::Shutdown::Write).unwrap();
+            conn
+        };
+        let finish = |mut conn: UnixStream| {
             let mut raw = Vec::new();
             conn.read_to_end(&mut raw).unwrap();
             serde_json::from_slice::<ControlResponse>(&raw).unwrap()
         };
-        let ControlResponse::Done { success, .. } = send(&request);
+        let request = ControlRequest::Copy {
+            mem_path: mem_path.clone(),
+            full: false,
+        };
+
+        // Before the handshake, a copy must fail cleanly.
+        let ControlResponse::Done { success, .. } = finish(send(&request));
         assert!(!success);
 
         fc_stream
@@ -1489,10 +1650,72 @@ mod tests {
             .unwrap();
         std::thread::sleep(Duration::from_millis(100));
 
-        let ControlResponse::Done { success, message } = send(&request);
+        // Playing Firecracker: the copy request must produce a `DirtyPages` frame on the
+        // handshake connection, which we answer with page 1 dirty.
+        let conn = send(&request);
+        let mut got = vec![0u8; frame::dirty_pages_request().len()];
+        fc_stream.read_exact(&mut got).unwrap();
+        assert_eq!(got, frame::dirty_pages_request());
+        // While we sit on the reply, a second copy is refused rather than queued.
+        let ControlResponse::Done {
+            success, message, ..
+        } = finish(send(&request));
+        assert!(!success);
+        assert!(message.contains("in progress"), "{message}");
+        // Send the reply in two pieces to exercise the incremental decoder.
+        let reply = frame::encode(
+            br#"{"total_size":8192,"page_size":4096,"unplugged":[]}"#,
+            &[0b10],
+        );
+        fc_stream.write_all(&reply[..10]).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        fc_stream.write_all(&reply[10..]).unwrap();
+
+        let ControlResponse::Done {
+            success,
+            message,
+            set_pages,
+        } = finish(conn);
         assert!(success, "{message}");
+        assert_eq!(set_pages, 1);
+        let mut expected = vec![0u8; 4096];
+        expected.extend(std::iter::repeat_n(2u8, 4096));
+        assert_eq!(std::fs::read(&mem_path).unwrap(), expected);
+
+        // A full copy issues the request too (it consumes the dirty state) and copies all
+        // plugged pages whatever the bitmap says.
+        let conn = send(&ControlRequest::Copy {
+            mem_path: mem_path.clone(),
+            full: true,
+        });
+        fc_stream.read_exact(&mut got).unwrap();
+        fc_stream
+            .write_all(&frame::encode(
+                br#"{"total_size":8192,"page_size":4096,"unplugged":[]}"#,
+                &[0],
+            ))
+            .unwrap();
+        let ControlResponse::Done {
+            success,
+            message,
+            set_pages,
+        } = finish(conn);
+        assert!(success, "{message}");
+        assert_eq!(set_pages, 0);
         let mut expected = vec![1u8; 4096];
         expected.extend(std::iter::repeat_n(2u8, 4096));
         assert_eq!(std::fs::read(&mem_path).unwrap(), expected);
+
+        // An error reply fails the copy.
+        let conn = send(&request);
+        fc_stream.read_exact(&mut got).unwrap();
+        fc_stream
+            .write_all(&frame::encode(br#"{"error":"no"}"#, &[]))
+            .unwrap();
+        let ControlResponse::Done {
+            success, message, ..
+        } = finish(conn);
+        assert!(!success);
+        assert!(message.contains("refused"), "{message}");
     }
 }

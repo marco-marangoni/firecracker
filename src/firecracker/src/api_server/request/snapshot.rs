@@ -31,7 +31,6 @@ pub(crate) fn parse_put_snapshot(
         Some(request_type) => match request_type {
             "create" => parse_put_snapshot_create(body),
             "load" => parse_put_snapshot_load(body),
-            "dirty-pages" => parse_put_snapshot_dirty_pages(body),
             _ => Err(RequestError::InvalidPathMethod(
                 format!("/snapshot/{}", request_type),
                 Method::Put,
@@ -58,21 +57,6 @@ fn parse_put_snapshot_create(body: &Body) -> Result<ParsedRequest, RequestError>
     Ok(ParsedRequest::new_sync(VmmAction::CreateSnapshot(
         snapshot_config,
     )))
-}
-
-/// `PUT /snapshot/dirty-pages`: the body is reserved for future options and must currently be
-/// empty or an empty JSON object.
-fn parse_put_snapshot_dirty_pages(body: &Body) -> Result<ParsedRequest, RequestError> {
-    let raw = body.raw();
-    if !raw.is_empty() {
-        let value = serde_json::from_slice::<serde_json::Value>(raw)?;
-        if value != serde_json::json!({}) {
-            return Err(RequestError::SerdeJson(serde_json::Error::custom(
-                "PUT /snapshot/dirty-pages takes no parameters",
-            )));
-        }
-    }
-    Ok(ParsedRequest::new_sync(VmmAction::GetDirtyPages))
 }
 
 fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
@@ -472,6 +456,12 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_put_snapshot_dirty_pages_is_gone() {
+        // Dirty pages travel on the memory backend's connection, not over HTTP.
+        parse_put_snapshot(&Body::new("{}"), Some("dirty-pages")).unwrap_err();
+    }
+
+    #[test]
     fn test_parse_patch_vm_state() {
         let body = r#"{
             "state": "Paused"
@@ -495,21 +485,5 @@ mod tests {
             "invalid": "Paused"
         }"#;
         parse_patch_vm_state(&Body::new(invalid_body)).unwrap_err();
-    }
-
-    #[test]
-    fn test_parse_put_snapshot_dirty_pages() {
-        for body in ["", "{}", " { } "] {
-            assert!(
-                parse_put_snapshot(&Body::new(body), Some("dirty-pages"))
-                    .unwrap()
-                    .eq(&ParsedRequest::new_sync(VmmAction::GetDirtyPages)),
-                "body {body:?}"
-            );
-        }
-        parse_put_snapshot(&Body::new(r#"{"format": "ranges"}"#), Some("dirty-pages")).unwrap_err();
-        parse_put_snapshot(&Body::new("not json"), Some("dirty-pages")).unwrap_err();
-        // The old name is gone.
-        parse_put_snapshot(&Body::new("{}"), Some("dirty-ranges")).unwrap_err();
     }
 }

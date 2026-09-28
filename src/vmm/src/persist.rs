@@ -37,9 +37,7 @@ use crate::utils::u64_to_usize;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
-use crate::vmm_config::snapshot::{
-    CreateSnapshotParams, LoadSnapshotParams, MemBackendType, SnapshotMemoryLayout,
-};
+use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
     self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
@@ -173,16 +171,16 @@ pub const SNAPSHOT_VERSION: Version = Version::new(12, 0, 0);
 
 /// Creates a Microvm snapshot.
 ///
-/// Without a memory backend, guest memory is written to `params.mem_file_path` and `None` is
-/// returned. With a memory backend attached, no memory is written; instead the returned
-/// [`SnapshotMemoryLayout`] tells the backend which pages of the shared memfd make up the
-/// snapshot. Either way the dirty tracking state is consumed exactly as it would be by writing
-/// the corresponding memory file.
+/// Without a memory backend, guest memory is written to `params.mem_file_path`. With a memory
+/// backend attached, only the vmstate is written and the dirty tracking state is left untouched:
+/// the backend obtains the pages that make up the snapshot with a `DirtyPages` request on its
+/// connection, after this has returned and before the microVM is resumed
+/// (see `docs/snapshotting/shared-memfd-design.md`, §4 and §7).
 pub fn create_snapshot(
     vmm: &mut Vmm,
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
-) -> Result<Option<SnapshotMemoryLayout>, CreateSnapshotError> {
+) -> Result<(), CreateSnapshotError> {
     // Validate before saving anything, so a rejected request has no side effects.
     let mem_file_path = match (vmm.mem_backend_attached, &params.mem_file_path) {
         (true, Some(_)) => return Err(CreateSnapshotError::MemFilePathWithMemBackend),
@@ -201,22 +199,22 @@ pub fn create_snapshot(
         params.sync_snapshot_files,
     )?;
 
+    // With a memory backend, the memory part of the snapshot is the backend's business; nothing
+    // here may consume the dirty state it will ask for.
+    let Some(mem_file_path) = mem_file_path else {
+        return Ok(());
+    };
+
     let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
         CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
             "snapshot requires KVM".into(),
         ))
     })?;
-    let layout = match mem_file_path {
-        Some(mem_file_path) => {
-            kvm_vm.snapshot_memory_to_file(
-                mem_file_path,
-                params.snapshot_type,
-                params.sync_snapshot_files,
-            )?;
-            None
-        }
-        None => Some(kvm_vm.snapshot_memory_layout(params.snapshot_type)?),
-    };
+    kvm_vm.snapshot_memory_to_file(
+        mem_file_path,
+        params.snapshot_type,
+        params.sync_snapshot_files,
+    )?;
 
     // We need to mark queues as dirty again for all activated devices. The reason we
     // do it here is that we don't mark pages as dirty during runtime
@@ -224,7 +222,7 @@ pub fn create_snapshot(
     vmm.device_manager
         .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
 
-    Ok(layout)
+    Ok(())
 }
 
 fn snapshot_state_to_file(
@@ -495,7 +493,7 @@ pub fn restore_from_snapshot(
     let mem_backend_path = &params.mem_backend.backend_path;
     let mem_state = &microvm_state.vm_state.memory;
 
-    let (guest_memory, uffd) = match params.mem_backend.backend_type {
+    let (guest_memory, uffd, mem_backend_stream) = match params.mem_backend.backend_type {
         MemBackendType::File => {
             if vm_resources.machine_config.huge_pages.is_hugetlbfs() {
                 return Err(RestoreFromSnapshotGuestMemoryError::File(
@@ -512,25 +510,32 @@ pub fn restore_from_snapshot(
                 )
                 .map_err(RestoreFromSnapshotGuestMemoryError::File)?,
                 None,
+                None,
             )
         }
-        MemBackendType::Uffd | MemBackendType::SharedMemfd => guest_memory_from_uffd(
-            mem_backend_path,
-            mem_state,
-            track_dirty_pages,
-            vm_resources.machine_config.huge_pages,
-            params.mem_backend.backend_type == MemBackendType::SharedMemfd,
-        )
-        .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
+        MemBackendType::Uffd | MemBackendType::SharedMemfd => {
+            let UffdGuestMemory {
+                regions,
+                uffd,
+                mem_backend_stream,
+            } = guest_memory_from_uffd(
+                mem_backend_path,
+                mem_state,
+                track_dirty_pages,
+                vm_resources.machine_config.huge_pages,
+                params.mem_backend.backend_type == MemBackendType::SharedMemfd,
+            )
+            .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?;
+            (regions, Some(uffd), mem_backend_stream)
+        }
     };
-    let mem_backend_attached = params.mem_backend.backend_type == MemBackendType::SharedMemfd;
     builder::build_microvm_from_snapshot(
         instance_info,
         event_manager,
         microvm_state,
         guest_memory,
         uffd,
-        mem_backend_attached,
+        mem_backend_stream,
         seccomp_filters,
         vm_resources,
         params.clock_realtime,
@@ -598,13 +603,21 @@ pub enum GuestMemoryFromUffdError {
     Send(#[from] vmm_sys_util::errno::Error),
 }
 
+/// Guest memory populated through a UFFD handler: the regions, the uffd, and, for a `SharedMemfd`
+/// backend, the connection on which it requests dirty pages.
+struct UffdGuestMemory {
+    regions: Vec<GuestRegionMmap>,
+    uffd: Uffd,
+    mem_backend_stream: Option<UnixStream>,
+}
+
 fn guest_memory_from_uffd(
     mem_uds_path: &Path,
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
     share_memfd: bool,
-) -> Result<(Vec<GuestRegionMmap>, Option<Uffd>), GuestMemoryFromUffdError> {
+) -> Result<UffdGuestMemory, GuestMemoryFromUffdError> {
     let (guest_memory, memfd) = if share_memfd {
         let regions: Vec<_> = mem_state.regions().collect();
         let (guest_memory, backing) =
@@ -644,9 +657,16 @@ fn guest_memory_from_uffd(
     if let Some(memfd) = &memfd {
         fds.push(memfd.as_raw_fd());
     }
-    send_uffd_handshake(mem_uds_path, &backend_mappings, &fds)?;
+    // A `SharedMemfd` backend keeps the connection as its request channel; a plain UFFD handler
+    // never hears from Firecracker again.
+    let mem_backend_stream =
+        send_uffd_handshake(mem_uds_path, &backend_mappings, &fds, share_memfd)?;
 
-    Ok((guest_memory, Some(uffd)))
+    Ok(UffdGuestMemory {
+        regions: guest_memory,
+        uffd,
+        mem_backend_stream,
+    })
 }
 
 /// Builds the handshake message for a UFFD handler / memory backend: one entry per region, in
@@ -678,11 +698,16 @@ pub fn uffd_mappings<'a>(
 /// This is the one handshake Firecracker speaks. Which fds accompany it depends on how the
 /// microVM was started: `[uffd]` for a plain UFFD restore, `[uffd, memfd]` for a restore with a
 /// memory backend, `[memfd]` for a boot with a memory backend.
+///
+/// With `keep_stream` the connection is returned: a `SharedMemfd` backend uses it to request
+/// dirty pages, and the `firecracker` binary services it from the API thread. Without it (a
+/// plain UFFD handler) the stream is leaked on purpose and never read.
 pub fn send_uffd_handshake(
     mem_uds_path: &Path,
     backend_mappings: &[GuestRegionUffdMapping],
     fds: &[RawFd],
-) -> Result<(), GuestMemoryFromUffdError> {
+    keep_stream: bool,
+) -> Result<Option<UnixStream>, GuestMemoryFromUffdError> {
     // This is safe to unwrap() because we control the contents of the vector
     // (i.e GuestRegionUffdMapping entries).
     let backend_mappings = serde_json::to_string(backend_mappings).unwrap();
@@ -723,12 +748,16 @@ pub fn send_uffd_handshake(
         fds,
     )?;
 
+    if keep_stream {
+        return Ok(Some(socket));
+    }
+
     // We prevent Rust from closing the socket file descriptor to avoid a potential race condition
     // between the mappings message and the connection shutdown. If the latter arrives at the UFFD
     // handler first, the handler never sees the mappings.
     forget(socket);
 
-    Ok(())
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -906,7 +935,15 @@ mod tests {
 
         let listener = UnixListener::bind(uds_path).expect("Cannot bind to socket path");
 
-        send_uffd_handshake(uds_path, &uffd_regions, &[std::io::stdin().as_raw_fd()]).unwrap();
+        // A plain UFFD handler: the stream is not returned (and leaked on purpose).
+        let kept = send_uffd_handshake(
+            uds_path,
+            &uffd_regions,
+            &[std::io::stdin().as_raw_fd()],
+            false,
+        )
+        .unwrap();
+        assert!(kept.is_none());
 
         let (stream, _) = listener.accept().expect("Cannot listen on UDS socket");
 
@@ -920,5 +957,27 @@ mod tests {
             serde_json::from_slice(&message_buf).unwrap();
 
         assert_eq!(uffd_regions, deserialized);
+
+        // A memory backend: the stream comes back and is connected to the peer.
+        let kept = send_uffd_handshake(
+            uds_path,
+            &uffd_regions,
+            &[std::io::stdin().as_raw_fd()],
+            true,
+        )
+        .unwrap()
+        .expect("stream must be kept for a memory backend");
+        let (mut peer, _) = listener.accept().unwrap();
+        let mut message_buf = vec![0u8; 1024];
+        let (bytes_read, _) = peer.recv_with_fd(&mut message_buf[..]).unwrap();
+        message_buf.resize(bytes_read, 0);
+        assert_eq!(
+            serde_json::from_slice::<Vec<GuestRegionUffdMapping>>(&message_buf).unwrap(),
+            uffd_regions
+        );
+        peer.write_all(b"ping").unwrap();
+        let mut buf = [0u8; 4];
+        std::io::Read::read_exact(&mut (&kept), &mut buf).unwrap();
+        assert_eq!(&buf, b"ping");
     }
 }

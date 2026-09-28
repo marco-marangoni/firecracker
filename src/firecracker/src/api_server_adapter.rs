@@ -19,7 +19,7 @@ use vmm::{EventManager, FcExitCode, Vmm};
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::EventFd;
 
-use super::api_server::{ApiServer, HttpServer, ServerError};
+use super::api_server::{ApiServer, HttpServer, MemBackendHandover, ServerError};
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum ApiServerError {
@@ -210,16 +210,30 @@ pub(crate) fn run_with_api(
         .add_kill_switch(api_kill_switch_clone)
         .expect("Cannot add HTTP server kill switch");
 
+    // Channel on which the memory backend connection (if a `SharedMemfd` backend is attached at
+    // boot or restore) is handed to the API thread, which services its `DirtyPages` requests.
+    let (mem_backend_tx, mem_backend_rx) = channel();
+    let mem_backend_event_fd =
+        EventFd::new(libc::EFD_NONBLOCK).expect("Cannot create memory backend handover eventfd.");
+    let handover = MemBackendHandover {
+        receiver: mem_backend_rx,
+        event_fd: mem_backend_event_fd
+            .try_clone()
+            .expect("Failed to clone memory backend handover eventfd"),
+    };
+
     // Start the separate API thread.
     let api_thread = thread::Builder::new()
         .name("fc_api".to_owned())
         .spawn(move || {
-            ApiServer::new(to_vmm, from_vmm, to_vmm_event_fd).run(
-                server,
-                process_time_reporter,
-                &api_seccomp_filter,
-                api_payload_limit,
-            );
+            ApiServer::new(to_vmm, from_vmm, to_vmm_event_fd)
+                .with_mem_backend_handover(handover)
+                .run(
+                    server,
+                    process_time_reporter,
+                    &api_seccomp_filter,
+                    api_payload_limit,
+                );
         })
         .expect("API thread spawn failed.");
 
@@ -260,6 +274,21 @@ pub(crate) fn run_with_api(
     // INVARIANT: seccomp must be applied before entering the event loop.
     // No guest-facing operations may occur between builder return and filter installation.
     let result = build_result.and_then(|vmm| {
+        // Hand the memory backend connection to the API thread. Done before the VMM filter is
+        // applied (`set_nonblocking` is an `ioctl` the VMM thread does not otherwise need); from
+        // here on only the API thread touches the stream.
+        if let Some(stream) = vmm.lock().expect("Poisoned lock").take_mem_backend_stream() {
+            stream
+                .set_nonblocking(true)
+                .expect("Cannot make the memory backend connection non-blocking");
+            mem_backend_tx
+                .send(stream)
+                .expect("API thread gone before the memory backend handover");
+            mem_backend_event_fd
+                .write(1)
+                .expect("Cannot signal the memory backend handover");
+        }
+
         vmm::seccomp::apply_filter(
             seccomp_filters
                 .get("vmm")

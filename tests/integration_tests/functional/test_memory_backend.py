@@ -4,22 +4,28 @@
 through a memfd and producing memory snapshots from it, byte-for-byte identical
 to the ones Firecracker writes itself.
 
-The test framework plays the orchestrator: it calls `PUT /snapshot/create` (or
-`PUT /snapshot/dirty-pages`), receives the `memory` object and forwards it to
-the example handler's control socket, which copies the set pages out of the memfd.
+The test framework plays the orchestrator: it calls `PUT /snapshot/create`
+(vmstate only) and then tells the example handler, on its control socket, to
+copy. The handler asks Firecracker for the dirty pages on its own connection
+(the one the handshake arrived on) and copies the set pages out of the memfd;
+the framework never sees the bitmap, only the handler's `set_pages` count.
 """
 
-import base64
 import filecmp
+import json
 import platform
 import shutil
+import socket
+import struct
+import time
 from pathlib import Path
 from subprocess import TimeoutExpired
 
 import pytest
+from tenacity import retry, stop_after_delay, wait_fixed
 
 from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel
-from framework.microvm import SnapshotType
+from framework.microvm import Snapshot, SnapshotType
 from framework.utils import get_stable_rss_mem, make_guest_dirty_memory
 from framework.utils_hugepages import HugePagesConfig
 from integration_tests.functional.test_balloon import wait_for_balloon_actual
@@ -83,108 +89,34 @@ def boot_with_mem_backend(
 PAGE_SIZE = 4096
 
 
-def decode_pages(memory):
-    """The `pages` bitmap of a `memory` object as bytes, or None for a `Full`."""
-    if "pages" not in memory:
-        return None
-    return base64.b64decode(memory["pages"], validate=True)
+def dirty_bytes(done):
+    """Bytes Firecracker reported dirty for a backend copy, from its `Done` reply."""
+    return done["set_pages"] * PAGE_SIZE
 
 
-def plugged_end(memory):
-    """End offset of the last plugged slot: the file minus a trailing unplugged range."""
-    unplugged = memory["unplugged"]
-    if (
-        unplugged
-        and unplugged[-1]["offset"] + unplugged[-1]["len"] == memory["total_size"]
-    ):
-        return unplugged[-1]["offset"]
-    return memory["total_size"]
+@retry(wait=wait_fixed(0.2), stop=stop_after_delay(10), reraise=True)
+def wait_for_log_message(vm, message):
+    """Wait for `message` to show up in Firecracker's log."""
+    vm.check_log_message(message)
 
 
-def in_unplugged(memory, offset):
-    """Whether `offset` lies in an `unplugged` range."""
-    return any(
-        r["offset"] <= offset < r["offset"] + r["len"] for r in memory["unplugged"]
+def assert_no_dirty_pages_endpoint(vm):
+    """Dirty pages travel on the backend connection; there is no HTTP endpoint for them."""
+    res = vm.api.session.request(
+        "PUT", vm.api.endpoint + "/snapshot/dirty-pages", json={}
     )
-
-
-def page_set(memory, page):
-    """Whether `page` is to be copied: its bit is set, or this is a `Full` and it is plugged."""
-    bitmap = decode_pages(memory)
-    offset = page * memory["page_size"]
-    if bitmap is None:
-        return offset < memory["total_size"] and not in_unplugged(memory, offset)
-    return page // 8 < len(bitmap) and bool(bitmap[page // 8] & (1 << (page % 8)))
-
-
-def check_layout(memory, total_size):
-    """Sanity checks on a `memory` object returned by Firecracker."""
-    assert memory["total_size"] == total_size
-    assert memory["page_size"] == PAGE_SIZE
-    unplugged = memory["unplugged"]
-    for rng in unplugged:
-        assert rng["len"] > 0
-        assert rng["offset"] % PAGE_SIZE == 0
-        assert rng["len"] % PAGE_SIZE == 0
-        assert rng["offset"] + rng["len"] <= total_size
-    # sorted and merged
-    for prev, cur in zip(unplugged, unplugged[1:]):
-        assert prev["offset"] + prev["len"] < cur["offset"]
-    bitmap = decode_pages(memory)
-    if bitmap is not None:
-        # The bitmap covers the file up to the last plugged slot, whatever is dirty.
-        covered_pages = -(-plugged_end(memory) // PAGE_SIZE)
-        assert len(bitmap) == -(-covered_pages // 8)
-        # Bits past the last plugged page, and bits of unplugged slots, are clear.
-        for page in range(covered_pages, len(bitmap) * 8):
-            assert not page_set(memory, page)
-        for rng in unplugged:
-            assert set_bytes_in(memory, rng["offset"], rng["len"]) == 0
-
-
-def covered_bytes(ranges):
-    """Total number of bytes covered by a range list."""
-    return sum(rng["len"] for rng in ranges)
-
-
-def set_bytes(memory):
-    """Total number of bytes to copy according to `memory`."""
-    bitmap = decode_pages(memory)
-    if bitmap is None:
-        return memory["total_size"] - covered_bytes(memory["unplugged"])
-    return sum(byte.bit_count() for byte in bitmap) * memory["page_size"]
-
-
-def set_pages(memory):
-    """Sorted list of the pages to copy."""
-    return [
-        page
-        for page in range(memory["total_size"] // memory["page_size"])
-        if page_set(memory, page)
-    ]
-
-
-def set_bytes_in(memory, offset, length):
-    """Bytes to copy within `[offset, offset + length)`."""
-    page_size = memory["page_size"]
-    first, last = offset // page_size, (offset + length) // page_size
-    return sum(1 for page in range(first, last) if page_set(memory, page)) * page_size
+    assert res.status_code == 400, res.text
+    assert "Invalid request method and/or path" in res.json()["fault_message"]
 
 
 def differing_pages(path_a, path_b, page_size=4096):
     """Offsets of the pages at which two memory files differ."""
-    offsets = []
     with open(path_a, "rb") as file_a, open(path_b, "rb") as file_b:
-        offset = 0
-        while True:
-            page_a = file_a.read(page_size)
-            page_b = file_b.read(page_size)
-            if not page_a and not page_b:
-                break
-            if page_a != page_b:
-                offsets.append(offset)
-            offset += page_size
-    return offsets
+        pages = zip(
+            iter(lambda: file_a.read(page_size), b""),
+            iter(lambda: file_b.read(page_size), b""),
+        )
+        return [i * page_size for i, (a, b) in enumerate(pages) if a != b]
 
 
 @pytest.mark.parametrize("huge_pages", PAGE_CONFIGS)
@@ -198,10 +130,8 @@ def test_boot_full_snapshot_restores(uvm, microvm_factory, huge_pages):
     make_guest_dirty_memory(vm.ssh, amount_mib=32)
 
     snapshot = vm.snapshot_full()
-    memory = vm.last_snapshot_memory
-    check_layout(memory, MEM_SIZE_MIB * 2**20)
-    assert not memory["unplugged"]
-    assert set_bytes(memory) == MEM_SIZE_MIB * 2**20
+    # A full copy consumes the dirty state as well; a booted guest has dirtied plenty.
+    assert dirty_bytes(vm.last_backend_copy) >= 32 * 2**20
     assert snapshot.mem.stat().st_size == MEM_SIZE_MIB * 2**20
     vm.kill()
 
@@ -229,11 +159,8 @@ def test_diff_self_consistency(uvm, huge_pages):
     make_guest_dirty_memory(vm.ssh, amount_mib=64)
 
     diff = vm.snapshot_diff(mem_path="mem_diff")
-    diff_memory = vm.last_snapshot_memory
-    check_layout(diff_memory, MEM_SIZE_MIB * 2**20)
-    dirty_bytes = set_bytes(diff_memory)
     # The workload dirtied at least what it wrote, and not everything.
-    assert 64 * 2**20 <= dirty_bytes < MEM_SIZE_MIB * 2**20
+    assert 64 * 2**20 <= dirty_bytes(vm.last_backend_copy) < MEM_SIZE_MIB * 2**20
     assert diff.mem.stat().st_size == MEM_SIZE_MIB * 2**20
 
     # Still paused: nothing changed since the diff.
@@ -295,17 +222,13 @@ def test_precopy_dirty_pages(uvm, huge_pages):
 
     for _ in range(4):
         make_guest_dirty_memory(vm.ssh, amount_mib=16)
-        memory = vm.dirty_pages(copy_to="mem_precopy")
-        check_layout(memory, MEM_SIZE_MIB * 2**20)
-        assert set_bytes(memory) > 0, "a running guest dirties something"
+        done = vm.precopy_pass("mem_precopy")
+        assert dirty_bytes(done) > 0, "a running guest dirties something"
 
-    # Final pass while paused, merged into the same file.
+    # Final pass while paused, after the vmstate is written, merged into the same file.
     vm.pause()
-    memory = vm.api.snapshot_create.put(
-        snapshot_path="vmstate", snapshot_type="Diff"
-    ).json()["memory"]
-    check_layout(memory, MEM_SIZE_MIB * 2**20)
-    vm.mem_backend.copy(memory, "/mem_precopy")
+    vm.api.snapshot_create.put(snapshot_path="vmstate", snapshot_type="Diff")
+    vm.backend_copy("mem_precopy", full=False)
 
     # Reference: everything, still paused.
     full = vm.snapshot_full(mem_path="mem_full", vmstate_path="vmstate_full")
@@ -313,19 +236,60 @@ def test_precopy_dirty_pages(uvm, huge_pages):
 
 
 def test_dirty_pages_are_consumed(uvm):
-    """Two back-to-back `dirty-pages` calls on a paused guest: the second is empty."""
+    """Two back-to-back `DirtyPages` requests on a paused guest: the second is (almost) empty."""
     vm = boot_with_mem_backend(uvm)
     make_guest_dirty_memory(vm.ssh, amount_mib=16)
     vm.pause()
 
-    first = vm.dirty_pages()
-    check_layout(first, MEM_SIZE_MIB * 2**20)
-    assert set_bytes(first) >= 16 * 2**20
-    second = vm.dirty_pages()
+    first = vm.precopy_pass("mem_a")
+    assert dirty_bytes(first) >= 16 * 2**20
+    second = vm.precopy_pass("mem_b")
     # Only the virtqueue pages, re-marked after every reset so that they are part of the next
     # set, remain.
-    assert set_bytes(second) < 2**20
-    assert set_pages(second) == set_pages(vm.dirty_pages())
+    assert dirty_bytes(second) < 2**20
+    assert dirty_bytes(second) == dirty_bytes(vm.precopy_pass("mem_c"))
+
+
+def test_request_before_create_is_not_final(uvm):
+    """
+    A `DirtyPages` request between `Pause` and `snapshot/create` is legal but not
+    the snapshot's set: `snapshot/create` may still write guest memory (block
+    drain) and marks what it wrote dirty, so a request after it completes the
+    snapshot. Rebasing both diffs onto the base must equal a full copy taken
+    afterwards.
+    """
+    vm = boot_with_mem_backend(uvm)
+    make_guest_dirty_memory(vm.ssh, amount_mib=16)
+    base = vm.snapshot_full(mem_path="mem_base")
+    vm.resume()
+    make_guest_dirty_memory(vm.ssh, amount_mib=16)
+    vm.pause()
+
+    # Too early: consumes what the guest dirtied, but not what `snapshot/create` will touch.
+    early = vm.backend_copy("mem_early", full=False)
+    assert dirty_bytes(early) >= 16 * 2**20
+    vm.api.snapshot_create.put(snapshot_path="vmstate", snapshot_type="Diff")
+    late = vm.backend_copy("mem_late", full=False)
+    assert dirty_bytes(late) > 0
+    full = vm.snapshot_full(mem_path="mem_full", vmstate_path="vmstate_full")
+
+    # base <- early <- late must equal the full copy.
+    root = Path(vm.chroot())
+
+    def diff_snapshot(mem_path):
+        return Snapshot(
+            vmstate=root / "vmstate",
+            mem=root / mem_path,
+            disks=base.disks,
+            net_ifaces=base.net_ifaces,
+            ssh_key=base.ssh_key,
+            snapshot_type=SnapshotType.DIFF,
+            meta=base.meta,
+        )
+
+    rebased = diff_snapshot("mem_early").rebase_snapshot(base)
+    rebased = diff_snapshot("mem_late").rebase_snapshot(rebased)
+    assert filecmp.cmp(rebased.mem, full.mem, shallow=False)
 
 
 def test_pause_invariant(uvm):
@@ -461,10 +425,9 @@ def test_boot_snapshot_restores_with_uffd(uvm, microvm_factory):
     )
     restored.memory_monitor = None
     assert restored.ssh.check_output("cat /tmp/marker").stdout.strip() == "hello"
-    # A plain UFFD restore attaches no backend.
+    # A plain UFFD restore attaches no backend, and there is no HTTP way to get dirty pages.
     assert restored.mem_backend is None
-    with pytest.raises(RuntimeError, match="No memory backend"):
-        restored.api.snapshot_dirty_pages.put()
+    assert_no_dirty_pages_endpoint(restored)
     restored.kill()
 
 
@@ -487,8 +450,10 @@ def test_fault_all_handler_as_backend(uvm, microvm_factory):
 
 def test_virtio_mem_unplugged_slots(uvm, microvm_factory):
     """
-    With virtio-mem, `total_size` includes the hotplug region and the unplugged
-    slots are reported in `unplugged` and zeroed in the memory file.
+    With virtio-mem, the memory file covers the hotplug region and the unplugged
+    slots are zero in it (the backend zeroes the `unplugged` ranges Firecracker
+    reports). The shape of the reply itself is checked by the Rust unit tests;
+    here we look at the files and at the dirty page counts.
     """
     vm = uvm
     vm.memory_monitor = None
@@ -506,37 +471,32 @@ def test_virtio_mem_unplugged_slots(uvm, microvm_factory):
 
     total_size = (MEM_SIZE_MIB + 512) * 2**20
 
-    # Nothing plugged yet: the whole hotplug region is unplugged. A `Full` has
-    # no bitmap: everything outside `unplugged` is copied.
+    # Nothing plugged yet: the whole hotplug region is unplugged. The file is
+    # `total_size` long and the hotplug region is zero in it. No page of the
+    # unplugged region can be reported dirty: at most DRAM is.
     snapshot = vm.snapshot_full(mem_path="mem_unplugged")
-    memory = vm.last_snapshot_memory
-    check_layout(memory, total_size)
-    assert "pages" not in memory
-    assert covered_bytes(memory["unplugged"]) == 512 * 2**20
-    assert set_bytes(memory) == MEM_SIZE_MIB * 2**20
-
-    # A `Diff` right away: its bitmap ends with DRAM, since the hotplug region
-    # that follows is unplugged, however large it is.
-    vm.resume()
-    vm.pause()
-    memory = vm.dirty_pages()
-    check_layout(memory, total_size)
-    assert len(decode_pages(memory)) == MEM_SIZE_MIB * 2**20 // PAGE_SIZE // 8
+    assert dirty_bytes(vm.last_backend_copy) <= MEM_SIZE_MIB * 2**20
     assert snapshot.mem.stat().st_size == total_size
     with open(snapshot.mem, "rb") as mem:
         mem.seek(MEM_SIZE_MIB * 2**20)
         assert mem.read(512 * 2**20) == bytes(512 * 2**20)
 
-    # Plug one slot's worth and make the guest use it.
+    # A diff after a brief run: a few pages, nothing like the 512 MiB unplugged region.
+    vm.resume()
+    vm.pause()
+    assert dirty_bytes(vm.precopy_pass("mem_scratch")) < 16 * 2**20
+
+    # Plug one slot's worth and make the guest use it. The plugged slot is part
+    # of the file; the rest of the hotplug region is still zero.
     vm.resume()
     vm.api.memory_hotplug.patch(requested_size_mib=128)
     make_guest_dirty_memory(vm.ssh, amount_mib=64)
     snapshot = vm.snapshot_full(mem_path="mem_plugged", vmstate_path="vmstate_plugged")
-    memory = vm.last_snapshot_memory
-    check_layout(memory, total_size)
-    assert covered_bytes(memory["unplugged"]) == (512 - 128) * 2**20
-    assert set_bytes(memory) == (MEM_SIZE_MIB + 128) * 2**20
-    assert "pages" not in memory
+    assert snapshot.mem.stat().st_size == total_size
+    with open(snapshot.mem, "rb") as mem:
+        mem.seek(MEM_SIZE_MIB * 2**20)
+        assert mem.read(128 * 2**20) != bytes(128 * 2**20)
+        assert mem.read((512 - 128) * 2**20) == bytes((512 - 128) * 2**20)
     vm.kill()
 
     restored = microvm_factory.build_from_snapshot(snapshot)
@@ -567,7 +527,6 @@ def test_virtio_mem_unplug_after_use(uvm, microvm_factory):
     vm.api.memory_hotplug.put(total_size_mib=512, slot_size_mib=128, block_size_mib=2)
     vm.add_net_iface()
     vm.start()
-    total_size = (MEM_SIZE_MIB + 512) * 2**20
 
     # Plug two slots and put data in the guest's memory, most of which can only
     # fit in the hotplugged part.
@@ -575,7 +534,9 @@ def test_virtio_mem_unplug_after_use(uvm, microvm_factory):
     vm.ssh.check_output("mount -o remount,size=300M -t tmpfs tmpfs /dev/shm")
     vm.ssh.check_output("dd if=/dev/urandom of=/dev/shm/data bs=1M count=200")
     base = vm.snapshot_full(mem_path="mem_base")
-    assert covered_bytes(vm.last_snapshot_memory["unplugged"]) == 256 * 2**20
+    with open(base.mem, "rb") as mem:
+        mem.seek((MEM_SIZE_MIB + 256) * 2**20)
+        assert mem.read(256 * 2**20) == bytes(256 * 2**20)
     vm.resume()
 
     # Unplug one slot's worth. The guest migrates the data away first, so the
@@ -587,15 +548,10 @@ def test_virtio_mem_unplug_after_use(uvm, microvm_factory):
     merged = Path(vm.chroot()) / "mem_merged"
     shutil.copy(base.mem, merged)
     diff = vm.snapshot_diff(mem_path="mem_merged", vmstate_path="vmstate_diff")
-    diff_memory = vm.last_snapshot_memory
-    check_layout(diff_memory, total_size)
-    assert covered_bytes(diff_memory["unplugged"]) == (512 - 128) * 2**20
-    # The unplug marked the slot dirty, but as long as it is unplugged the API
-    # describes it through `unplugged` only: no bit is set for it, and the bitmap
-    # ends with the last plugged slot however much unplugged memory follows.
-    plugged_end_offset = (MEM_SIZE_MIB + 128) * 2**20
-    assert plugged_end(diff_memory) == plugged_end_offset
-    assert len(decode_pages(diff_memory)) == plugged_end_offset // PAGE_SIZE // 8
+    # The unplug marked the slot dirty, but as long as it is unplugged Firecracker
+    # describes it through `unplugged` only: no bit is set for it, so the dirty
+    # set is smaller than the slot that went away plus DRAM.
+    assert dirty_bytes(vm.last_backend_copy) < (MEM_SIZE_MIB + 128) * 2**20
     full = vm.snapshot_full(mem_path="mem_full", vmstate_path="vmstate_full")
     assert filecmp.cmp(diff.mem, full.mem, shallow=False)
     # The unplugged slots are zero in the file, whatever the base had there.
@@ -610,10 +566,8 @@ def test_virtio_mem_unplug_after_use(uvm, microvm_factory):
     vm.hotplug_memory(0)
     vm.hotplug_memory(128)
     vm.pause()
-    replugged = vm.dirty_pages()
-    check_layout(replugged, total_size)
-    assert set_bytes_in(replugged, MEM_SIZE_MIB * 2**20, 128 * 2**20) == 128 * 2**20
-    assert covered_bytes(replugged["unplugged"]) == (512 - 128) * 2**20
+    replugged = vm.precopy_pass("mem_replugged")
+    assert dirty_bytes(replugged) >= 128 * 2**20
     vm.kill()
 
     # Restore, plug everything back and use it.
@@ -643,9 +597,7 @@ def check_diff_identity_across_inflate(vm, base, amount_mib):
     """
     inflate_balloon(vm, amount_mib)
     diff = vm.snapshot_diff(mem_path="mem_diff")
-    diff_memory = vm.last_snapshot_memory
-    check_layout(diff_memory, MEM_SIZE_MIB * 2**20)
-    assert set_bytes(diff_memory) >= amount_mib * 2**20
+    assert dirty_bytes(vm.last_backend_copy) >= amount_mib * 2**20
     full = vm.snapshot_full(mem_path="mem_full", vmstate_path="vmstate_full")
     rebased = diff.rebase_snapshot(base)
     assert filecmp.cmp(rebased.mem, full.mem, shallow=False)
@@ -773,9 +725,7 @@ def test_diff_mincore_self_consistency(uvm):
     make_guest_dirty_memory(vm.ssh, amount_mib=64)
 
     diff = vm.make_snapshot(SnapshotType.DIFF_MINCORE, mem_path="mem_diff")
-    diff_memory = vm.last_snapshot_memory
-    check_layout(diff_memory, MEM_SIZE_MIB * 2**20)
-    assert set_bytes(diff_memory) >= 64 * 2**20
+    assert dirty_bytes(vm.last_backend_copy) >= 64 * 2**20
 
     full = vm.snapshot_full(mem_path="mem_full", vmstate_path="vmstate_full")
     rebased = diff.rebase_snapshot(base)
@@ -796,13 +746,14 @@ def test_two_dram_regions(uvm, microvm_factory):
     vm.memory_monitor = None
     make_guest_dirty_memory(vm.ssh, amount_mib=32)
 
+    # The reply for 4.5 GiB is a 144 KiB bitmap, more than a default socket buffer: this
+    # exercises the API thread's blocking write to the backend.
     snapshot = vm.snapshot_full()
-    memory = vm.last_snapshot_memory
-    check_layout(memory, mem_size_mib * 2**20)
-    # Both regions are plugged and adjacent in file space: every bit is set.
-    assert set_bytes(memory) == mem_size_mib * 2**20
-    assert memory["unplugged"] == []
     assert snapshot.mem.stat().st_size == mem_size_mib * 2**20
+    # A diff right after, still paused, is tiny, and the file still has full size.
+    diff = vm.snapshot_diff(mem_path="mem_diff", vmstate_path="vmstate_diff")
+    assert dirty_bytes(vm.last_backend_copy) < 2**20
+    assert diff.mem.stat().st_size == mem_size_mib * 2**20
     vm.kill()
 
     restored = microvm_factory.build_from_snapshot(snapshot)
@@ -839,7 +790,7 @@ def test_snapshot_right_after_restore(uvm, microvm_factory, snapshot_type):
 
     if snapshot_type == SnapshotType.DIFF:
         diff = vm.snapshot_diff(mem_path="mem_diff")
-        dirty = set_bytes(vm.last_snapshot_memory)
+        dirty = dirty_bytes(vm.last_backend_copy)
         # A handful of pages, not nothing and not everything.
         assert 0 < dirty <= 2**20, dirty
         full = vm.snapshot_full(mem_path="mem_full", vmstate_path="vmstate_full")
@@ -886,14 +837,13 @@ def test_negative_api(uvm, microvm_factory, guest_kernel, rootfs):
         vm.api.actions.put(action_type="InstanceStart")
     vm.kill()
 
-    # Without a backend: mem_file_path stays mandatory, dirty-pages is rejected.
+    # Without a backend: mem_file_path stays mandatory; there is no dirty-pages endpoint.
     plain = microvm_factory.build(guest_kernel, rootfs)
     plain.spawn()
     plain.basic_config(vcpu_count=2, mem_size_mib=MEM_SIZE_MIB, track_dirty_pages=True)
     plain.add_net_iface()
     plain.start()
-    with pytest.raises(RuntimeError, match="No memory backend"):
-        plain.api.snapshot_dirty_pages.put()
+    assert_no_dirty_pages_endpoint(plain)
     plain.pause()
     with pytest.raises(RuntimeError, match="mem_file_path"):
         plain.api.snapshot_create.put(snapshot_path="vmstate", snapshot_type="Full")
@@ -901,8 +851,10 @@ def test_negative_api(uvm, microvm_factory, guest_kernel, rootfs):
     plain.ssh.check_output("true")
     plain.kill()
 
-    # With a backend: mem_file_path must be absent; a dead backend does not fail the request.
+    # With a backend: mem_file_path must be absent; `snapshot/create` answers 204 and
+    # writes no memory; a dead backend does not fail the request or the HTTP API.
     backed = boot_with_mem_backend(microvm_factory.build(guest_kernel, rootfs))
+    assert_no_dirty_pages_endpoint(backed)
     backed.pause()
     with pytest.raises(RuntimeError, match="mem_file_path"):
         backed.api.snapshot_create.put(
@@ -914,21 +866,132 @@ def test_negative_api(uvm, microvm_factory, guest_kernel, rootfs):
     backed.mem_backend.kill()
     backed.ssh.check_output("true")
     backed.pause()
-    memory = backed.api.snapshot_create.put(
-        snapshot_path="vmstate", snapshot_type="Full"
-    ).json()["memory"]
-    check_layout(memory, MEM_SIZE_MIB * 2**20)
+    res = backed.api.snapshot_create.put(snapshot_path="vmstate", snapshot_type="Full")
+    assert res.status_code == 204
+    assert (Path(backed.chroot()) / "vmstate").exists()
+    assert not (Path(backed.chroot()) / "mem").exists()
     with pytest.raises((ConnectionError, FileNotFoundError, OSError)):
-        backed.mem_backend.control({"Copy": {"mem_path": "/mem", "memory": memory}})
+        backed.mem_backend.control({"Copy": {"mem_path": "/mem", "full": True}})
     backed.uffd_handler = None
     backed.resume()
     backed.ssh.check_output("true")
+    wait_for_log_message(backed, "Memory backend closed its connection")
 
 
-@pytest.mark.parametrize("snapshot_type", [SnapshotType.FULL, SnapshotType.DIFF])
-def test_snapshot_types_with_backend(uvm, snapshot_type):
-    """`snapshot_type` is echoed in the response and the file has the full size either way."""
-    vm = boot_with_mem_backend(uvm)
-    snapshot = vm.make_snapshot(snapshot_type)
-    assert snapshot.mem.stat().st_size == MEM_SIZE_MIB * 2**20
-    assert vm.last_snapshot_memory["total_size"] == MEM_SIZE_MIB * 2**20
+@pytest.mark.parametrize("mem_size_mib", [MEM_SIZE_MIB, 8192])
+def test_backend_protocol_errors(uvm, mem_size_mib):
+    """
+    A backend that speaks garbage on its connection gets it closed; the microVM
+    and the HTTP API are unaffected. An unknown request gets an error reply and
+    the connection stays usable. The test plays the backend itself with a plain
+    listening socket, so that it can send arbitrary frames. With 8 GiB the
+    reply is 256 KiB, more than the socket buffer: read late, it makes the API
+    thread wait for writability, under its seccomp filter.
+    """
+    if mem_size_mib > 4096 and platform.machine() != "x86_64":
+        pytest.skip("large guest variant is for the x86 two-region layout")
+    vm = uvm
+    vm.spawn()
+    vm.memory_monitor = None
+    sock_path = Path(vm.chroot()) / "raw_backend.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(sock_path))
+    # The jailed Firecracker runs as another user.
+    sock_path.chmod(0o777)
+    listener.listen(1)
+    vm.basic_config(vcpu_count=2, mem_size_mib=mem_size_mib, track_dirty_pages=True)
+    vm.api.machine_config.put(
+        vcpu_count=2,
+        mem_size_mib=mem_size_mib,
+        track_dirty_pages=True,
+        mem_backend={
+            "backend_type": "SharedMemfd",
+            "backend_path": "/raw_backend.sock",
+        },
+    )
+    vm.add_net_iface()
+    vm.start()
+    conn, _ = listener.accept()
+    conn.settimeout(30)
+    # The handshake: one message with the memfd attached. We ignore the fd.
+    handshake, ancdata, _, _ = conn.recvmsg(65536, socket.CMSG_SPACE(4))
+    assert handshake.startswith(b"[")
+    assert ancdata, "no memfd in the handshake"
+    vm.ssh.check_output("true")
+
+    def frame(json_bytes, blob=b""):
+        return struct.pack("<II", len(json_bytes), len(blob)) + json_bytes + blob
+
+    def read_frame():
+        header = b""
+        while len(header) < 8:
+            header += conn.recv(8 - len(header))
+        json_len, blob_len = struct.unpack("<II", header)
+        body = b""
+        while len(body) < json_len + blob_len:
+            body += conn.recv(json_len + blob_len - len(body))
+        return body[:json_len], body[json_len:]
+
+    # An unknown request is answered with an error; the connection stays usable.
+    conn.sendall(frame(b'{"request":"Frobnicate"}'))
+    json_part, blob = read_frame()
+    assert b"error" in json_part and not blob
+    conn.sendall(frame(b'{"request":"DirtyPages"}'))
+    # Let the reply pile up in the socket buffer (and beyond it, for the large
+    # guest, which stalls the API thread until we read) before reading it.
+    time.sleep(1)
+    json_part, blob = read_frame()
+    vm.api.describe.get()
+    assert b"total_size" in json_part
+    assert len(blob) == mem_size_mib * 2**20 // PAGE_SIZE // 8
+    # A booted guest has dirtied something.
+    assert sum(byte.bit_count() for byte in blob) > 0
+
+    # A frame with a blob in a request breaks framing: Firecracker closes the connection.
+    conn.sendall(frame(b'{"request":"DirtyPages"}', b"x"))
+    assert conn.recv(1) == b""
+    conn.close()
+    listener.close()
+    wait_for_log_message(vm, "closing")
+    # MicroVM and HTTP API are fine; snapshot/create still writes vmstate.
+    vm.ssh.check_output("true")
+    vm.pause()
+    vm.api.snapshot_create.put(snapshot_path="vmstate", snapshot_type="Full")
+    vm.resume()
+    vm.ssh.check_output("true")
+
+
+def test_mem_backend_requires_api(uvm):
+    """`--no-api` rejects a memory backend: nothing would service its connection."""
+    vm = uvm
+    vm.create_jailed_resource(vm.kernel_file)
+    vm.create_jailed_resource(vm.rootfs_file)
+    config = {
+        "boot-source": {
+            "kernel_image_path": vm.kernel_file.name,
+            "boot_args": "console=ttyS0 reboot=k panic=1",
+        },
+        "drives": [
+            {
+                "drive_id": "rootfs",
+                "path_on_host": vm.rootfs_file.name,
+                "is_root_device": True,
+                "is_read_only": True,
+            }
+        ],
+        "machine-config": {
+            "vcpu_count": 1,
+            "mem_size_mib": 128,
+            "mem_backend": {
+                "backend_type": "SharedMemfd",
+                "backend_path": "/backend.sock",
+            },
+        },
+    }
+    vm_config = Path(vm.chroot()) / "vm_config.json"
+    vm_config.write_text(json.dumps(config))
+    vm.jailer.extra_args = {"config-file": vm_config.name, "no-api": None}
+    vm.spawn(serial_out_path=None)
+    vm.mark_killed()
+    vm.check_log_message("requires the API server")
+    assert vm.get_exit_code() != 0

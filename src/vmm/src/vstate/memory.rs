@@ -1224,10 +1224,6 @@ where
     /// Store the dirty bitmap in internal store
     fn store_dirty_bitmap(&self, dirty_bitmap: &DirtyBitmap, page_size: usize);
 
-    /// Describes the memory file layout of a full snapshot: no bitmap (every plugged page is to
-    /// be copied), all unplugged slots as `unplugged`. Has no effect on dirty tracking.
-    fn full_layout(&self) -> SnapshotMemoryLayout;
-
     /// Describes the memory file layout of a diff snapshot: exactly the pages
     /// [`Self::dump_dirty`] would write have their bit set in `pages`, and the unplugged slots
     /// are listed in `unplugged`. Bits of currently unplugged slots are never set, whatever
@@ -1376,26 +1372,6 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         })
     }
 
-    fn full_layout(&self) -> SnapshotMemoryLayout {
-        let total_size = self.iter().map(|r| r.len()).sum();
-        let mut unplugged = Vec::new();
-        // Cannot fail: the callback never errors.
-        self.for_each_slot_at_file_offset(|mem_slot, plugged, file_offset| {
-            if !plugged {
-                push_merged(
-                    &mut unplugged,
-                    MemoryRange {
-                        offset: file_offset,
-                        len: mem_slot.slice.len() as u64,
-                    },
-                );
-            }
-            Ok(())
-        })
-        .expect("full_layout callback cannot fail");
-        SnapshotMemoryLayout::full(total_size, host_page_size() as u64, unplugged)
-    }
-
     fn dirty_layout(
         &self,
         dirty_bitmap: &DirtyBitmap,
@@ -1412,7 +1388,7 @@ impl GuestMemoryExtension for GuestMemoryMmap {
             Ok(())
         })
         .expect("callback cannot fail");
-        let mut layout = SnapshotMemoryLayout::diff(total_size, page_size as u64, plugged_end);
+        let mut layout = SnapshotMemoryLayout::new(total_size, page_size as u64, plugged_end);
 
         let result = self.for_each_slot_at_file_offset(|mem_slot, plugged, file_offset| {
             if !plugged {
@@ -2977,13 +2953,18 @@ mod tests {
     }
 
     /// Applies a layout the way a memory backend would: create the target at `total_size`, copy
-    /// every set page from the memfd, zero `unplugged`.
-    fn apply_layout(layout: &SnapshotMemoryLayout, memfd: &File) -> Vec<u8> {
+    /// every set page (or, for a full copy, every plugged page) from the memfd, zero `unplugged`.
+    fn apply_layout(layout: &SnapshotMemoryLayout, memfd: &File, full: bool) -> Vec<u8> {
         let page_size = u64_to_usize(layout.page_size);
         let mut target = vec![0u8; u64_to_usize(layout.total_size)];
         for page in 0..target.len() / page_size {
             let offset = page * page_size;
-            if layout.page_is_set(offset as u64) {
+            let copy = if full {
+                layout.page_is_plugged(offset as u64)
+            } else {
+                layout.page_is_set(offset as u64)
+            };
+            if copy {
                 memfd
                     .read_exact_at(&mut target[offset..offset + page_size], offset as u64)
                     .unwrap();
@@ -2995,12 +2976,16 @@ mod tests {
         target
     }
 
-    /// The set pages of a layout as merged `MemoryRange`s, for readable assertions.
-    fn set_ranges(layout: &SnapshotMemoryLayout) -> Vec<MemoryRange> {
+    /// The plugged pages of a layout as merged `MemoryRange`s.
+    fn plugged_ranges(layout: &SnapshotMemoryLayout) -> Vec<MemoryRange> {
+        ranges_where(layout, |offset| layout.page_is_plugged(offset))
+    }
+
+    fn ranges_where(layout: &SnapshotMemoryLayout, pred: impl Fn(u64) -> bool) -> Vec<MemoryRange> {
         let mut ranges = Vec::new();
         for page in 0..layout.total_size.div_ceil(layout.page_size) {
             let offset = page * layout.page_size;
-            if layout.page_is_set(offset) {
+            if pred(offset) {
                 push_merged(
                     &mut ranges,
                     MemoryRange {
@@ -3024,21 +3009,19 @@ mod tests {
     fn assert_layout_well_formed(layout: &SnapshotMemoryLayout) {
         let page_size = host_page_size() as u64;
         assert_eq!(layout.page_size, page_size);
-        if let Some(pages) = &layout.pages {
-            // The bitmap ends with the last plugged slot: it covers everything up to the start of
-            // the trailing unplugged range (if any), rounded up to a byte, and nothing more.
-            let plugged_end = match layout.unplugged.last() {
-                Some(r) if r.offset + r.len == layout.total_size => r.offset,
-                _ => layout.total_size,
-            };
-            assert_eq!(
-                pages.len() as u64,
-                plugged_end.div_ceil(page_size).div_ceil(8)
-            );
-            // Bits past the last plugged page are clear.
-            for page in plugged_end.div_ceil(page_size)..pages.len() as u64 * 8 {
-                assert!(!layout.page_is_set(page * page_size));
-            }
+        // The bitmap ends with the last plugged slot: it covers everything up to the start of
+        // the trailing unplugged range (if any), rounded up to a byte, and nothing more.
+        let plugged_end = match layout.unplugged.last() {
+            Some(r) if r.offset + r.len == layout.total_size => r.offset,
+            _ => layout.total_size,
+        };
+        assert_eq!(
+            layout.pages.len() as u64,
+            plugged_end.div_ceil(page_size).div_ceil(8)
+        );
+        // Bits past the last plugged page are clear.
+        for page in plugged_end.div_ceil(page_size)..layout.pages.len() as u64 * 8 {
+            assert!(!layout.page_is_set(page * page_size));
         }
         for range in &layout.unplugged {
             assert!(range.len > 0);
@@ -3053,21 +3036,24 @@ mod tests {
     }
 
     #[test]
-    fn test_full_layout_matches_dump() {
+    fn test_full_copy_matches_dump() {
         let (guest_memory, backing) = layout_test_memory();
         let page_size = host_page_size() as u64;
 
         let mut dump_file = TempFile::new().unwrap().into_file();
         guest_memory.dump(&mut dump_file).unwrap();
 
-        let layout = guest_memory.full_layout();
+        // A full copy is "every plugged page": `total_size` minus `unplugged`, both of which
+        // every reply carries.
+        let layout = guest_memory
+            .dirty_layout(&(0..6).map(|slot| (slot, vec![0u64])).collect())
+            .unwrap();
         assert_layout_well_formed(&layout);
         assert_eq!(layout.total_size, 12 * page_size);
-        assert!(layout.pages.is_none());
         // DRAM is contiguous in file space, then the plugged hotplug slots 0 and 2. Unplugged
-        // slots are never set in a full layout.
+        // slots are never part of a full copy.
         assert_eq!(
-            set_ranges(&layout),
+            plugged_ranges(&layout),
             vec![
                 MemoryRange {
                     offset: 0,
@@ -3094,7 +3080,7 @@ mod tests {
         );
 
         assert_eq!(
-            apply_layout(&layout, &backing.file),
+            apply_layout(&layout, &backing.file, true),
             read_back(&mut dump_file, u64_to_usize(layout.total_size))
         );
     }
@@ -3160,7 +3146,7 @@ mod tests {
                 layout.total_size,
                 u64::try_from(total_pages * page_size).unwrap()
             );
-            let actual = apply_layout(&layout, &backing.file);
+            let actual = apply_layout(&layout, &backing.file, false);
 
             assert_eq!(
                 actual, expected,
@@ -3221,7 +3207,7 @@ mod tests {
         assert_layout_well_formed(&layout);
         assert!(!layout.page_is_set(11 * page_size as u64));
         assert!(layout.page_is_set(10 * page_size as u64));
-        assert_eq!(layout.pages.as_ref().unwrap().len(), 2);
+        assert_eq!(layout.pages.len(), 2);
         assert_eq!(layout.unplugged.len(), 2);
 
         // Same marks, but the slot is plugged again before the call: reported.
@@ -3247,7 +3233,7 @@ mod tests {
         // page 10, so 11 pages, 2 bytes), and nothing more.
         let layout = guest_memory.dirty_layout(&kvm_bitmap).unwrap();
         assert_layout_well_formed(&layout);
-        assert_eq!(layout.pages.as_deref(), Some(&[0u8, 0][..]));
+        assert_eq!(layout.pages, vec![0u8, 0]);
         assert_eq!(layout.total_size, 12 * page_size as u64);
         assert_eq!(layout.unplugged.len(), 2);
 
@@ -3261,7 +3247,7 @@ mod tests {
         hotplug.bitmap().mark_dirty(0, 4 * page_size);
         let layout = guest_memory.dirty_layout(&kvm_bitmap).unwrap();
         assert_layout_well_formed(&layout);
-        assert_eq!(layout.pages.as_deref(), Some(&[0u8][..]));
+        assert_eq!(layout.pages, vec![0u8]);
         assert_eq!(
             layout.unplugged,
             vec![MemoryRange {
@@ -3269,11 +3255,8 @@ mod tests {
                 len: 4 * page_size as u64,
             }]
         );
-
-        // The full layout has no bitmap regardless.
-        let layout = guest_memory.full_layout();
-        assert!(layout.pages.is_none());
-        assert_eq!(layout.set_pages(), 8);
+        // A full copy would be DRAM only.
+        assert_eq!(layout.plugged_pages(), 8);
     }
 
     #[test]

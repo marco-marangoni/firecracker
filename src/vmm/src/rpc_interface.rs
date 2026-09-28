@@ -44,7 +44,7 @@ use crate::vmm_config::net::{
 use crate::vmm_config::pmem::{PmemConfig, PmemConfigError, PmemDeviceUpdateConfig};
 use crate::vmm_config::serial::SerialConfig;
 use crate::vmm_config::snapshot::{
-    CreateSnapshotParams, LoadSnapshotParams, SnapshotMemoryResponse, SnapshotType,
+    CreateSnapshotParams, LoadSnapshotParams, SnapshotMemoryLayout, SnapshotType,
 };
 use crate::vmm_config::vsock::{VsockConfigError, VsockDeviceConfig};
 use crate::vmm_config::{self, RateLimiterUpdate};
@@ -71,8 +71,9 @@ pub enum VmmAction {
     GetBalloonConfig,
     /// Get the ballon device latest statistics.
     GetBalloonStats,
-    /// Get (and consume) the guest memory pages dirtied since the last snapshot or dirty-pages
-    /// request. Only allowed with a memory backend attached.
+    /// Get (and consume) the guest memory pages dirtied since the last such request. Issued by
+    /// the API thread on behalf of a `SharedMemfd` memory backend's `DirtyPages` request; only
+    /// allowed with a memory backend attached.
     GetDirtyPages,
     /// Get complete microVM configuration in JSON format.
     GetFullVmConfig,
@@ -253,9 +254,9 @@ pub enum VmmData {
     VirtioMemStatus(VirtioMemStatus),
     /// The status of the virtio-balloon hinting run
     HintingStatus(HintingStatus),
-    /// Which pages of the shared guest memory make up a snapshot; returned by `snapshot/create`
-    /// and `snapshot/dirty-pages` when a memory backend is attached.
-    SnapshotMemory(SnapshotMemoryResponse),
+    /// Which pages of the shared guest memory were dirtied since the dirty state was last
+    /// consumed; the answer to a `DirtyPages` request from a `SharedMemfd` memory backend.
+    SnapshotMemory(SnapshotMemoryLayout),
 }
 
 fn mmds_patch_data(
@@ -735,12 +736,7 @@ impl RuntimeApiController {
                 .lock()
                 .expect("Poisoned lock")
                 .dirty_pages()
-                .map(|memory| {
-                    VmmData::SnapshotMemory(SnapshotMemoryResponse {
-                        snapshot_type: None,
-                        memory,
-                    })
-                })
+                .map(VmmData::SnapshotMemory)
                 .map_err(VmmActionError::InternalVmm),
             GetFullVmConfig => Ok(VmmData::FullVmConfig(
                 self.vmm.lock().expect("Poisoned lock").full_config(),
@@ -956,7 +952,7 @@ impl RuntimeApiController {
         let vm_info = VmInfo::from(&*locked_vmm);
         let create_start_us = get_time_us(ClockType::Monotonic);
 
-        let layout = create_snapshot(&mut locked_vmm, &vm_info, create_params)?;
+        create_snapshot(&mut locked_vmm, &vm_info, create_params)?;
 
         match create_params.snapshot_type {
             SnapshotType::Full => {
@@ -980,13 +976,7 @@ impl RuntimeApiController {
                 );
             }
         }
-        Ok(match layout {
-            Some(memory) => VmmData::SnapshotMemory(SnapshotMemoryResponse {
-                snapshot_type: Some(create_params.snapshot_type),
-                memory,
-            }),
-            None => VmmData::Empty,
-        })
+        Ok(VmmData::Empty)
     }
 
     /// Updates block device properties:

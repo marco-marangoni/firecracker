@@ -47,10 +47,12 @@ or `PUT /snapshot/load` with `backend_type: SharedMemfd`). Firecracker connects
 to the path given in the request (relative to its chroot when jailed) and sends
 the message. If nobody is listening, the API call fails.
 
-After that, Firecracker never reads from or writes to the socket, and keeps it
-open until it exits. The backend can use the connection to learn Firecracker's
-PID with `SO_PEERCRED`, and to notice that Firecracker has exited when the
-connection closes. Anything the backend sends on it is ignored.
+After that, the connection stays open until Firecracker exits and becomes the
+channel on which the backend asks Firecracker for dirty pages (see
+[the dirty pages protocol](#the-dirty-pages-protocol)). Firecracker never sends
+anything on it unsolicited. The backend can use the connection to learn
+Firecracker's PID with `SO_PEERCRED`, and to notice that Firecracker has exited
+when the connection closes.
 
 ### The message
 
@@ -132,11 +134,12 @@ On a fresh boot nothing else happens: the memfd starts empty and the guest fills
 it. On a restore, the backend serves page faults from the snapshot file, and the
 memfd fills with what it populates and what the guest writes.
 
-From here on, Firecracker's only involvement is the API. `PUT /snapshot/create`
-and `PUT /snapshot/dirty-pages` return a bitmap of the pages of the memfd to
-copy, and whoever made the call passes it to the backend however it likes; the
-example handler uses a second Unix socket. There is no other protocol between
-Firecracker and the backend.
+From here on, Firecracker's involvement is the HTTP API for the orchestrator
+(pause, `PUT /snapshot/create`, resume) and one request/reply exchange for the
+backend: `DirtyPages`, on the connection it already holds, which returns a
+bitmap of the pages of the memfd to copy. How the orchestrator tells the backend
+when to copy and where to is not Firecracker's business; the example handler
+uses a second Unix socket for that.
 
 Sharing memory this way has a cost: guest memory is a `MAP_SHARED` mapping of
 shmem or hugetlbfs, page faults on it are somewhat slower than on anonymous
@@ -198,32 +201,67 @@ made with a memory backend restores fine with `File` or `Uffd`, and vice versa.
 The microVM must be `Paused`, as always. With a backend attached,
 `mem_file_path` must be **absent** (400 otherwise): Firecracker does not write
 guest memory in this mode. Without a backend it stays mandatory and the request
-behaves as before, answering `204 No Content`.
+behaves as before.
 
-With a backend the response is `200 OK` with a body describing the memory part
-of the snapshot:
+With a backend the request writes the microVM state to `snapshot_path` and
+answers `204 No Content`, like every other `snapshot/create`. It does not touch
+the dirty tracking state: the memory part of the snapshot is obtained by the
+backend with a `DirtyPages` request **after this request has returned** and
+before the microVM is resumed. `snapshot_type` has no effect: whether the
+backend writes a full memory file or a diff is the backend's decision.
+
+## The dirty pages protocol
+
+After the handshake, every message on the connection, in either direction, is a
+frame:
+
+| offset         | size       | field                                     |
+| :------------- | :--------- | :---------------------------------------- |
+| 0              | 4          | `json_len`, `u32`, little-endian          |
+| 4              | 4          | `blob_len`, `u32`, little-endian          |
+| 8              | `json_len` | a JSON object, UTF-8                      |
+| 8 + `json_len` | `blob_len` | binary payload, meaning given by the JSON |
+
+The handshake message itself is not framed: read it with one `recvmsg` as
+described above, then switch to frames. There is one request, and Firecracker
+only ever writes replies to it.
+
+### Request: `DirtyPages`
+
+```json
+{ "request": "DirtyPages" }
+```
+
+with `blob_len` 0. As bytes, with the JSON in compact form:
+`18 00 00 00 00 00 00 00` followed by the 24 bytes of JSON. Unknown fields are
+rejected (with an error reply), so that a request meant for a newer Firecracker
+does not get silently misread.
+
+It asks for the pages of the memfd dirtied since the dirty tracking state was
+last consumed, and consumes it. It can be sent at any time after the handshake,
+while the microVM is `Running` or `Paused`. Send one request at a time: wait for
+the reply before sending the next.
+
+### Reply
 
 ```json
 {
-  "snapshot_type": "Diff",
-  "memory": {
-    "total_size": 1048576,
-    "page_size": 4096,
-    "pages": "Ax4AAAABAPwPAAAAEAAAAAwAACAA/B8A",
-    "unplugged": [
-      {
-        "offset": 786432,
-        "len": 262144
-      }
-    ]
-  }
+  "total_size": 1048576,
+  "page_size": 4096,
+  "unplugged": [
+    {
+      "offset": 786432,
+      "len": 262144
+    }
+  ]
 }
 ```
 
-The example is a 1 MiB guest (256 pages) whose last 256 KiB is an unplugged
-virtio-mem slot. The bitmap covers the 192 plugged pages and decodes to 24
-bytes. Bit `b` of byte `i` is page `8 * i + b`, so in the usual binary notation
-the lowest page of a byte is its rightmost bit:
+followed by the bitmap as the binary payload. The example is a 1 MiB guest (256
+pages) whose last 256 KiB is an unplugged virtio-mem slot; the bitmap covers the
+192 plugged pages and is 24 bytes long, so with the JSON in compact form (84
+bytes) the frame header is `54 00 00 00 18 00 00 00`. With the following
+payload:
 
 ```text
 index  pages    hex   binary    dirty pages
@@ -253,107 +291,126 @@ index  pages    hex   binary    dirty pages
    23  184-191  0x00  00000000  -
 ```
 
-Pages 0–1, 9–12, 40, 58–67, 100, 130–131, 157 and 170–180 are to be copied.
-Pages 192–255 are unplugged and not covered by the bitmap; `unplugged` says to
-zero them. A 1 GiB guest with all its memory plugged has a 32 KiB bitmap.
+pages 0–1, 9–12, 40, 58–67, 100, 130–131, 157 and 170–180 are dirty. Pages
+192–255 are unplugged and not covered by the bitmap; `unplugged` says to zero
+them. Bit `b` of byte `i` is page `8 * i + b`, so in the usual binary notation
+the lowest page of a byte is its rightmost bit. A 1 GiB guest with all its
+memory plugged has a 32 KiB bitmap.
 
 - `total_size` is the size of a full memory file (the sum of all region sizes,
   including the hotplug region). Create the target file at this size.
-- `page_size` is the granularity of `pages`, in bytes. It is the host page size
-  (usually 4096), also when the guest memory is backed by 2 MiB hugetlbfs pages.
-- `pages` is the set of pages to copy from the memfd into the target, at the
-  same offset, as a bitmap: standard base64 (RFC 4648, with padding). Byte `i`,
-  bit `b` (least significant bit first) is the page at offset
+- `page_size` is the granularity of the bitmap, in bytes. It is the host page
+  size (usually 4096), also when the guest memory is backed by 2 MiB hugetlbfs
+  pages.
+- The payload is the set of pages dirtied since the last request, as a bitmap.
+  Byte `i`, bit `b` (least significant bit first) is the page at offset
   `(8 * i + b) * page_size`. Read little-endian, the bytes are also an array of
   64-bit words in which bit `j` of word `w` is page `64 * w + j`. The bitmap
   covers the file from offset 0 up to the end of the last plugged slot,
   `ceil(plugged_end / page_size / 8)` bytes, whatever is dirty: its length is a
   function of the plug state alone, and unplugged memory at the end of the file
   (an unplugged hotplug region, however large) costs nothing. Pages past its end
-  are clear, and so are the bits of unplugged slots. For `Diff` every plugged
-  page dirtied since the last snapshot is set, as tracked by KVM's dirty log (or
-  `mincore` when `track_dirty_pages` is off) and by Firecracker's own
-  device-write tracking. Pages that became zero because the guest released them
-  (balloon), or because their virtio-mem slot was unplugged and plugged again
-  since, count as dirty. **For `Full` the field is absent**: every page outside
-  `unplugged` is to be copied.
+  are clear, and so are the bits of unplugged slots. Every plugged page dirtied
+  since the last request is set, as tracked by KVM's dirty log (or `mincore`
+  when `track_dirty_pages` is off) and by Firecracker's own device-write
+  tracking. Pages that became zero because the guest released them (balloon), or
+  because their virtio-mem slot was unplugged and plugged again since, count as
+  dirty.
 - `unplugged` are the currently unplugged virtio-mem slots, as sorted,
   page-aligned, non-overlapping `{offset, len}` pairs. Empty without virtio-mem.
   **Every byte of these ranges must be zero in the snapshot produced by the
   backend.**
+- Ignore JSON fields you do not know: future versions may add some.
 
-Copying every set page, followed by zeroing the `unplugged` range, yields a file
-identical to what Firecracker would have written. Merging a `Diff` into an
-existing full memory file is the same operation applied to that file.
+For a **diff**, copy every set page from the memfd into the target at the same
+offset and zero the `unplugged` ranges: merged into an existing full memory
+file, the result is identical to what Firecracker would have written. For a
+**full** copy, copy every page outside `unplugged` (the bitmap is not needed),
+and zero `unplugged`. Issue the request in both cases: it is what resets the
+dirty tracking, so that the next diff is relative to this copy. Like writing a
+memory file, the request consumes the dirty tracking state; the virtqueue pages
+of every activated device are marked dirty again afterwards, as today, so that
+they are part of the next set.
 
-The bitmap is at most 32 KiB per GiB of guest memory (43 KiB as base64).
+### Errors
 
-Like writing a memory file, this consumes the dirty tracking state: the pages
-returned are no longer considered dirty. The virtqueue pages of every activated
-device are marked dirty again afterwards, as today, so that they are part of the
-next diff.
-
-### `PUT /snapshot/dirty-pages`: pre-copy
+A request Firecracker cannot serve (for example while the dirty log cannot be
+read) is answered with
 
 ```json
-{}
+{ "error": "<message>" }
 ```
 
-Returns `200 OK` with the same `memory` object as the `/snapshot/create` API
-(without `snapshot_type`): the pages dirtied since the last snapshot or the last
-call, and resets the tracking. It can be issued while the microVM is `Running`
-or `Paused`, and is rejected with 400 when no memory backend is attached,
-because then nobody but Firecracker could turn the consumed dirty set into
-bytes.
+and no payload; nothing was consumed. So is a request it does not understand
+(unknown request or unknown fields). A frame that breaks the framing rules
+(`json_len` above 64 KiB, `blob_len` other than 0 in a request, or a JSON part
+that is not JSON) cannot be resynchronised: Firecracker closes the connection
+and logs it. The microVM keeps running and `PUT /snapshot/create` keeps writing
+vmstate, but nobody can produce memory snapshots for it any more; there is no
+reconnection.
 
-Before resetting the bitmaps, Firecracker returns to the guest any virtio-net RX
-buffers it has parsed but not yet filled (they are marked dirty when parsed, not
-when written), so that the later write cannot go unnoticed.
+If the connection drops while Firecracker is writing a reply, the dirty set in
+it is gone: the backend's next copy must be a full one.
 
-In case of a running guest, the returned pages might be modified after this API
-returns. In that case, it's guaranteed they will be returned on the next call of
-`/snapshot/dirty-pages` or `/snapshot/create`.
+### Serving page faults while waiting
+
+The backend waits on Firecracker for the reply. A backend that also serves page
+faults must keep doing so while it waits: Firecracker's handling of the request
+does not read or write guest memory today, but a backend that blocks on the
+reply stalls every vCPU that faults meanwhile, and would deadlock with any
+future Firecracker path that did touch a page. The example handler sends the
+request from its poll loop and reads the reply incrementally, between faults.
 
 ## Consistency
 
 In order to produce a consistent snapshot, the backend needs to adhere to some
 simple rules. These rules cannot be enforced by Firecracker.
 
-- The pages returned by the `/snapshot/dirty-pages` and `/snapshot/create` APIs
-  must be eventually copied into the snapshot
-- The `unplugged` ranges returned by `/snapshot/create` must be zero in the
-  resulting memory file
-- If a response is lost (e.g. connection dropped before the body was read), that
-  dirty information is gone and the next snapshot must be a `Full` snapshot
-- After the final `/snapshot/create`, the VM must not be resumed until the
-  backend has copied every set page out of the memfd.
+- The pages returned by every `DirtyPages` request must eventually be copied
+  into the snapshot.
+- The `unplugged` ranges returned must be zero in the resulting memory file.
+- The dirty set that belongs to a snapshot is the reply to a request sent
+  **after `PUT /snapshot/create` has returned and before the microVM is
+  resumed**. A request sent while the microVM is `Running` is a pre-copy pass: a
+  page it reports may be written again before it is copied, and will then be in
+  the next set. A request sent after `Pause` but before `snapshot/create` is
+  legal but not final either: `snapshot/create` itself may still write guest
+  memory (it drains in-flight block I/O), and it marks what it wrote dirty, so a
+  further request after it is what completes the snapshot.
+- If the connection drops while a reply is being written, that dirty information
+  is gone and the next copy must be a full one.
+- After the final request, the VM must not be resumed until the backend has
+  copied every set page out of the memfd.
 
 As an example, without pre-copy, the snapshot process would be something like:
 
-1. Pause the VM
-1. Call `/snapshot/create`
-1. Copy the set pages into a new file
-1. VM can be resumed here
+1. Orchestrator: pause the VM
+1. Orchestrator: call `/snapshot/create`
+1. Orchestrator: tell the backend to copy
+1. Backend: send `DirtyPages`, copy the set pages (or all plugged pages) into a
+   new file, zero the unplugged ranges
+1. Orchestrator: VM can be resumed here
 
 For a backend that implements pre-copy:
 
-1. Call `/snapshot/dirty-pages`
-1. Copy the set pages into a file
-1. Zero unplugged ranges
+1. Backend: send `DirtyPages`
+1. Backend: copy the set pages into a file
+1. Backend: zero unplugged ranges
 1. Repeat from step 1 until the dirty set is small enough or after a timeout or
    iterations limit
-1. Pause the VM
-1. Call `/snapshot/create`
-1. Final copy of the set pages into a file
-1. Final zero-ing of unplugged ranges
-1. VM can be resumed here
+1. Orchestrator: pause the VM
+1. Orchestrator: call `/snapshot/create`
+1. Orchestrator: tell the backend to take the final pass
+1. Backend: send `DirtyPages`, final copy of the set pages into the file, final
+   zeroing of unplugged ranges
+1. Orchestrator: VM can be resumed here
 
 Note: this algorithm doesn't make sense without dirty tracking. With mincore,
-the dirty set doesn't decrease between API calls.
+the dirty set doesn't decrease between requests.
 
 ### What the backend should copy
 
-The `pages` Firecracker returns say *which* pages to copy. They do not say
+The bitmap Firecracker returns says *which* pages to copy. It does not say
 *where from*, and after a restore that is not always the memfd. The rule is: the
 copy must contain what a read through Firecracker's mapping would return at that
 moment.

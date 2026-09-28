@@ -1069,6 +1069,10 @@
                 "comment": "Rust std uses it to write to unix socket"
             },
             {
+                "syscall": "poll",
+                "comment": "Used to wait for the memory backend connection to become writable when a reply does not fit the socket buffer"
+            },
+            {
                 "syscall": "tkill",
                 "comment": "tkill is used by libc::abort during a panic to raise SIGABRT",
                 "args": [

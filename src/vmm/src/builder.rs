@@ -6,6 +6,7 @@
 use std::fmt::Debug;
 use std::io;
 use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixStream;
 #[cfg(feature = "gdb")]
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -205,8 +206,9 @@ pub fn build_microvm_for_boot(
 
     // Hand guest memory to the memory backend, if one is configured. All regions are mapped and
     // registered with KVM at this point and no vCPU is running yet. The handshake is the UFFD
-    // one, with the memfd as its only fd: there is nothing to populate on a fresh boot.
-    let mem_backend_attached = if let Some(mem_backend) = &vm_resources.machine_config.mem_backend {
+    // one, with the memfd as its only fd: there is nothing to populate on a fresh boot. The
+    // connection is kept: the backend requests dirty pages on it.
+    let mem_backend_stream = if let Some(mem_backend) = &vm_resources.machine_config.mem_backend {
         let backing = memfd_backing
             .as_ref()
             .expect("memory is memfd-backed when a memory backend is configured");
@@ -218,11 +220,11 @@ pub fn build_microvm_for_boot(
             &mem_backend.backend_path,
             &mappings,
             &[backing.file.as_raw_fd()],
+            true,
         )
-        .map_err(StartMicrovmError::MemBackend)?;
-        true
+        .map_err(StartMicrovmError::MemBackend)?
     } else {
-        false
+        None
     };
 
     let kvm_vm = Arc::new(vm);
@@ -354,7 +356,8 @@ pub fn build_microvm_for_boot(
         shutdown_exit_code: None,
         vm,
         device_manager,
-        mem_backend_attached,
+        mem_backend_attached: mem_backend_stream.is_some(),
+        mem_backend_stream,
     };
     let vmm = Arc::new(Mutex::new(vmm));
 
@@ -458,7 +461,7 @@ pub fn build_microvm_from_snapshot(
     microvm_state: MicrovmState,
     guest_memory: Vec<GuestRegionMmap>,
     uffd: Option<Uffd>,
-    mem_backend_attached: bool,
+    mem_backend_stream: Option<UnixStream>,
     seccomp_filters: &BpfThreadMap,
     vm_resources: &mut VmResources,
     clock_realtime: bool,
@@ -546,7 +549,8 @@ pub fn build_microvm_from_snapshot(
         shutdown_exit_code: None,
         vm,
         device_manager,
-        mem_backend_attached,
+        mem_backend_attached: mem_backend_stream.is_some(),
+        mem_backend_stream,
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -886,6 +890,7 @@ pub(crate) mod tests {
             vm: Vm::Kvm(Arc::new(vm)),
             device_manager: default_device_manager(),
             mem_backend_attached: false,
+            mem_backend_stream: None,
         }
     }
 
@@ -905,6 +910,7 @@ pub(crate) mod tests {
             vm: Vm::Kvm(vm),
             device_manager,
             mem_backend_attached: false,
+            mem_backend_stream: None,
         }
     }
 

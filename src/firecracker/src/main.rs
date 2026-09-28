@@ -626,6 +626,10 @@ enum RunWithoutApiError {
     MissingSeccompFilter,
     /// Failed to install vmm seccomp filter: {0}
     SeccompFilter(vmm::seccomp::InstallationError),
+    /// A memory backend (`machine-config.mem_backend`) requires the API server: its connection is
+    /// serviced by the API thread, and without an API there is no way to pause the microVM or
+    /// write a snapshot for it to copy.
+    MemBackendRequiresApi,
 }
 
 fn run_without_api(
@@ -643,12 +647,25 @@ fn run_without_api(
     let firecracker_metrics = Arc::new(Mutex::new(metrics::PeriodicMetrics::new()));
     event_manager.add_subscriber(firecracker_metrics.clone());
 
+    // Safe to unwrap since '--no-api' requires this to be set.
+    let config_json = config_json.unwrap();
+
+    // Reject a memory backend before anything is built: nothing would service its connection.
+    // (Configuration errors proper are reported by `build_microvm_from_json` below.)
+    if let Ok(config) = serde_json::from_str::<vmm::resources::VmmConfig>(&config_json)
+        && config
+            .machine_config
+            .as_ref()
+            .is_some_and(|machine_config| machine_config.mem_backend.is_some())
+    {
+        return Err(RunWithoutApiError::MemBackendRequiresApi);
+    }
+
     // Build the microVm. We can ignore VmResources since it's not used without api.
     let vmm = build_microvm_from_json(
         seccomp_filters,
         &mut event_manager,
-        // Safe to unwrap since '--no-api' requires this to be set.
-        config_json.unwrap(),
+        config_json,
         instance_info,
         bool_timer_enabled,
         pci_enabled,

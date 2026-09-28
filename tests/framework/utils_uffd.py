@@ -116,16 +116,24 @@ class UffdHandler:
                 raw += chunk
         return json.loads(raw)
 
-    def copy(self, memory: dict, mem_path: str):
-        """Ask the handler to write the `memory` object returned by Firecracker
-        (`PUT /snapshot/create` or `PUT /snapshot/dirty-pages`) into `mem_path`,
-        a path inside the handler's chroot. Creates the file at `total_size` or
-        merges into an existing one.
+    def copy(self, mem_path: str, *, full: bool) -> dict:
+        """Ask the handler to request the dirty pages from Firecracker (on its
+        handshake connection) and write them into `mem_path`, a path inside the
+        handler's chroot: every plugged page for `full`, the dirty pages
+        otherwise. Creates the file at `total_size` or merges into an existing
+        one. Either way Firecracker's dirty tracking state is consumed.
+
+        Returns the handler's `Done` reply; `set_pages` in it is the number of
+        pages Firecracker reported dirty.
         """
-        reply = self.control({"Copy": {"mem_path": mem_path, "memory": memory}})
+        reply = self.control({"Copy": {"mem_path": mem_path, "full": full}})
         done = reply["Done"]
         assert done["success"], f"memory backend copy failed: {done['message']}"
         return done
+
+    def try_copy(self, mem_path: str, *, full: bool) -> dict:
+        """Like `copy`, but returns the `Done` reply without asserting success."""
+        return self.control({"Copy": {"mem_path": mem_path, "full": full}})["Done"]
 
     def kill(self):
         """Kills the uffd handler process"""

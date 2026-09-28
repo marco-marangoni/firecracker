@@ -227,9 +227,9 @@ class Microvm:
         self.initrd_file = None
         self.boot_args = None
         self.uffd_handler = None
-        # The `memory` object of the last `PUT /snapshot/create` /
-        # `PUT /snapshot/dirty-pages` response, when a memory backend is attached.
-        self.last_snapshot_memory = None
+        # The memory backend's `Done` reply to the last copy it made for us (a
+        # snapshot or a pre-copy pass), when a memory backend is attached.
+        self.last_backend_copy = None
 
         self.fc_binary_path = Path(fc_binary_path)
         assert fc_binary_path.exists()
@@ -1011,18 +1011,22 @@ class Microvm:
             "backend_path": str(self.uffd_handler.socket_path),
         }
 
-    def dirty_pages(self, *, copy_to: str = None) -> dict:
-        """`PUT /snapshot/dirty-pages`: fetch (and consume) the pages dirtied since the
-        last snapshot or the last call, for a pre-copy pass. Requires a memory backend.
-
-        With `copy_to`, also asks the backend to copy those pages into that file
-        (chroot-relative path), as an orchestrator would.
+    def backend_copy(self, mem_path: str, *, full: bool) -> dict:
+        """Have the memory backend ask Firecracker for the dirty pages (over its
+        own connection) and copy them into `mem_path` (chroot-relative): a full
+        copy of all plugged pages, or the dirty pages only. Consumes the dirty
+        tracking state. Returns the backend's `Done` reply.
         """
-        memory = self.api.snapshot_dirty_pages.put().json()["memory"]
-        self.last_snapshot_memory = memory
-        if copy_to is not None:
-            self.mem_backend.copy(memory, str(Path("/") / copy_to))
-        return memory
+        done = self.mem_backend.copy(str(Path("/") / mem_path), full=full)
+        self.last_backend_copy = done
+        return done
+
+    def precopy_pass(self, mem_path: str) -> dict:
+        """One pre-copy pass: the backend fetches and copies the pages dirtied
+        since the last copy into `mem_path`. Can run while the guest is running.
+        Requires a memory backend.
+        """
+        return self.backend_copy(mem_path, full=False)
 
     def pause(self):
         """Pauses the microVM"""
@@ -1062,19 +1066,17 @@ class Microvm:
                 sync_snapshot_files=sync_snapshot_files,
             )
         else:
-            # With a memory backend attached Firecracker does not write guest memory;
-            # it tells us which pages of the shared memfd make up the snapshot, and
-            # we (the orchestrator) have the backend copy them. The VM stays paused,
-            # so the copy can happen at any time before the resume.
-            response = self.api.snapshot_create.put(
+            # With a memory backend attached Firecracker writes the vmstate only.
+            # We (the orchestrator) then tell the backend to copy: it asks
+            # Firecracker for the dirty pages on its own connection and writes
+            # them out. The VM stays paused, so this can happen at any time
+            # before the resume, and the set it gets is the snapshot's.
+            self.api.snapshot_create.put(
                 snapshot_path=str(vmstate_path),
                 snapshot_type=snapshot_type.api_type,
                 sync_snapshot_files=sync_snapshot_files,
             )
-            body = response.json()
-            assert body["snapshot_type"] == snapshot_type.api_type
-            self.last_snapshot_memory = body["memory"]
-            self.mem_backend.copy(body["memory"], str(Path("/") / mem_path))
+            self.backend_copy(mem_path, full=snapshot_type == SnapshotType.FULL)
         root = Path(self.chroot())
         return Snapshot(
             vmstate=root / vmstate_path,
