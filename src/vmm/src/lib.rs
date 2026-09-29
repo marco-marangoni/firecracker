@@ -518,7 +518,10 @@ impl Vmm {
         self.device_manager.commit_dirty();
 
         kvm_vm
-            .snapshot_memory_layout(SnapshotType::Diff)
+            .snapshot_memory_layout(
+                SnapshotType::Diff,
+                self.machine_config.huge_pages.page_size(),
+            )
             .map_err(|err| VmmError::DirtyPages(err.to_string()))
     }
 

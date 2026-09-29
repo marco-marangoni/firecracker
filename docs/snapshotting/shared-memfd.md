@@ -215,15 +215,17 @@ of the snapshot:
         "offset": 786432,
         "len": 262144
       }
-    ]
+    ],
+    "populated_page_size": 4096,
+    "populated": "//////////8AAAAAAAAAAP//////////"
   }
 }
 ```
 
 The example is a 1 MiB guest (256 pages) whose last 256 KiB is an unplugged
-virtio-mem slot. The bitmap covers the 192 plugged pages and decodes to 24
+virtio-mem slot. Both bitmaps cover the 192 plugged pages and decode to 24
 bytes. Bit `b` of byte `i` is page `8 * i + b`, so in the usual binary notation
-the lowest page of a byte is its rightmost bit:
+the lowest page of a byte is its rightmost bit. For `pages`:
 
 ```text
 index  pages    hex   binary    dirty pages
@@ -255,7 +257,12 @@ index  pages    hex   binary    dirty pages
 
 Pages 0–1, 9–12, 40, 58–67, 100, 130–131, 157 and 170–180 are to be copied.
 Pages 192–255 are unplugged and not covered by the bitmap; `unplugged` says to
-zero them. A 1 GiB guest with all its memory plugged has a 32 KiB bitmap.
+zero them. `populated` decodes to eight `0xff` bytes, eight `0x00` bytes and
+eight `0xff` bytes: pages 64–127 are not resident (the guest released them
+through the balloon, say), so the dirty pages among them (64–67 and 100) read as
+zeros and can be zeroed in the target instead of read. A 1 GiB guest with all
+its memory plugged has a 32 KiB `pages` bitmap and, with 4 KiB pages, a 32 KiB
+`populated` bitmap; with 2 MiB pages `populated` is 64 bytes.
 
 - `total_size` is the size of a full memory file (the sum of all region sizes,
   including the hotplug region). Create the target file at this size.
@@ -281,12 +288,35 @@ zero them. A 1 GiB guest with all its memory plugged has a 32 KiB bitmap.
   page-aligned, non-overlapping `{offset, len}` pairs. Empty without virtio-mem.
   **Every byte of these ranges must be zero in the snapshot produced by the
   backend.**
+- `populated_page_size` is the granularity of `populated`, in bytes: the backing
+  page size of guest memory, 4096 or 2097152 (2 MiB) with hugetlbfs.
+- `populated` is a bitmap with one bit per `populated_page_size` bytes, same
+  layout and same extent as `pages`. A set bit means the backing page is
+  resident in Firecracker's mapping of guest memory, as reported by
+  `mincore(2)`: a read through that mapping returns the page's content. A clear
+  bit means such a read returns zeros: the page was never touched, or was
+  released by the balloon or by free page reporting (Firecracker punches a hole
+  in the memfd), or its virtio-mem slot was unplugged. Bits of unplugged slots
+  are clear. The bitmap is present for `Full` as well and consumes nothing; it
+  describes the moment the response was computed. Two things it cannot know: a
+  page another process wrote through a mapping of its own that Firecracker has
+  not touched since shows as clear on hugetlbfs (`mincore` reports Firecracker's
+  page tables there; on tmpfs it reports the page cache, so this does not
+  apply), and a page swapped out shows as clear on tmpfs (host swap must be off,
+  as for `mincore`-based diffs). A backend knows what it wrote itself; pages it
+  populated through `UFFDIO_COPY` are resident in Firecracker's mapping and show
+  as set.
 
 Copying every set page, followed by zeroing the `unplugged` range, yields a file
 identical to what Firecracker would have written. Merging a `Diff` into an
-existing full memory file is the same operation applied to that file.
+existing full memory file is the same operation applied to that file. Where a
+set page's bit in `populated` is clear and the memfd is the page's source (see
+below), the backend can zero the page in the target instead of reading it: on
+hugetlbfs that saves a 2 MiB `read()` of zeros per released huge page, which is
+what makes copying after a balloon inflation cheap.
 
-The bitmap is at most 32 KiB per GiB of guest memory (43 KiB as base64).
+The `pages` bitmap is at most 32 KiB per GiB of guest memory (43 KiB as base64);
+`populated` is the same with 4 KiB pages and 512 times smaller with 2 MiB pages.
 
 Like writing a memory file, this consumes the dirty tracking state: the pages
 returned are no longer considered dirty. The virtqueue pages of every activated
@@ -359,9 +389,12 @@ copy must contain what a read through Firecracker's mapping would return at that
 moment.
 
 For a backend attached at **boot** the answer is simple: all pages can be read
-from the memfd. Pages the guest never touched are holes and read as zero;
-`copy_file_range` copies nothing for them, so the target file must start out
-zeroed (a freshly created file at `total_size` is).
+from the memfd. Pages the guest never touched, or that it released, are holes
+and read as zero; `populated` tells which, so the backend can zero them in the
+target (or leave a fresh target's zeros in place) rather than read them. On
+tmpfs `copy_file_range` copies nothing for a hole anyway; on hugetlbfs it is not
+available and a hole costs a full `read()`, so `populated` is what avoids the
+cost.
 
 For a backend attached at **restore**, the decision process is slightly more
 complex, as it involves keeping track of whether each page is UFFD registered
@@ -373,6 +406,13 @@ Note: this condition is rare, but possible to exist even in case of diff
 snapshots. For example, virtIO queues might be marked as dirty before any data
 is written to them, so they might be in a dirty, uffd-register, and unpopulated
 state.
+
+`populated` does not change that rule; it refines the memfd case. The decision
+per page, in order, is: uffd-registered and never populated by the backend →
+snapshot file; otherwise `populated` clear → zero; otherwise → memfd. A page the
+backend never populated is never resident in Firecracker's mapping, so
+`populated` alone would misclassify it as zero; the backend's own record has to
+come first. The example handler implements exactly this order.
 
 For both **boot** and **resume**, `unplugged` ranges must end up zero in the
 target.

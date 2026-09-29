@@ -90,6 +90,31 @@ def decode_pages(memory):
     return base64.b64decode(memory["pages"], validate=True)
 
 
+def decode_populated(memory):
+    """The `populated` bitmap of a `memory` object as bytes."""
+    return base64.b64decode(memory["populated"], validate=True)
+
+
+def page_populated(memory, offset):
+    """Whether the backing page at `offset` is reported resident."""
+    bitmap = decode_populated(memory)
+    page = offset // memory["populated_page_size"]
+    return page // 8 < len(bitmap) and bool(bitmap[page // 8] & (1 << (page % 8)))
+
+
+def populated_bytes(memory):
+    """Total bytes reported resident."""
+    return (
+        sum(byte.bit_count() for byte in decode_populated(memory))
+        * memory["populated_page_size"]
+    )
+
+
+def zeroed_bytes(vm):
+    """Bytes the backend zeroed instead of reading, in its last copy for `vm`."""
+    return vm.last_backend_copy["zeroed_bytes"]
+
+
 def plugged_end(memory):
     """End offset of the last plugged slot: the file minus a trailing unplugged range."""
     unplugged = memory["unplugged"]
@@ -140,6 +165,17 @@ def check_layout(memory, total_size):
             assert not page_set(memory, page)
         for rng in unplugged:
             assert set_bytes_in(memory, rng["offset"], rng["len"]) == 0
+    # `populated`: backing-page granularity, same extent, nothing in unplugged slots.
+    backing = memory["populated_page_size"]
+    assert backing in (PAGE_SIZE, 2 * 2**20)
+    populated = decode_populated(memory)
+    covered = -(-plugged_end(memory) // backing)
+    assert len(populated) == -(-covered // 8)
+    for page in range(covered, len(populated) * 8):
+        assert not page_populated(memory, page * backing)
+    for rng in unplugged:
+        for offset in range(rng["offset"], rng["offset"] + rng["len"], backing):
+            assert not page_populated(memory, offset)
 
 
 def covered_bytes(ranges):
@@ -203,6 +239,12 @@ def test_boot_full_snapshot_restores(uvm, microvm_factory, huge_pages):
     assert not memory["unplugged"]
     assert set_bytes(memory) == MEM_SIZE_MIB * 2**20
     assert snapshot.mem.stat().st_size == MEM_SIZE_MIB * 2**20
+    # A freshly booted guest has touched some, but not all, of its memory. What it has not
+    # touched is not resident, and the backend zeroed it instead of reading it: the two
+    # complement each other exactly (the memfd is authoritative for every page at boot).
+    populated = populated_bytes(memory)
+    assert 32 * 2**20 <= populated < MEM_SIZE_MIB * 2**20, populated
+    assert zeroed_bytes(vm) == MEM_SIZE_MIB * 2**20 - populated
     vm.kill()
 
     restored = microvm_factory.build_from_snapshot(
@@ -632,21 +674,35 @@ def inflate_balloon(vm, amount_mib):
     wait_for_balloon_actual(vm, amount_mib, timeout_s=30)
 
 
-def check_diff_identity_across_inflate(vm, base, amount_mib):
+def check_diff_identity_across_inflate(vm, base, amount_mib, min_zeroed_mib):
     """Inflate the balloon (guest is running), then take a `Diff` and a `Full`
     and check that rebasing the diff onto `base` yields the full copy.
 
     Balloon inflation punches holes into the shared memfd. Those pages must be
     part of the diff (Firecracker marks discarded ranges dirty), and their
     content in both copies must be zero; a missing or stale page shows up as a
-    mismatch.
+    mismatch. Firecracker also reports them as not populated, and the backend
+    zeroes them in the target instead of reading them: at least
+    `min_zeroed_mib` worth. The backend may only do so for pages the memfd is
+    authoritative for; after a restore, a released page the handler never
+    populated is still served from the snapshot file (Firecracker never faulted
+    it in either, so it is not resident) and is copied, not zeroed. With 2M
+    pages after a restore that is nearly all of them: the balloon frees 4K
+    pages, so few huge pages get punched entirely, and the handler only learns
+    about those through `remove` events.
     """
     inflate_balloon(vm, amount_mib)
     diff = vm.snapshot_diff(mem_path="mem_diff")
     diff_memory = vm.last_snapshot_memory
     check_layout(diff_memory, MEM_SIZE_MIB * 2**20)
     assert set_bytes(diff_memory) >= amount_mib * 2**20
+    zeroed = zeroed_bytes(vm)
+    assert zeroed >= min_zeroed_mib * 2**20, zeroed
+    # Every zeroed page was a dirty, unpopulated one.
+    assert zeroed <= set_bytes(diff_memory)
+    assert zeroed <= MEM_SIZE_MIB * 2**20 - populated_bytes(diff_memory)
     full = vm.snapshot_full(mem_path="mem_full", vmstate_path="vmstate_full")
+    assert zeroed_bytes(vm) >= min_zeroed_mib * 2**20
     rebased = diff.rebase_snapshot(base)
     assert filecmp.cmp(rebased.mem, full.mem, shallow=False)
 
@@ -663,7 +719,9 @@ def test_balloon_inflate_at_boot(uvm):
     base = vm.snapshot_full(mem_path="mem_base")
     vm.resume()
 
-    check_diff_identity_across_inflate(vm, base, amount_mib=128)
+    # 128 MiB of a 256 MiB guest with 64 MiB dirtied: most of the released memory is
+    # 4K pages, all of which are punched out.
+    check_diff_identity_across_inflate(vm, base, amount_mib=128, min_zeroed_mib=96)
 
     # The guest keeps working, and can get its memory back.
     vm.resume()
@@ -742,7 +800,12 @@ def test_balloon_inflate_after_restore(uvm, microvm_factory, huge_pages):
     restored_base = vm.snapshot_full(mem_path="mem_base")
     vm.resume()
 
-    check_diff_identity_across_inflate(vm, restored_base, amount_mib=128)
+    check_diff_identity_across_inflate(
+        vm,
+        restored_base,
+        amount_mib=128,
+        min_zeroed_mib=0 if huge_pages == HugePagesConfig.HUGETLBFS_2MB else 64,
+    )
 
     # Deflate, reuse the memory, and make sure the result restores.
     vm.resume()

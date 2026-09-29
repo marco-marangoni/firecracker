@@ -233,8 +233,10 @@ class Microvm:
         self.boot_args = None
         self.uffd_handler = None
         # The `memory` object of the last `PUT /snapshot/create` /
-        # `PUT /snapshot/dirty-pages` response, when a memory backend is attached.
+        # `PUT /snapshot/dirty-pages` response, when a memory backend is attached,
+        # and the backend's `Done` reply to the copy the framework asked for.
         self.last_snapshot_memory = None
+        self.last_backend_copy = None
 
         self.fc_binary_path = Path(fc_binary_path)
         assert fc_binary_path.exists()
@@ -1040,7 +1042,9 @@ class Microvm:
         memory = self.api.snapshot_dirty_pages.put().json()["memory"]
         self.last_snapshot_memory = memory
         if copy_to is not None:
-            self.mem_backend.copy(memory, str(Path("/") / copy_to))
+            self.last_backend_copy = self.mem_backend.copy(
+                memory, str(Path("/") / copy_to)
+            )
         return memory
 
     def pause(self):
@@ -1093,7 +1097,9 @@ class Microvm:
             body = response.json()
             assert body["snapshot_type"] == snapshot_type.api_type
             self.last_snapshot_memory = body["memory"]
-            self.mem_backend.copy(body["memory"], str(Path("/") / mem_path))
+            self.last_backend_copy = self.mem_backend.copy(
+                body["memory"], str(Path("/") / mem_path)
+            )
         root = Path(self.chroot())
         return Snapshot(
             vmstate=root / vmstate_path,
