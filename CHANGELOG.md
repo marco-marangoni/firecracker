@@ -23,7 +23,11 @@ and this project adheres to
   `mem_file_path` and answers `200 OK` with a bitmap of the pages that make up
   the snapshot, and the new `PUT /snapshot/dirty-pages` endpoint returns (and
   resets) the pages dirtied since the last snapshot for pre-copy while the guest
-  runs. See [memory backend](docs/snapshotting/shared-memfd.md).
+  runs. Both also report which backing pages are resident in Firecracker's
+  mapping (`populated`, from `mincore(2)`), so that a backend can zero released
+  or never-touched pages instead of reading them, which matters on hugetlbfs
+  where a hole costs a full 2 MiB read. See
+  [memory backend](docs/snapshotting/shared-memfd.md).
 
 ### Changed
 

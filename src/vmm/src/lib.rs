@@ -517,7 +517,10 @@ impl Vmm {
         self.device_manager.prepare_dirty_tracking_reset();
 
         let layout = kvm_vm
-            .snapshot_memory_layout(SnapshotType::Diff)
+            .snapshot_memory_layout(
+                SnapshotType::Diff,
+                self.machine_config.huge_pages.page_size(),
+            )
             .map_err(|err| VmmError::DirtyPages(err.to_string()))?;
 
         // Queue pages are not tracked at runtime; mark them so the next set includes them, as

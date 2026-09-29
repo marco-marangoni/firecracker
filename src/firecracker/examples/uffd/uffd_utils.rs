@@ -76,18 +76,69 @@ pub struct SnapshotMemoryLayout {
     pub pages: Option<String>,
     /// Bytes to zero in the memory file (unplugged virtio-mem slots).
     pub unplugged: Vec<MemoryRange>,
+    /// Granularity of `populated`, in bytes: the backing page size (4096 or 2 MiB).
+    #[serde(default)]
+    pub populated_page_size: u64,
+    /// Standard base64 of a bitmap with one bit per `populated_page_size` bytes, same layout and
+    /// extent as `pages`: set when the backing page is resident in Firecracker's mapping. A
+    /// clear bit on a page the memfd is authoritative for means the page reads as zero (a hole),
+    /// so it can be zeroed in the target without reading the memfd. Absent (empty) when talking
+    /// to a Firecracker that does not report it; every page is then taken as populated.
+    #[serde(default)]
+    pub populated: Option<String>,
+}
+
+/// Which pages of the memfd Firecracker reports resident, decoded from
+/// [`SnapshotMemoryLayout::populated`].
+#[derive(Debug, Clone)]
+pub struct Populated {
+    page_size: u64,
+    bitmap: Option<Vec<u8>>,
+}
+
+impl Populated {
+    /// Whether the backing page at memfd `offset` is populated. Without a bitmap, everything is.
+    pub fn contains(&self, offset: u64) -> bool {
+        let Some(bitmap) = &self.bitmap else {
+            return true;
+        };
+        let page = offset / self.page_size;
+        bitmap
+            .get((page / 8) as usize)
+            .is_some_and(|b| b & (1 << (page % 8)) != 0)
+    }
 }
 
 impl SnapshotMemoryLayout {
     /// Decodes `pages`, if present. Firecracker emits standard, padded base64 (RFC 4648 §4).
     pub fn decode_pages(&self) -> Result<Option<Vec<u8>>, std::io::Error> {
-        self.pages
-            .as_ref()
-            .map(|pages| {
-                base64_decode(pages.as_bytes()).ok_or_else(|| {
+        Self::decode_field(self.pages.as_ref(), "pages")
+    }
+
+    /// Decodes `populated`.
+    pub fn decode_populated(&self) -> Result<Populated, std::io::Error> {
+        let bitmap = Self::decode_field(self.populated.as_ref(), "populated")?;
+        if bitmap.is_some()
+            && (self.populated_page_size == 0 || !self.populated_page_size.is_multiple_of(4096))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid `populated_page_size` {}", self.populated_page_size),
+            ));
+        }
+        Ok(Populated {
+            page_size: self.populated_page_size.max(1),
+            bitmap,
+        })
+    }
+
+    fn decode_field(field: Option<&String>, name: &str) -> Result<Option<Vec<u8>>, std::io::Error> {
+        field
+            .map(|value| {
+                base64_decode(value.as_bytes()).ok_or_else(|| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        "invalid base64 in `pages`",
+                        format!("invalid base64 in `{name}`"),
                     )
                 })
             })
@@ -222,7 +273,13 @@ pub enum ControlRequest {
 /// Reply to a [`ControlRequest`].
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ControlResponse {
-    Done { success: bool, message: String },
+    Done {
+        success: bool,
+        message: String,
+        /// Bytes of set pages zeroed in the target without reading guest memory, because
+        /// Firecracker reported them not populated. Lets an orchestrator observe the saving.
+        zeroed_bytes: u64,
+    },
 }
 
 /// One handshake message from Firecracker: the region mappings plus the fds that came with
@@ -538,29 +595,60 @@ pub struct MemorySource<'a> {
     pub backing: Option<(&'a File, &'a [&'a PopulatedPages])>,
 }
 
+/// Where the bytes of one page come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageSource {
+    /// The page was never populated by this handler and is still uffd-registered: the guest sees
+    /// the snapshot file's content.
+    SnapshotFile,
+    /// The memfd holds the page.
+    Memfd,
+    /// The memfd is authoritative but Firecracker reports the page not resident: it reads as
+    /// zeros, so zero the target instead of reading.
+    Zero,
+}
+
 impl MemorySource<'_> {
-    /// Whether the page at memfd `offset` has to be read from the memfd (`true`) or from the
-    /// snapshot file (`false`).
-    fn in_memfd(&self, offset: u64) -> bool {
-        match self.backing {
+    /// Where the page at memfd `offset` has to be read from.
+    fn source_of(&self, offset: u64, populated: &Populated) -> PageSource {
+        let memfd_authoritative = match self.backing {
             None => true,
-            Some((_, populated)) => populated.iter().any(|p| p.contains(offset)),
+            Some((_, mine)) => mine.iter().any(|p| p.contains(offset)),
+        };
+        if !memfd_authoritative {
+            PageSource::SnapshotFile
+        } else if populated.contains(offset) {
+            PageSource::Memfd
+        } else {
+            PageSource::Zero
         }
     }
+}
+
+/// What [`copy_pages`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CopyStats {
+    /// Runs copied from the memfd or the snapshot file.
+    pub copies: usize,
+    /// Runs zeroed instead of read because Firecracker reported them not populated.
+    pub zeroed: usize,
+    /// Bytes zeroed that way.
+    pub zeroed_bytes: u64,
 }
 
 /// Copies the set pages of `layout.pages` from `memfd` into the file at `mem_path` at the same
 /// offsets and zeroes `layout.unplugged` there. The file is created at `layout.total_size` if it
 /// does not exist; an existing file (a full snapshot a diff is merged into) is left at its size.
+/// Set pages that the memfd is authoritative for but that Firecracker reports not populated
+/// (`layout.populated`) are zeroed in the target without being read.
 ///
 /// This is what turns the `memory` object of a `PUT /snapshot/create` response into a memory
-/// file byte-for-byte identical to the one Firecracker would have written. Returns the number of
-/// copy operations performed.
+/// file byte-for-byte identical to the one Firecracker would have written.
 pub fn copy_pages(
     source: MemorySource<'_>,
     mem_path: &Path,
     layout: &SnapshotMemoryLayout,
-) -> Result<usize, std::io::Error> {
+) -> Result<CopyStats, std::io::Error> {
     let target = OpenOptions::new()
         .read(true)
         .write(true)
@@ -571,18 +659,19 @@ pub fn copy_pages(
         target.set_len(layout.total_size)?;
     }
 
-    let mut copies = 0;
+    let populated = layout.decode_populated()?;
+    let mut stats = CopyStats::default();
     for range in layout.set_runs()? {
-        // Split the run into pieces that come from the same file. `pages` is host-page (4 KiB)
+        // Split the run into pieces that come from the same source. `pages` is host-page (4 KiB)
         // granular even when the backing page is larger, so walk backing page *boundaries* rather
         // than stepping `page_size` from the run start.
         let page_size = source.page_size as u64;
         let end = range.offset + range.len;
         let mut start = range.offset;
         while start < end {
-            let from_memfd = source.in_memfd(start);
+            let src = source.source_of(start, &populated);
             let mut run_end = (start / page_size + 1) * page_size;
-            while run_end < end && source.in_memfd(run_end) == from_memfd {
+            while run_end < end && source.source_of(run_end, &populated) == src {
                 run_end += page_size;
             }
             let run_end = run_end.min(end);
@@ -590,13 +679,18 @@ pub fn copy_pages(
                 offset: start,
                 len: run_end - start,
             };
-            let src = if from_memfd {
-                source.memfd
-            } else {
-                source.backing.unwrap().0
-            };
-            copy_range(src, &target, &run)?;
-            copies += 1;
+            match src {
+                PageSource::Memfd => copy_range(source.memfd, &target, &run)?,
+                PageSource::SnapshotFile => copy_range(source.backing.unwrap().0, &target, &run)?,
+                PageSource::Zero => {
+                    write_zeros(&target, &run)?;
+                    stats.zeroed += 1;
+                    stats.zeroed_bytes += run.len;
+                    start = run_end;
+                    continue;
+                }
+            }
+            stats.copies += 1;
             start = run_end;
         }
     }
@@ -605,7 +699,7 @@ pub fn copy_pages(
     for range in &layout.unplugged {
         zero_range(&target, range)?;
     }
-    Ok(copies)
+    Ok(stats)
 }
 
 /// `copy_file_range` from `src` to `dst` at the same offset, falling back to a read/write loop
@@ -683,6 +777,14 @@ fn zero_range(file: &File, range: &MemoryRange) -> Result<(), std::io::Error> {
     if ret == 0 {
         return Ok(());
     }
+    write_zeros(file, range)
+}
+
+/// Writes zeros over `range` in `file`. Unlike [`zero_range`] this never punches a hole: in a
+/// diff file a hole means "page not in the diff" to `rebase-snap`, whereas a released page that
+/// now reads as zero *is* in the diff and must be applied over the base's old bytes, exactly as
+/// Firecracker's own `dump_dirty` writes explicit zeros for it.
+fn write_zeros(file: &File, range: &MemoryRange) -> Result<(), std::io::Error> {
     const CHUNK: usize = 1 << 20;
     let zeros = vec![0u8; CHUNK];
     let mut offset = range.offset;
@@ -840,6 +942,7 @@ impl Runtime {
             Err(err) => ControlResponse::Done {
                 success: false,
                 message: format!("invalid control request: {err}"),
+                zeroed_bytes: 0,
             },
         };
         let response = serde_json::to_vec(&response).unwrap();
@@ -855,6 +958,7 @@ impl Runtime {
                     return ControlResponse::Done {
                         success: false,
                         message: "no memfd received from Firecracker".to_string(),
+                        zeroed_bytes: 0,
                     };
                 };
                 let populated: Vec<&PopulatedPages> =
@@ -868,17 +972,23 @@ impl Runtime {
                         .map(|file| (file, populated.as_slice())),
                 };
                 match copy_pages(source, &mem_path, &memory) {
-                    Ok(copies) => ControlResponse::Done {
+                    Ok(stats) => ControlResponse::Done {
                         success: true,
                         message: format!(
-                            "copied {copies} runs and zeroed {} ranges into {}",
+                            "copied {} runs, zeroed {} unpopulated runs ({} bytes) and {} \
+                             unplugged ranges into {}",
+                            stats.copies,
+                            stats.zeroed,
+                            stats.zeroed_bytes,
                             memory.unplugged.len(),
                             mem_path.display()
                         ),
+                        zeroed_bytes: stats.zeroed_bytes,
                     },
                     Err(err) => ControlResponse::Done {
                         success: false,
                         message: format!("copy into {} failed: {err}", mem_path.display()),
+                        zeroed_bytes: 0,
                     },
                 }
             }
@@ -1167,6 +1277,8 @@ mod tests {
             page_size,
             pages: Some(base64_encode(&bitmap)),
             unplugged,
+            populated_page_size: 0,
+            populated: None,
         }
     }
 
@@ -1177,7 +1289,25 @@ mod tests {
             page_size: 4096,
             pages: None,
             unplugged,
+            populated_page_size: 0,
+            populated: None,
         }
+    }
+
+    /// Sets `populated` on a layout: one bit per `page_size` bytes, the given pages set.
+    fn with_populated(
+        mut layout: SnapshotMemoryLayout,
+        page_size: u64,
+        total_pages: u64,
+        set: &[u64],
+    ) -> SnapshotMemoryLayout {
+        let mut bitmap = vec![0u8; total_pages.div_ceil(8) as usize];
+        for &page in set {
+            bitmap[(page / 8) as usize] |= 1 << (page % 8);
+        }
+        layout.populated_page_size = page_size;
+        layout.populated = Some(base64_encode(&bitmap));
+        layout
     }
 
     #[test]
@@ -1228,6 +1358,8 @@ mod tests {
             page_size: 4096,
             pages: Some("AxA=".to_string()),
             unplugged: vec![],
+            populated_page_size: 0,
+            populated: None,
         };
         assert_eq!(runs(&doc), vec![(0, 8192), (49152, 4096)]);
         // Page count not a multiple of 8, last page set.
@@ -1242,6 +1374,8 @@ mod tests {
             page_size: 4096,
             pages: Some("Aw==".to_string()),
             unplugged: vec![],
+            populated_page_size: 0,
+            populated: None,
         };
         assert_eq!(runs(&short), vec![(0, 8192)]);
         let empty = SnapshotMemoryLayout {
@@ -1249,6 +1383,8 @@ mod tests {
             page_size: 4096,
             pages: Some(String::new()),
             unplugged: vec![],
+            populated_page_size: 0,
+            populated: None,
         };
         assert!(empty.set_runs().unwrap().is_empty());
         // A bitmap longer than the file is rejected.
@@ -1257,6 +1393,8 @@ mod tests {
             page_size: 4096,
             pages: Some("AxA=".to_string()),
             unplugged: vec![],
+            populated_page_size: 0,
+            populated: None,
         };
         long.set_runs().unwrap_err();
 
@@ -1308,7 +1446,7 @@ mod tests {
             page_size: 4096,
             backing: None,
         };
-        assert_eq!(copy_pages(source, &mem_path, &full).unwrap(), 1);
+        assert_eq!(copy_pages(source, &mem_path, &full).unwrap().copies, 1);
         let mut expected = Vec::new();
         for page in 0..3u8 {
             expected.extend(std::iter::repeat_n(page + 1, 4096));
@@ -1377,7 +1515,7 @@ mod tests {
         let mem_path = tmp_dir.as_path().join("mem");
         let full = full_layout(4, vec![]);
         // Pages 0 and 3 from the snapshot file, 1 and 2 from the memfd: three runs.
-        assert_eq!(copy_pages(source, &mem_path, &full).unwrap(), 3);
+        assert_eq!(copy_pages(source, &mem_path, &full).unwrap().copies, 3);
 
         let mut expected = snapshot.clone();
         expected[2 * 4096..3 * 4096].fill(0xEE);
@@ -1390,7 +1528,10 @@ mod tests {
             backing: None,
         };
         let boot_path = tmp_dir.as_path().join("mem_boot");
-        assert_eq!(copy_pages(boot_source, &boot_path, &full).unwrap(), 1);
+        assert_eq!(
+            copy_pages(boot_source, &boot_path, &full).unwrap().copies,
+            1
+        );
         let mut expected = vec![0u8; 4 * 4096];
         expected[4096..2 * 4096].copy_from_slice(&snapshot[4096..2 * 4096]);
         expected[2 * 4096..3 * 4096].fill(0xEE);
@@ -1432,12 +1573,142 @@ mod tests {
         let mem_path = tmp_dir.as_path().join("mem");
         let layout = layout(6, &[1, 2, 3, 4], vec![]);
         assert_eq!(layout.page_size, 4096);
-        assert_eq!(copy_pages(source, &mem_path, &layout).unwrap(), 3);
+        assert_eq!(copy_pages(source, &mem_path, &layout).unwrap().copies, 3);
 
         let mut expected = vec![0u8; 3 * PAGE];
         expected[4096..PAGE].copy_from_slice(&snapshot[4096..PAGE]);
         expected[PAGE..2 * PAGE].fill(0xEE);
         expected[2 * PAGE..2 * PAGE + 4096].copy_from_slice(&snapshot[2 * PAGE..2 * PAGE + 4096]);
+        assert_eq!(std::fs::read(&mem_path).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_copy_pages_skips_unpopulated() {
+        // Firecracker reports pages 1 and 2 not populated (holes): a diff that includes them
+        // zeroes them in the target without reading the memfd. Everything else is copied.
+        let memfd = memfd_with_pattern(4);
+        let tmp_dir = TempDir::new().unwrap();
+        let mem_path = tmp_dir.as_path().join("mem");
+        // Pre-fill the target with garbage so that zeroing is observable.
+        std::fs::write(&mem_path, vec![0xEE; 4 * 4096]).unwrap();
+
+        let source = MemorySource {
+            memfd: &memfd,
+            page_size: 4096,
+            backing: None,
+        };
+        let diff = with_populated(layout(4, &[0, 1, 2, 3], vec![]), 4096, 4, &[0, 3]);
+        let stats = copy_pages(source, &mem_path, &diff).unwrap();
+        assert_eq!(stats.copies, 2);
+        assert_eq!(stats.zeroed, 1);
+        assert_eq!(stats.zeroed_bytes, 2 * 4096);
+        let mut expected = vec![1u8; 4096];
+        expected.extend(std::iter::repeat_n(0u8, 2 * 4096));
+        expected.extend(std::iter::repeat_n(4u8, 4096));
+        assert_eq!(std::fs::read(&mem_path).unwrap(), expected);
+
+        // A full copy behaves the same way; a page not set is untouched either way.
+        std::fs::write(&mem_path, vec![0xEE; 4 * 4096]).unwrap();
+        let full = with_populated(full_layout(4, vec![]), 4096, 4, &[0, 3]);
+        let stats = copy_pages(source, &mem_path, &full).unwrap();
+        assert_eq!((stats.copies, stats.zeroed), (2, 1));
+        assert_eq!(std::fs::read(&mem_path).unwrap(), expected);
+        std::fs::write(&mem_path, vec![0xEE; 4 * 4096]).unwrap();
+        let partial = with_populated(layout(4, &[1, 3], vec![]), 4096, 4, &[0, 3]);
+        copy_pages(source, &mem_path, &partial).unwrap();
+        let mut expected = vec![0xEEu8; 4096];
+        expected.extend(std::iter::repeat_n(0u8, 4096));
+        expected.extend(std::iter::repeat_n(0xEEu8, 4096));
+        expected.extend(std::iter::repeat_n(4u8, 4096));
+        assert_eq!(std::fs::read(&mem_path).unwrap(), expected);
+
+        // Without `populated` (older Firecracker), everything is read.
+        std::fs::write(&mem_path, vec![0xEE; 4 * 4096]).unwrap();
+        let stats = copy_pages(source, &mem_path, &layout(4, &[0, 1, 2, 3], vec![])).unwrap();
+        assert_eq!((stats.copies, stats.zeroed), (1, 0));
+
+        // Malformed `populated` is rejected.
+        let mut bad = layout(4, &[0], vec![]);
+        bad.populated = Some("!!".to_string());
+        bad.populated_page_size = 4096;
+        copy_pages(source, &mem_path, &bad).unwrap_err();
+        let mut bad = layout(4, &[0], vec![]);
+        bad.populated = Some(String::new());
+        bad.populated_page_size = 0;
+        copy_pages(source, &mem_path, &bad).unwrap_err();
+    }
+
+    #[test]
+    fn test_copy_pages_unpopulated_after_restore() {
+        // After a restore, `populated` only matters for pages the memfd is authoritative for.
+        // A page still served from the snapshot file is copied from it regardless (Firecracker
+        // never populated it, so it is not resident); a page the handler did populate but that
+        // has since been punched (balloon) is zero.
+        let tmp_dir = TempDir::new().unwrap();
+        let snapshot_path = tmp_dir.as_path().join("snapshot_mem");
+        let mut snapshot = vec![0u8; 4 * 4096];
+        for page in 0..4 {
+            snapshot[page * 4096..(page + 1) * 4096].fill(0x10 + page as u8);
+        }
+        std::fs::write(&snapshot_path, &snapshot).unwrap();
+        let snapshot_file = File::open(&snapshot_path).unwrap();
+
+        let name = std::ffi::CString::new("test").unwrap();
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), 0) };
+        let memfd = unsafe { File::from_raw_fd(fd) };
+        memfd.set_len(4 * 4096).unwrap();
+        // The handler populated pages 1 and 2; page 2 was punched afterwards (a hole, reads 0).
+        memfd.write_all_at(&snapshot[4096..2 * 4096], 4096).unwrap();
+        let mut populated_by_me = PopulatedPages::new(4 * 4096, 4096);
+        populated_by_me.mark(4096, 2 * 4096);
+        let refs = [&populated_by_me];
+        let source = MemorySource {
+            memfd: &memfd,
+            page_size: 4096,
+            backing: Some((&snapshot_file, &refs)),
+        };
+        // Firecracker: only page 1 resident.
+        let full = with_populated(full_layout(4, vec![]), 4096, 4, &[1]);
+        let mem_path = tmp_dir.as_path().join("mem");
+        let stats = copy_pages(source, &mem_path, &full).unwrap();
+        // page 0: snapshot; page 1: memfd; page 2: zero; page 3: snapshot.
+        assert_eq!((stats.copies, stats.zeroed), (3, 1));
+        let mut expected = snapshot.clone();
+        expected[2 * 4096..3 * 4096].fill(0);
+        assert_eq!(std::fs::read(&mem_path).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_copy_pages_unpopulated_huge_backing_page() {
+        // `populated` is at backing page granularity while `pages` is 4 KiB: a dirty run inside
+        // an unpopulated 8K page is zeroed, one inside a populated page is copied.
+        const PAGE: usize = 8192;
+        let name = std::ffi::CString::new("test").unwrap();
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), 0) };
+        let memfd = unsafe { File::from_raw_fd(fd) };
+        memfd.set_len((3 * PAGE) as u64).unwrap();
+        memfd.write_all_at(&[0xAA; PAGE], PAGE as u64).unwrap();
+        let tmp_dir = TempDir::new().unwrap();
+        let mem_path = tmp_dir.as_path().join("mem");
+        std::fs::write(&mem_path, vec![0xEE; 3 * PAGE]).unwrap();
+
+        let source = MemorySource {
+            memfd: &memfd,
+            page_size: PAGE,
+            backing: None,
+        };
+        // 4K pages 1..=4 dirty (middle of backing page 0 to middle of backing page 2); backing
+        // page 1 populated only.
+        let layout = with_populated(layout(6, &[1, 2, 3, 4], vec![]), PAGE as u64, 3, &[1]);
+        let stats = copy_pages(source, &mem_path, &layout).unwrap();
+        assert_eq!(
+            (stats.copies, stats.zeroed, stats.zeroed_bytes),
+            (1, 2, 2 * 4096)
+        );
+        let mut expected = vec![0xEEu8; 3 * PAGE];
+        expected[4096..PAGE].fill(0);
+        expected[PAGE..2 * PAGE].fill(0xAA);
+        expected[2 * PAGE..2 * PAGE + 4096].fill(0);
         assert_eq!(std::fs::read(&mem_path).unwrap(), expected);
     }
 
@@ -1489,8 +1760,13 @@ mod tests {
             .unwrap();
         std::thread::sleep(Duration::from_millis(100));
 
-        let ControlResponse::Done { success, message } = send(&request);
+        let ControlResponse::Done {
+            success,
+            message,
+            zeroed_bytes,
+        } = send(&request);
         assert!(success, "{message}");
+        assert_eq!(zeroed_bytes, 0);
         let mut expected = vec![1u8; 4096];
         expected.extend(std::iter::repeat_n(2u8, 4096));
         assert_eq!(std::fs::read(&mem_path).unwrap(), expected);

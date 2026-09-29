@@ -243,29 +243,102 @@ pub struct SnapshotMemoryLayout {
     /// Ranges that must be zeroed in the memory file: the currently unplugged virtio-mem slots.
     /// Sorted, merged and page-aligned.
     pub unplugged: Vec<MemoryRange>,
+    /// Granularity of `populated`, in bytes: the backing page size of guest memory (4096, or
+    /// 2 MiB with hugetlbfs).
+    pub populated_page_size: u64,
+    /// One bit per `populated_page_size` bytes of the memory file, same byte/bit layout and same
+    /// extent (up to the end of the last plugged slot) as `pages`. A set bit means the backing
+    /// page is resident in Firecracker's mapping of guest memory (`mincore(2)`), so that a read
+    /// through that mapping returns its content. A clear bit means a read would return zeros,
+    /// unless another process wrote the page through a mapping of its own and Firecracker has
+    /// not touched it since (hugetlbfs, where `mincore` reports Firecracker's page tables), or
+    /// the page is swapped out (host swap must be off). A backend that is told a page is dirty
+    /// but not populated can therefore write zeros to it instead of reading guest memory,
+    /// provided it is not a page the backend itself has to serve from a snapshot file.
+    ///
+    /// Bits of unplugged slots are clear. Describes the state at the time the layout was taken
+    /// and does not consume anything.
+    ///
+    /// Serialised as standard, padded base64.
+    #[serde(with = "base64_vec")]
+    pub populated: Vec<u8>,
 }
 
 impl SnapshotMemoryLayout {
     /// Creates the layout of a full snapshot: no bitmap, every page outside `unplugged` is set.
-    pub fn full(total_size: u64, page_size: u64, unplugged: Vec<MemoryRange>) -> Self {
+    /// `populated` is all clear and sized for `plugged_end`; fill it with
+    /// [`Self::set_populated_range`].
+    pub fn full(
+        total_size: u64,
+        page_size: u64,
+        populated_page_size: u64,
+        plugged_end: u64,
+        unplugged: Vec<MemoryRange>,
+    ) -> Self {
         Self {
             total_size,
             page_size,
             pages: None,
             unplugged,
+            populated_page_size,
+            populated: Self::bitmap_for(populated_page_size, plugged_end),
         }
     }
 
-    /// Creates the layout of a diff snapshot with an all-clear bitmap covering the file up to
+    /// Creates the layout of a diff snapshot with all-clear bitmaps covering the file up to
     /// `plugged_end`, the end offset of the last plugged slot.
-    pub fn diff(total_size: u64, page_size: u64, plugged_end: u64) -> Self {
-        let pages = usize::try_from(plugged_end.div_ceil(page_size)).unwrap_or(usize::MAX);
+    pub fn diff(
+        total_size: u64,
+        page_size: u64,
+        populated_page_size: u64,
+        plugged_end: u64,
+    ) -> Self {
         Self {
             total_size,
             page_size,
-            pages: Some(vec![0u8; pages.div_ceil(8)]),
+            pages: Some(Self::bitmap_for(page_size, plugged_end)),
             unplugged: Vec::new(),
+            populated_page_size,
+            populated: Self::bitmap_for(populated_page_size, plugged_end),
         }
+    }
+
+    /// An all-clear bitmap with one bit per `page_size` bytes up to `end`.
+    fn bitmap_for(page_size: u64, end: u64) -> Vec<u8> {
+        let pages = usize::try_from(end.div_ceil(page_size)).unwrap_or(usize::MAX);
+        vec![0u8; pages.div_ceil(8)]
+    }
+
+    /// Whether the backing page at file offset `offset` is populated.
+    pub fn page_is_populated(&self, offset: u64) -> bool {
+        let page = offset / self.populated_page_size;
+        let byte = usize::try_from(page / 8).unwrap();
+        self.populated
+            .get(byte)
+            .is_some_and(|b| b & (1 << (page % 8)) != 0)
+    }
+
+    /// Sets the `populated` bits of the `len` bytes at file offset `offset` (both
+    /// `populated_page_size`-aligned).
+    ///
+    /// # Panics
+    ///
+    /// If the range lies past the end of the bitmap.
+    pub fn set_populated_range(&mut self, offset: u64, len: u64) {
+        let first = offset / self.populated_page_size;
+        let last = (offset + len).div_ceil(self.populated_page_size);
+        for page in first..last {
+            let byte = usize::try_from(page / 8).unwrap();
+            self.populated[byte] |= 1 << (page % 8);
+        }
+    }
+
+    /// Number of populated backing pages.
+    pub fn populated_pages(&self) -> u64 {
+        self.populated
+            .iter()
+            .map(|b| u64::from(b.count_ones()))
+            .sum()
     }
 
     /// Whether the page at file offset `offset` must be copied.
@@ -310,6 +383,22 @@ impl SnapshotMemoryLayout {
             }
             Some(pages) => pages.iter().map(|b| u64::from(b.count_ones())).sum(),
         }
+    }
+}
+
+mod base64_vec {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        STANDARD
+            .decode(String::deserialize(deserializer)?)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -359,9 +448,11 @@ mod tests {
     #[test]
     fn test_snapshot_memory_layout_bits() {
         // Diff: 16 pages, all plugged.
-        let mut layout = SnapshotMemoryLayout::diff(16 * 4096, 4096, 16 * 4096);
+        let mut layout = SnapshotMemoryLayout::diff(16 * 4096, 4096, 4096, 16 * 4096);
         assert_eq!(layout.pages.as_deref(), Some(&[0u8, 0][..]));
         assert_eq!(layout.set_pages(), 0);
+        assert_eq!(layout.populated, vec![0u8, 0]);
+        assert_eq!(layout.populated_pages(), 0);
 
         layout.set_range(0, 2 * 4096);
         layout.set_range(8 * 4096, 4096);
@@ -375,22 +466,39 @@ mod tests {
 
         // The bitmap covers the plugged part of the file only, rounded up to whole bytes; its
         // length does not depend on what is set.
-        let layout = SnapshotMemoryLayout::diff(64 * 4096, 4096, 13 * 4096);
+        let layout = SnapshotMemoryLayout::diff(64 * 4096, 4096, 4096, 13 * 4096);
         assert_eq!(layout.pages.as_ref().unwrap().len(), 2);
         assert!(!layout.page_is_set(63 * 4096));
-        let layout = SnapshotMemoryLayout::diff(64 * 4096, 4096, 0);
+        let layout = SnapshotMemoryLayout::diff(64 * 4096, 4096, 4096, 0);
         assert_eq!(layout.pages.as_deref(), Some(&[][..]));
+        assert!(layout.populated.is_empty());
+
+        // `populated` has its own, coarser granularity (the backing page): 13 4K pages plugged
+        // are 7 8K backing pages, one byte.
+        let mut layout = SnapshotMemoryLayout::diff(64 * 4096, 4096, 8192, 13 * 4096);
+        assert_eq!(layout.populated.len(), 1);
+        layout.set_populated_range(2 * 8192, 8192);
+        assert_eq!(layout.populated, vec![0b100]);
+        assert!(!layout.page_is_populated(8192));
+        assert!(layout.page_is_populated(2 * 8192));
+        assert!(layout.page_is_populated(2 * 8192 + 4096));
+        assert!(!layout.page_is_populated(3 * 8192));
+        assert!(!layout.page_is_populated(1 << 40));
+        assert_eq!(layout.populated_pages(), 1);
 
         // Full: no bitmap, everything but `unplugged` is set.
         let layout = SnapshotMemoryLayout::full(
             16 * 4096,
             4096,
+            4096,
+            16 * 4096,
             vec![MemoryRange {
                 offset: 8 * 4096,
                 len: 4 * 4096,
             }],
         );
         assert!(layout.pages.is_none());
+        assert_eq!(layout.populated.len(), 2);
         assert_eq!(layout.set_pages(), 12);
         assert!(layout.page_is_set(0));
         assert!(layout.page_is_set(7 * 4096));
@@ -404,27 +512,32 @@ mod tests {
     fn test_snapshot_memory_layout_json() {
         // The example of docs/snapshotting/shared-memfd-design.md: pages 0, 1 and 12 set, the
         // slot at pages 8..12 unplugged.
-        let mut layout = SnapshotMemoryLayout::diff(16 * 4096, 4096, 16 * 4096);
+        // Pages 0..8 and 12..16 are populated (the unplugged slot is not).
+        let mut layout = SnapshotMemoryLayout::diff(16 * 4096, 4096, 4096, 16 * 4096);
         layout.set_range(0, 2 * 4096);
         layout.set_range(12 * 4096, 4096);
         layout.unplugged.push(MemoryRange {
             offset: 8 * 4096,
             len: 4 * 4096,
         });
+        layout.set_populated_range(0, 8 * 4096);
+        layout.set_populated_range(12 * 4096, 4 * 4096);
         let json = serde_json::to_string(&layout).unwrap();
         assert_eq!(
             json,
-            r#"{"total_size":65536,"page_size":4096,"pages":"AxA=","unplugged":[{"offset":32768,"len":16384}]}"#
+            r#"{"total_size":65536,"page_size":4096,"pages":"AxA=","unplugged":[{"offset":32768,"len":16384}],"populated_page_size":4096,"populated":"//A="}"#
         );
         let back: SnapshotMemoryLayout = serde_json::from_str(&json).unwrap();
         assert_eq!(back, layout);
 
-        // A full layout has no `pages` field at all.
-        let full = SnapshotMemoryLayout::full(16 * 4096, 4096, layout.unplugged.clone());
+        // A full layout has no `pages` field at all, but does have `populated`.
+        let mut full =
+            SnapshotMemoryLayout::full(16 * 4096, 4096, 4096, 16 * 4096, layout.unplugged.clone());
+        full.populated = layout.populated.clone();
         let json = serde_json::to_string(&full).unwrap();
         assert_eq!(
             json,
-            r#"{"total_size":65536,"page_size":4096,"unplugged":[{"offset":32768,"len":16384}]}"#
+            r#"{"total_size":65536,"page_size":4096,"unplugged":[{"offset":32768,"len":16384}],"populated_page_size":4096,"populated":"//A="}"#
         );
         assert_eq!(
             serde_json::from_str::<SnapshotMemoryLayout>(&json).unwrap(),
@@ -442,9 +555,13 @@ mod tests {
             response
         );
 
-        // Invalid base64 is rejected.
+        // Invalid base64 is rejected, in either bitmap.
         serde_json::from_str::<SnapshotMemoryLayout>(
-            r#"{"total_size":4096,"page_size":4096,"pages":"!!","unplugged":[]}"#,
+            r#"{"total_size":4096,"page_size":4096,"pages":"!!","unplugged":[],"populated_page_size":4096,"populated":"AA=="}"#,
+        )
+        .unwrap_err();
+        serde_json::from_str::<SnapshotMemoryLayout>(
+            r#"{"total_size":4096,"page_size":4096,"unplugged":[],"populated_page_size":4096,"populated":"!!"}"#,
         )
         .unwrap_err();
     }

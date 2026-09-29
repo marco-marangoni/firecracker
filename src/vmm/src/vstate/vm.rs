@@ -26,7 +26,7 @@ use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::terminal::Terminal;
 
-use crate::arch::{GSI_MSI_END, host_page_size};
+use crate::arch::GSI_MSI_END;
 pub use crate::arch::{KvmVm, KvmVmError, VmState};
 use crate::logger::{debug, info};
 use crate::pci::PciSBDF;
@@ -38,7 +38,7 @@ use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorGroup};
 use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{
     GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion, GuestMemoryState, GuestRegionMmap,
-    GuestRegionMmapExt, MemoryError,
+    GuestRegionMmapExt, MemoryError, mincore_resident,
 };
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::{StartThreadedError, VcpuError, VcpuHandle};
@@ -111,7 +111,7 @@ pub enum VmError {
     /// Failed to add a memory region: {0}
     InsertRegion(#[from] vm_memory::GuestRegionCollectionError),
     /// Error calling mincore: {0}
-    Mincore(vmm_sys_util::errno::Error),
+    Mincore(std::io::Error),
     /// ResourceAllocator error: {0}
     ResourceAllocator(#[from] vm_allocator::Error),
     /// MemoryError error: {0}
@@ -596,18 +596,22 @@ impl KvmVm {
     /// backend counterpart of [`Self::snapshot_memory_to_file`] and consumes the dirty tracking
     /// state in the same way: a `Diff` layout covers the pages `dump_dirty` would write (plus
     /// the dirty pages of unplugged slots) and resets both bitmaps on success; a `Full` layout
-    /// covers all plugged slots and resets both bitmaps.
+    /// covers all plugged slots and resets both bitmaps. Both carry the `populated` bitmap at
+    /// `backing_page_size` granularity.
     pub(crate) fn snapshot_memory_layout(
         &self,
         snapshot_type: SnapshotType,
+        backing_page_size: usize,
     ) -> Result<SnapshotMemoryLayout, CreateSnapshotError> {
         match snapshot_type {
             SnapshotType::Diff => {
                 let dirty_bitmap = self.get_dirty_bitmap()?;
-                Ok(self.guest_memory().dirty_layout(&dirty_bitmap)?)
+                Ok(self
+                    .guest_memory()
+                    .dirty_layout(&dirty_bitmap, backing_page_size)?)
             }
             SnapshotType::Full => {
-                let layout = self.guest_memory().full_layout();
+                let layout = self.guest_memory().full_layout(backing_page_size)?;
                 self.reset_dirty_bitmap();
                 self.guest_memory().reset_dirty();
                 Ok(layout)
@@ -800,23 +804,12 @@ fn mincore_bitmap(addr: *mut u8, len: usize) -> Result<Vec<u64>, VmError> {
     // Mincore always works at PAGE_SIZE granularity, even if the VMA we are dealing with
     // is a hugetlbfs VMA (e.g. to report a single hugepage as "present", mincore will
     // give us 512 4k markers with the lowest bit set).
-    let page_size = host_page_size();
-    let mut mincore_bitmap = vec![0u8; len / page_size];
-    let mut bitmap = vec![0u64; (len / page_size).div_ceil(64)];
-
-    // SAFETY: The safety invariants of GuestRegionMmap ensure that region.as_ptr() is a valid
-    // userspace mapping of size region.len() bytes. The bitmap has exactly one byte for each
-    // page in this userspace mapping. Note that mincore does not operate on bitmaps like
-    // KVM_MEM_LOG_DIRTY_PAGES, but rather it uses 8 bits per page (e.g. 1 byte), setting the
-    // least significant bit to 1 if the page corresponding to a byte is in core (available in
-    // the page cache and resolvable via just a minor page fault).
-    let r = unsafe { libc::mincore(addr.cast(), len, mincore_bitmap.as_mut_ptr()) };
-
-    if r != 0 {
-        return Err(VmError::Mincore(vmm_sys_util::errno::Error::last()));
-    }
-
-    for (page_idx, b) in mincore_bitmap.iter().enumerate() {
+    let resident = mincore_resident(addr, len).map_err(|err| match err {
+        MemoryError::Mincore(err) => VmError::Mincore(err),
+        other => VmError::MemoryError(other),
+    })?;
+    let mut bitmap = vec![0u64; resident.len().div_ceil(64)];
+    for (page_idx, b) in resident.iter().enumerate() {
         bitmap[page_idx / 64] |= (*b as u64 & 0x1) << (page_idx as u64 % 64);
     }
 

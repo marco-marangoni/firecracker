@@ -355,15 +355,18 @@ Response, with a backend: `200 OK` with
     "pages": "AxA=",
     "unplugged": [
       { "offset": 32768, "len": 16384 }
-    ]
+    ],
+    "populated_page_size": 4096,
+    "populated": "//A="
   }
 }
 ```
 
 (A 64 KiB guest, for the sake of a readable example: `AxA=` decodes to the two
 bytes `0x03 0x10`, so pages 0, 1 and 12 are to be copied; pages 8 to 11 are an
-unplugged virtio-mem slot, to be zeroed. A 1 GiB guest has a 32 KiB bitmap. A
-`Full` response has no `pages` field.)
+unplugged virtio-mem slot, to be zeroed; `//A=` is `0xff 0xf0`: pages 0 to 7 and
+12 to 15 are resident, the unplugged ones are not. A 1 GiB guest has a 32 KiB
+bitmap. A `Full` response has no `pages` field but does have `populated`.)
 
 - `total_size` is the size of a full memory file (sum of all region sizes,
   including the hotplug region); the peer creates the target at that size.
@@ -524,6 +527,85 @@ dirty information, and it is a handful of huge extents. A binary response
 `MediaType`) can be added later for peers that measure the base64 cost; it does
 not change the JSON contract.
 
+#### Decision: report populated pages (`populated`), from `mincore`
+
+Every response also carries `populated`, one bit per *backing* page
+(`populated_page_size`: 4 KiB, or 2 MiB on hugetlbfs), same extent as `pages`,
+set when `mincore(2)` reports the page resident in Firecracker's mapping of the
+slot. It is taken right before the dirty state is consumed, consumes nothing,
+and is present for `Full` as well.
+
+The problem it solves: a dirty page that is a hole in the memfd (released by the
+balloon or free page reporting, never touched after boot) reads as zeros, and a
+backend has no way to know that without reading it. On tmpfs the read is cheap
+(`copy_file_range` skips holes) and `lseek(SEEK_HOLE)` would tell anyway; on
+hugetlbfs neither works: `lseek` is `default_llseek` (whole file is data),
+`cachestat` returns `EOPNOTSUPP`, `FIEMAP` is not implemented, and reading a
+hole is a 2 MiB zero-fill through `read()`. After a large inflation the final
+copy pass would zero-fill gigabytes. Firecracker is the only party that can
+answer cheaply: `mincore` over its own mapping costs 0.09 ms per GiB on
+hugetlbfs (one page-table walk entry per huge page) and 1.8 ms per GiB on tmpfs
+(the same walk the `mincore` diff does).
+
+What `mincore` means differs between the two backings, and the field is defined
+so that both are covered. On tmpfs it reports page-cache residency: present ⇔
+the page has content, whoever wrote it; absent ⇔ hole, or swapped out. On
+hugetlbfs it reports *Firecracker's own huge PTEs*: present ⇔ content that
+Firecracker has touched since the page was last allocated; absent ⇔ hole, or
+content written only by another process through its own mapping. Verified on
+5.10 with two mappings of one memfd: a write through mapping B leaves `mincore`
+on A clear until A reads the page; `MADV_REMOVE` of a whole huge page clears it
+on both; a partial punch (8 KiB inside a huge page) leaves the page allocated
+and present, with its bytes intact on 5.10 and zeroed on newer kernels. The
+partial-punch case is the reason to prefer asking the kernel over Firecracker
+tracking its own discards: the page stays present, the backend reads it, and
+gets whatever the guest sees, whatever the kernel did. The other-process case is
+the backend itself (it knows what it wrote; `UFFDIO_COPY` installs Firecracker's
+PTE, so uffd-populated pages show as present) or a vhost-user backend writing RX
+buffers the guest has not touched, a pre-existing gap. The swap case is the
+existing `mincore` diff requirement. All three are documented rather than
+engineered around.
+
+The backend's per-page rule becomes three-way: uffd-registered and never
+populated by the backend → snapshot file (the backend's own knowledge, and it
+must come first: such a page is never resident in Firecracker's mapping, so
+`populated` alone would call it zero); otherwise `populated` clear → write or
+punch zeros, do not read; otherwise → memfd. `pages` says *what* to copy and is
+unchanged; `populated` only refines *where from*.
+
+What it does not deliver, measured: after a UFFD *restore* on hugetlbfs, the
+pages the balloon releases are mostly pages the guest never touched since the
+restore, which the handler never populated and Firecracker never faulted in.
+They are dirty (the discard marks them), not resident, and correctly classified
+as "snapshot file" by the handler, so they are copied from the base, not zeroed;
+`populated` cannot help, and only whole huge pages released in a single balloon
+batch are punched and become zeroable through the `remove` event. In the same
+test on 4 KiB pages, or after a *boot* on either page size, the released memory
+is zeroed almost entirely (the integration tests assert ≥64 MiB and ≥96 MiB of
+128 MiB respectively). A backend that wants the restore + hugetlbfs case too
+must decide the source from its own records (it can treat a page it never
+populated and that is dirty only because of a discard as zero if it unregisters
+the range), which is the design's original rule and needs nothing more from
+Firecracker.
+
+Another lesson from the same tests: the handler must *write* zeros for these
+pages, not punch holes in the target. `rebase-snap` and `snapshot-editor` treat
+a hole in a diff file as "page not in the diff", and Firecracker's own
+`dump_dirty` writes explicit zeros for released pages for the same reason.
+Punching is only correct for `unplugged` ranges (which restore never maps) and
+for a fresh full file.
+
+Rejected: Firecracker tracking discards itself (a second `AtomicBitmap` written
+by `discard_range`, cleared on balloon deflate, masked against the KVM log at
+consumption). It needs kernel-version reasoning for partial punches, a deflate
+hook, and cannot express "never touched since boot", which is the boot-time
+`Full` win. Rejected: 4 KiB granularity for `populated` on hugetlbfs. `mincore`
+returns 512 identical entries per huge page, so nothing would be gained and the
+bitmap would be 512 times larger; the backend already rounds source decisions to
+the backing page. Rejected: making it opt-in. It is 64 bytes per GiB on
+hugetlbfs and 32 KiB per GiB (the size of `pages`) on tmpfs, where it also saves
+the read of every never-touched page in a boot-time `Full`.
+
 ### 8. `PUT /snapshot/dirty-pages`: pre-copy passes
 
 ```json
@@ -619,21 +701,27 @@ handler would serve the snapshot file, which is therefore the guest-visible
 content and what Firecracker's own `dump` would have written. The copy must
 follow the same rule:
 
-| Page                                                  | Read from                  |
-| :---------------------------------------------------- | :------------------------- |
-| uffd-registered, never populated by the handler       | snapshot file, same offset |
-| populated (`UFFDIO_COPY`/`UFFDIO_ZEROPAGE`, `EEXIST`) | memfd                      |
-| in a range received as uffd `remove` event            | memfd (a hole, reads zero) |
-| unplugged virtio-mem slot                             | zero                       |
+| Page                                                     | Read from                  |
+| :------------------------------------------------------- | :------------------------- |
+| uffd-registered, never populated by the handler          | snapshot file, same offset |
+| populated by the handler, Firecracker reports resident   | memfd                      |
+| populated by the handler, Firecracker reports not        | zero (a hole)              |
+| in a range received as uffd `remove` event, not resident | zero (a hole)              |
+| unplugged virtio-mem slot                                | zero                       |
 
-Only the handler can tell these apart, and it can do so exactly and for free: it
-is the only party that populates pages, and it is told about every discard.
-`uffd_utils.rs` keeps one bit per page (`PopulatedPages`), set on every
-successful populate and for every range it unregisters on `remove`, and its copy
-routine ANDs the received bitmap with it to split the pages into runs from the
-memfd and runs from the snapshot file. Since the memfd and the snapshot file
-share one layout, this is a matter of offsets. Alternatives in which Firecracker
-determines the source were considered and rejected (§13).
+The first distinction only the handler can make, and it can do so exactly and
+for free: it is the only party that populates pages, and it is told about every
+discard. `uffd_utils.rs` keeps one bit per page (`PopulatedPages`), set on every
+successful populate and for every range it unregisters on `remove`. The second
+distinction, hole or content within the memfd, is Firecracker's `populated`
+bitmap (§7). The copy routine walks the received `pages` in backing-page steps,
+classifies each page (`PageSource::{SnapshotFile, Memfd, Zero}`), merges
+consecutive pages of the same source into runs, and copies or zeroes each run
+(`zero_range`: `fallocate(PUNCH_HOLE)`, falling back to writing zeros). Since
+the memfd and the snapshot file share one layout, this is a matter of offsets.
+The handler's `Done` reply reports `zeroed_bytes`, which is how the tests
+observe the saving. Alternatives in which Firecracker determines the source
+entirely were considered and rejected (§13).
 
 #### Discards: balloon and virtio-mem
 
@@ -876,13 +964,16 @@ Remaining before this leaves developer preview:
 - Balloon/virtio-mem discards punch holes into the memfd (`MADV_REMOVE`, so the
   uffd `remove` event is preserved) and are marked dirty.
 - The peer cannot rely on finding those holes in the memfd itself. On tmpfs
-  `lseek(SEEK_DATA/SEEK_HOLE)` reports them; on hugetlbfs `lseek` is
-  `default_llseek` and reports the whole file as data, punched pages included
-  (checked on 5.10). `mincore` over a mapping of the memfd sees them on both, at
-  the cost of the mapping and a per-page scan. This is also why `unplugged`
-  stays an explicit list rather than being folded into `pages` and inferred from
-  holes: a hotplug region can be gigabytes of never-plugged memory, and on
-  hugetlbfs the peer would have to read all of it as zeros.
+  `lseek(SEEK_DATA/SEEK_HOLE)` reports them; on hugetlbfs nothing does: `lseek`
+  is `default_llseek` and reports the whole file as data, `mincore` on the
+  *peer's* mapping reports the peer's page tables (so an untouched page is
+  "absent" whether it is a hole or not), `cachestat` returns `EOPNOTSUPP`,
+  `FIEMAP` is not implemented. (An earlier version of this document claimed
+  `mincore` worked for the peer on both; it does not on hugetlbfs.) Firecracker
+  therefore reports residency in *its* mapping as `populated` (§7). This is also
+  why `unplugged` stays an explicit list rather than being folded into `pages`
+  and inferred from holes: a hotplug region can be gigabytes of never-plugged
+  memory.
 
 ### 14. Corrections made in retrospect
 

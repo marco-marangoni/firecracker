@@ -215,7 +215,10 @@ pub fn create_snapshot(
             )?;
             None
         }
-        None => Some(kvm_vm.snapshot_memory_layout(params.snapshot_type)?),
+        None => Some(kvm_vm.snapshot_memory_layout(
+            params.snapshot_type,
+            vmm.machine_config.huge_pages.page_size(),
+        )?),
     };
 
     // We need to mark queues as dirty again for all activated devices. The reason we

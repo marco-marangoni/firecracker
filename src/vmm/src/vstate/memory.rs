@@ -196,6 +196,8 @@ pub enum MemoryError {
     SeekError(std::io::Error),
     /// Volatile memory error: {0}
     VolatileMemoryError(vm_memory::VolatileMemoryError),
+    /// Error calling mincore: {0}
+    Mincore(std::io::Error),
 }
 
 impl From<vm_memory::VolatileMemoryError> for MemoryError {
@@ -1289,8 +1291,10 @@ where
     fn store_dirty_bitmap(&self, dirty_bitmap: &DirtyBitmap, page_size: usize);
 
     /// Describes the memory file layout of a full snapshot: no bitmap (every plugged page is to
-    /// be copied), all unplugged slots as `unplugged`. Has no effect on dirty tracking.
-    fn full_layout(&self) -> SnapshotMemoryLayout;
+    /// be copied), all unplugged slots as `unplugged`, and the `populated` bitmap at
+    /// `backing_page_size` granularity ([`Self::fill_populated`]). Has no effect on dirty
+    /// tracking.
+    fn full_layout(&self, backing_page_size: usize) -> Result<SnapshotMemoryLayout, MemoryError>;
 
     /// Describes the memory file layout of a diff snapshot: exactly the pages
     /// [`Self::dump_dirty`] would write have their bit set in `pages`, and the unplugged slots
@@ -1303,8 +1307,19 @@ where
     /// its (zeroed) pages do show up. Like `dump_dirty`, this consumes the dirty information: on
     /// success Firecracker's bitmaps are reset, on failure the KVM bitmap is folded into them so
     /// that nothing is lost.
-    fn dirty_layout(&self, dirty_bitmap: &DirtyBitmap)
-    -> Result<SnapshotMemoryLayout, MemoryError>;
+    ///
+    /// The `populated` bitmap is filled in as for [`Self::full_layout`].
+    fn dirty_layout(
+        &self,
+        dirty_bitmap: &DirtyBitmap,
+        backing_page_size: usize,
+    ) -> Result<SnapshotMemoryLayout, MemoryError>;
+
+    /// Fills `layout.populated` from `mincore(2)` over every plugged slot: a bit is set when the
+    /// backing page (`layout.populated_page_size` bytes) is resident in this mapping. `mincore`
+    /// reports 4 KiB entries whatever the backing page size; on hugetlbfs every entry of a
+    /// resident huge page is set, so the first entry of each backing page decides.
+    fn fill_populated(&self, layout: &mut SnapshotMemoryLayout) -> Result<(), MemoryError>;
 
     /// Apply a function to each region in a memory range
     fn try_for_each_region_in_range<F>(
@@ -1441,12 +1456,15 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         })
     }
 
-    fn full_layout(&self) -> SnapshotMemoryLayout {
+    fn full_layout(&self, backing_page_size: usize) -> Result<SnapshotMemoryLayout, MemoryError> {
         let total_size = self.iter().map(|r| r.len()).sum();
         let mut unplugged = Vec::new();
+        let mut plugged_end = 0u64;
         // Cannot fail: the callback never errors.
         self.for_each_slot_at_file_offset(|mem_slot, plugged, file_offset| {
-            if !plugged {
+            if plugged {
+                plugged_end = file_offset + mem_slot.slice.len() as u64;
+            } else {
                 push_merged(
                     &mut unplugged,
                     MemoryRange {
@@ -1458,17 +1476,26 @@ impl GuestMemoryExtension for GuestMemoryMmap {
             Ok(())
         })
         .expect("full_layout callback cannot fail");
-        SnapshotMemoryLayout::full(total_size, host_page_size() as u64, unplugged)
+        let mut layout = SnapshotMemoryLayout::full(
+            total_size,
+            host_page_size() as u64,
+            backing_page_size as u64,
+            plugged_end,
+            unplugged,
+        );
+        self.fill_populated(&mut layout)?;
+        Ok(layout)
     }
 
     fn dirty_layout(
         &self,
         dirty_bitmap: &DirtyBitmap,
+        backing_page_size: usize,
     ) -> Result<SnapshotMemoryLayout, MemoryError> {
         let page_size = host_page_size();
         let total_size = self.iter().map(|r| r.len()).sum();
 
-        // The bitmap covers the file up to the end of the last plugged slot.
+        // The bitmaps cover the file up to the end of the last plugged slot.
         let mut plugged_end = 0u64;
         self.for_each_slot_at_file_offset(|mem_slot, plugged, file_offset| {
             if plugged {
@@ -1477,7 +1504,14 @@ impl GuestMemoryExtension for GuestMemoryMmap {
             Ok(())
         })
         .expect("callback cannot fail");
-        let mut layout = SnapshotMemoryLayout::diff(total_size, page_size as u64, plugged_end);
+        let mut layout = SnapshotMemoryLayout::diff(
+            total_size,
+            page_size as u64,
+            backing_page_size as u64,
+            plugged_end,
+        );
+        // Taken before the dirty state is consumed: a failure here leaves everything untouched.
+        self.fill_populated(&mut layout)?;
 
         let result = self.for_each_slot_at_file_offset(|mem_slot, plugged, file_offset| {
             if !plugged {
@@ -1509,6 +1543,32 @@ impl GuestMemoryExtension for GuestMemoryMmap {
 
         result?;
         Ok(layout)
+    }
+
+    fn fill_populated(&self, layout: &mut SnapshotMemoryLayout) -> Result<(), MemoryError> {
+        let host_page = host_page_size();
+        let backing_page = u64_to_usize(layout.populated_page_size);
+        debug_assert!(backing_page >= host_page && backing_page.is_multiple_of(host_page));
+        self.for_each_slot_at_file_offset(|mem_slot, plugged, file_offset| {
+            if !plugged {
+                return Ok(());
+            }
+            let len = mem_slot.slice.len();
+            let resident = mincore_resident(mem_slot.slice.ptr_guard_mut().as_ptr(), len)?;
+            // Slots are backing-page aligned and sized (DRAM and hotplug sizes are multiples of
+            // the huge page size on hugetlbfs), so backing page `i` of the slot is entries
+            // `i * (backing_page / host_page)..` of `resident`.
+            let entries_per_page = backing_page / host_page;
+            for (i, chunk) in resident.chunks(entries_per_page).enumerate() {
+                if chunk[0] & 1 != 0 {
+                    layout.set_populated_range(
+                        file_offset + (i * backing_page) as u64,
+                        backing_page as u64,
+                    );
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Stores the dirty bitmap inside into the internal bitmap
@@ -1621,6 +1681,20 @@ impl SlotFileOffsets for GuestMemoryMmap {
         }
         Ok(())
     }
+}
+
+/// `mincore(2)` over `[addr, addr + len)`: one byte per host page, least significant bit set when
+/// the page is resident (in the page cache for tmpfs-backed memory, in this process's page
+/// tables for hugetlbfs-backed memory). `len` must be a multiple of the host page size.
+pub(crate) fn mincore_resident(addr: *mut u8, len: usize) -> Result<Vec<u8>, MemoryError> {
+    let mut resident = vec![0u8; len / host_page_size()];
+    // SAFETY: the caller guarantees `[addr, addr + len)` is a mapping of this process and
+    // `resident` has one byte per page in it.
+    let r = unsafe { libc::mincore(addr.cast(), len, resident.as_mut_ptr()) };
+    if r != 0 {
+        return Err(MemoryError::Mincore(io::Error::last_os_error()));
+    }
+    Ok(resident)
 }
 
 fn create_memfd(
@@ -3284,13 +3358,14 @@ mod tests {
     }
 
     /// Applies a layout the way a memory backend would: create the target at `total_size`, copy
-    /// every set page from the memfd, zero `unplugged`.
+    /// every set *and populated* page from the memfd (an unpopulated one is left zero without
+    /// reading it), zero `unplugged`.
     fn apply_layout(layout: &SnapshotMemoryLayout, memfd: &File) -> Vec<u8> {
         let page_size = u64_to_usize(layout.page_size);
         let mut target = vec![0u8; u64_to_usize(layout.total_size)];
         for page in 0..target.len() / page_size {
             let offset = page * page_size;
-            if layout.page_is_set(offset as u64) {
+            if layout.page_is_set(offset as u64) && layout.page_is_populated(offset as u64) {
                 memfd
                     .read_exact_at(&mut target[offset..offset + page_size], offset as u64)
                     .unwrap();
@@ -3357,6 +3432,26 @@ mod tests {
             // sorted and merged: strictly increasing with a gap
             assert!(pair[0].offset + pair[0].len < pair[1].offset);
         }
+        // `populated` has the same extent as `pages`, at its own granularity, and never claims
+        // an unplugged page.
+        let plugged_end = match layout.unplugged.last() {
+            Some(r) if r.offset + r.len == layout.total_size => r.offset,
+            _ => layout.total_size,
+        };
+        let backing = layout.populated_page_size;
+        assert!(backing >= page_size && backing.is_multiple_of(page_size));
+        assert_eq!(
+            layout.populated.len() as u64,
+            plugged_end.div_ceil(backing).div_ceil(8)
+        );
+        for page in plugged_end.div_ceil(backing)..layout.populated.len() as u64 * 8 {
+            assert!(!layout.page_is_populated(page * backing));
+        }
+        for range in &layout.unplugged {
+            for offset in (range.offset..range.offset + range.len).step_by(u64_to_usize(backing)) {
+                assert!(!layout.page_is_populated(offset));
+            }
+        }
     }
 
     #[test]
@@ -3367,7 +3462,7 @@ mod tests {
         let mut dump_file = TempFile::new().unwrap().into_file();
         guest_memory.dump(&mut dump_file).unwrap();
 
-        let layout = guest_memory.full_layout();
+        let layout = guest_memory.full_layout(host_page_size()).unwrap();
         assert_layout_well_formed(&layout);
         assert_eq!(layout.total_size, 12 * page_size);
         assert!(layout.pages.is_none());
@@ -3461,7 +3556,9 @@ mod tests {
 
             // Candidate: same inputs, set pages copied by the "backend".
             mark(&guest_memory);
-            let layout = guest_memory.dirty_layout(&kvm_bitmap).unwrap();
+            let layout = guest_memory
+                .dirty_layout(&kvm_bitmap, host_page_size())
+                .unwrap();
             assert_layout_well_formed(&layout);
             assert_eq!(
                 layout.total_size,
@@ -3524,7 +3621,9 @@ mod tests {
         // does. It is not in the bitmap, which ends with the last plugged slot (file page 10).
         hotplug.bitmap().mark_dirty(3 * page_size, page_size);
         kvm_bitmap.insert(4, vec![1]); // file page 10, plugged
-        let layout = guest_memory.dirty_layout(&kvm_bitmap).unwrap();
+        let layout = guest_memory
+            .dirty_layout(&kvm_bitmap, host_page_size())
+            .unwrap();
         assert_layout_well_formed(&layout);
         assert!(!layout.page_is_set(11 * page_size as u64));
         assert!(layout.page_is_set(10 * page_size as u64));
@@ -3534,7 +3633,9 @@ mod tests {
         // Same marks, but the slot is plugged again before the call: reported.
         hotplug.bitmap().mark_dirty(3 * page_size, page_size);
         hotplug.plugged.lock().unwrap().set(3, true);
-        let layout = guest_memory.dirty_layout(&kvm_bitmap).unwrap();
+        let layout = guest_memory
+            .dirty_layout(&kvm_bitmap, host_page_size())
+            .unwrap();
         assert_layout_well_formed(&layout);
         assert!(layout.page_is_set(11 * page_size as u64));
         assert_eq!(layout.unplugged.len(), 1);
@@ -3552,7 +3653,9 @@ mod tests {
 
         // Nothing dirty: the bitmap still covers everything up to the last plugged slot (file
         // page 10, so 11 pages, 2 bytes), and nothing more.
-        let layout = guest_memory.dirty_layout(&kvm_bitmap).unwrap();
+        let layout = guest_memory
+            .dirty_layout(&kvm_bitmap, host_page_size())
+            .unwrap();
         assert_layout_well_formed(&layout);
         assert_eq!(layout.pages.as_deref(), Some(&[0u8, 0][..]));
         assert_eq!(layout.total_size, 12 * page_size as u64);
@@ -3566,7 +3669,9 @@ mod tests {
             plugged.set(2, false);
         }
         hotplug.bitmap().mark_dirty(0, 4 * page_size);
-        let layout = guest_memory.dirty_layout(&kvm_bitmap).unwrap();
+        let layout = guest_memory
+            .dirty_layout(&kvm_bitmap, host_page_size())
+            .unwrap();
         assert_layout_well_formed(&layout);
         assert_eq!(layout.pages.as_deref(), Some(&[0u8][..]));
         assert_eq!(
@@ -3578,9 +3683,83 @@ mod tests {
         );
 
         // The full layout has no bitmap regardless.
-        let layout = guest_memory.full_layout();
+        let layout = guest_memory.full_layout(host_page_size()).unwrap();
         assert!(layout.pages.is_none());
         assert_eq!(layout.set_pages(), 8);
+    }
+
+    #[test]
+    fn test_populated_bitmap() {
+        // Pages written through the memfd are resident; pages punched out are not; pages never
+        // touched are not. The layout code reports exactly that, at backing page granularity,
+        // for plugged slots only, and copying by it reproduces `dump`.
+        let (guest_memory, backing) = layout_test_memory();
+        let page_size = host_page_size();
+        let page = page_size as u64;
+        let hotplug = guest_memory.iter().nth(2).unwrap();
+
+        // Everything was written through the memfd: all plugged pages are populated, the
+        // unplugged ones (file pages 9 and 11) are not reported even though they hold data.
+        let layout = guest_memory.full_layout(page_size).unwrap();
+        assert_layout_well_formed(&layout);
+        assert_eq!(layout.populated_page_size, page);
+        assert_eq!(layout.populated_pages(), 10);
+        assert!(layout.page_is_populated(0));
+        assert!(layout.page_is_populated(8 * page));
+        assert!(!layout.page_is_populated(9 * page));
+        assert!(layout.page_is_populated(10 * page));
+
+        // Discard DRAM pages 1 and 2 (balloon): holes, not populated any more, but dirty.
+        guest_memory
+            .discard_range(GuestAddress(page), 2 * page_size)
+            .unwrap();
+        let mut kvm_bitmap: DirtyBitmap = HashMap::new();
+        for slot in 0..6 {
+            kvm_bitmap.insert(slot, vec![0]);
+        }
+        let layout = guest_memory.dirty_layout(&kvm_bitmap, page_size).unwrap();
+        assert_layout_well_formed(&layout);
+        assert!(layout.page_is_set(page));
+        assert!(layout.page_is_set(2 * page));
+        assert!(!layout.page_is_populated(page));
+        assert!(!layout.page_is_populated(2 * page));
+        assert!(layout.page_is_populated(0));
+        assert!(layout.page_is_populated(3 * page));
+        assert_eq!(layout.populated_pages(), 8);
+
+        // Skipping the unpopulated dirty pages is right: the memfd reads zeros there. (That
+        // skipping reproduces `dump`/`dump_dirty` in general is what the identity tests check,
+        // since `apply_layout` skips them too.)
+        let mut hole = vec![0xFFu8; 2 * page_size];
+        backing.file.read_exact_at(&mut hole, page).unwrap();
+        assert!(hole.iter().all(|&b| b == 0));
+        let actual = apply_layout(&layout, &backing.file);
+        assert!(actual[page_size..3 * page_size].iter().all(|&b| b == 0));
+
+        // Touching a punched page through the mapping repopulates it (with zeros).
+        guest_memory.write(&[0u8; 1], GuestAddress(page)).unwrap();
+        let layout = guest_memory.full_layout(page_size).unwrap();
+        assert!(layout.page_is_populated(page));
+        assert!(!layout.page_is_populated(2 * page));
+
+        // Coarser backing page: with an 8K "backing page" every pair of 4K pages is one bit,
+        // set if the first of the pair is resident. (This test memory's slots are not 8K
+        // multiples, unlike real ones, so only look at the first, aligned backing page.)
+        let layout = guest_memory.full_layout(2 * page_size).unwrap();
+        assert_eq!(layout.populated_page_size, 2 * page);
+        assert_eq!(layout.populated.len(), 1);
+        assert!(layout.page_is_populated(0));
+
+        // Unplug the whole hotplug region: no populated bits past DRAM, bitmap shrinks.
+        {
+            let mut plugged = hotplug.plugged.lock().unwrap();
+            plugged.set(0, false);
+            plugged.set(2, false);
+        }
+        let layout = guest_memory.full_layout(page_size).unwrap();
+        assert_layout_well_formed(&layout);
+        assert_eq!(layout.populated.len(), 1);
+        assert_eq!(layout.populated_pages(), 7);
     }
 
     #[test]
@@ -3597,7 +3776,7 @@ mod tests {
             kvm_bitmap.insert(slot, vec![0]);
         }
         assert!(matches!(
-            guest_memory.dirty_layout(&kvm_bitmap),
+            guest_memory.dirty_layout(&kvm_bitmap, host_page_size()),
             Err(MemoryError::DirtyBitmapTooLarge)
         ));
         let first = guest_memory.iter().next().unwrap();

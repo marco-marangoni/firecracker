@@ -1597,6 +1597,8 @@ definitions:
           - total_size
           - page_size
           - unplugged
+          - populated_page_size
+          - populated
         properties:
           total_size:
             type: integer
@@ -1623,6 +1625,26 @@ definitions:
             description: Sorted, page-aligned, non-overlapping ranges to zero in the memory file.
             items:
               $ref: "#/definitions/MemoryRange"
+          populated_page_size:
+            type: integer
+            format: int64
+            description: >-
+              Granularity of `populated`, in bytes: the backing page size of guest memory (4096,
+              or 2097152 with hugetlbfs).
+          populated:
+            type: string
+            format: byte
+            description: >-
+              Standard base64 of a bitmap with one bit per `populated_page_size` bytes, same
+              byte/bit layout and same extent as `pages` (up to the end of the last plugged
+              slot). A set bit means the backing page is resident in Firecracker's mapping of
+              guest memory (mincore(2)): a read through it returns the page's content. A clear
+              bit means such a read returns zeros, unless another process wrote the page through
+              a mapping of its own and Firecracker has not touched it since (hugetlbfs), or the
+              page is swapped out (host swap must be disabled). A backend may zero, rather than
+              read, a dirty page whose bit is clear, provided the page is not one it has to serve
+              from a snapshot file itself. Bits of unplugged slots are clear. Reflects the state
+              when the response was computed; consumes nothing.
 
   Metrics:
     type: object
