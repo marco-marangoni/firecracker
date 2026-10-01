@@ -11,7 +11,9 @@ use vm_memory::GuestMemoryBackend;
 
 use crate::logger::error;
 use crate::utils::u64_to_usize;
-use crate::vstate::memory::{ByteValued, GuestAddress, GuestMemorySlice};
+use crate::vstate::memory::{
+    ByteValued, GuestAddress, GuestMemorySlice, GuestMemorySliceMut, RegionDirtyBitmap,
+};
 
 pub const VIRTQ_DESC_F_NEXT: u16 = 0x1;
 pub const VIRTQ_DESC_F_WRITE: u16 = 0x2;
@@ -230,14 +232,15 @@ pub struct Queue {
     /// }
     pub(crate) avail_ring: GuestMemorySlice,
 
-    /// Used ring in guest memory, resolved by `initialize`.
+    /// Used ring in guest memory, resolved by `initialize`. The one ring Firecracker writes to;
+    /// every write marks its page dirty.
     /// struct UsedRing {
     ///     flags: u16,
     ///     idx: u16,
     ///     ring: [UsedElement; <queue size>],
     ///     avail_event: u16,
     /// }
-    pub(crate) used_ring: GuestMemorySlice,
+    pub(crate) used_ring: GuestMemorySliceMut,
 
     pub next_avail: Wrapping<u16>,
     pub next_used: Wrapping<u16>,
@@ -262,7 +265,7 @@ impl Queue {
 
             desc_table: GuestMemorySlice::UNRESOLVED,
             avail_ring: GuestMemorySlice::UNRESOLVED,
-            used_ring: GuestMemorySlice::UNRESOLVED,
+            used_ring: GuestMemorySliceMut::UNRESOLVED,
 
             next_avail: Wrapping(0),
             next_used: Wrapping(0),
@@ -312,8 +315,15 @@ impl Queue {
         Ok(())
     }
 
-    /// Resolve the queue objects in the guest memory and mark them dirty.
-    pub fn initialize<M: GuestMemoryBackend>(&mut self, mem: &M) -> Result<(), QueueError> {
+    /// Resolve the queue objects in the guest memory.
+    ///
+    /// Nothing is marked dirty here: the descriptor table and the available ring are only
+    /// written by the guest, which KVM tracks, and the used ring is marked as it is written.
+    pub fn initialize<M>(&mut self, mem: &M) -> Result<(), QueueError>
+    where
+        M: GuestMemoryBackend,
+        M::R: RegionDirtyBitmap,
+    {
         if !self.ready {
             return Err(QueueError::NotReady);
         }
@@ -342,7 +352,8 @@ impl Queue {
             GuestMemorySlice::new(mem, self.desc_table_address, self.desc_table_size())?;
         self.avail_ring =
             GuestMemorySlice::new(mem, self.avail_ring_address, self.avail_ring_size())?;
-        self.used_ring = GuestMemorySlice::new(mem, self.used_ring_address, self.used_ring_size())?;
+        self.used_ring =
+            GuestMemorySliceMut::new(mem, self.used_ring_address, self.used_ring_size())?;
 
         Ok(())
     }
@@ -1204,7 +1215,9 @@ mod tests {
     pub use super::*;
     use crate::devices::virtio::queue::QueueError::DescIndexOutOfBounds;
     use crate::devices::virtio::test_utils::{VirtQueue, default_mem};
-    use crate::test_utils::{multi_region_mem, single_region_mem};
+    use crate::test_utils::{
+        multi_region_mem, single_region_mem, single_region_mem_dirty_tracking,
+    };
     use crate::vstate::memory::GuestAddress;
 
     #[test]
@@ -1507,6 +1520,50 @@ mod tests {
                 reported_len: 6
             }
         );
+    }
+
+    #[test]
+    fn test_used_ring_dirty_tracking() {
+        use crate::arch::host_page_size;
+        use crate::vstate::memory::{Bitmap, GuestMemoryExtension};
+
+        let page_size = host_page_size();
+        let mem = single_region_mem_dirty_tracking(page_size * 16);
+        // Put each ring on its own page so that marking can be attributed.
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        let mut q = vq.create_queue();
+        q.desc_table_address = GuestAddress(page_size as u64);
+        q.avail_ring_address = GuestAddress(2 * page_size as u64);
+        q.used_ring_address = GuestAddress(3 * page_size as u64);
+        let region = mem.find_region(GuestAddress(0)).unwrap();
+        let dirty_page = |p: usize| region.bitmap().dirty_at(p * page_size);
+        let clean = || !(0..16).any(dirty_page);
+
+        // Initializing a queue marks nothing.
+        mem.reset_dirty();
+        q.initialize(&mem).unwrap();
+        assert!(clean());
+
+        // Writing a used element marks exactly the used ring's page, right away.
+        q.add_used(1, 0x10).unwrap();
+        assert!(!dirty_page(1));
+        assert!(!dirty_page(2));
+        assert!(dirty_page(3));
+        assert!(!dirty_page(4));
+
+        // So do the index and `avail_event` writes.
+        mem.reset_dirty();
+        q.advance_used_ring_idx();
+        assert!(dirty_page(3) && !dirty_page(1) && !dirty_page(2));
+        mem.reset_dirty();
+        q.used_ring_avail_event_set(7);
+        assert!(dirty_page(3) && !dirty_page(1) && !dirty_page(2));
+
+        // Reading the rings marks nothing.
+        mem.reset_dirty();
+        let _ = q.len();
+        let _ = q.avail_ring_used_event_get();
+        assert!(clean());
     }
 
     #[test]

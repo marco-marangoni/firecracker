@@ -86,3 +86,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "used_ring_dirty"
+harness = false
