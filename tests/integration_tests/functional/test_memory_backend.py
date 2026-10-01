@@ -730,20 +730,19 @@ def check_diff_identity_across_inflate(vm, base, amount_mib, min_zeroed_mib):
     Balloon inflation punches holes into the shared memfd. Those pages are dirty
     (Firecracker marks discarded ranges) and not resident, so they are zero
     pages: the backend zeroes at least `min_zeroed_mib` worth without reading
-    guest memory, and the content in both copies is zero. With 2M pages the
-    balloon frees 4K pages and `MADV_REMOVE` only frees a huge page covered by
-    one release; Firecracker marks (and the backend zeroes) exactly those, so
-    `min_zeroed_mib` is 0 and nothing else can be assumed about the dirty set.
+    guest memory, and the content in both copies is zero. With 2M pages only a
+    huge page a single release covers entirely is punched; the rest of each
+    release is zero-written instead (dirty, resident, zeros: authoritative). The
+    Linux balloon releases at most 1 MiB at a time, so nothing is punched,
+    `min_zeroed_mib` is 0, and every released page is still in the dirty set.
     """
     inflate_balloon(vm, amount_mib)
     diff = vm.snapshot_diff(mem_path="mem_diff")
     diff_memory = vm.last_snapshot_memory
     check_layout(diff_memory, MEM_SIZE_MIB * 2**20)
-    if min_zeroed_mib:
-        assert (
-            authoritative_bytes(diff_memory) + zero_bytes(diff_memory)
-            >= amount_mib * 2**20
-        )
+    assert (
+        authoritative_bytes(diff_memory) + zero_bytes(diff_memory) >= amount_mib * 2**20
+    )
     zeroed = zeroed_bytes(vm)
     assert zeroed >= min_zeroed_mib * 2**20, zeroed
     assert zeroed == zero_bytes(diff_memory)
@@ -812,9 +811,10 @@ def test_balloon_inflate_after_restore(uvm, microvm_factory, huge_pages):
     it had populated them before or not. Snapshots taken through the backend
     must reflect that.
 
-    With 2M pages the balloon still reports 4K ranges; only huge pages the
-    guest released entirely, in one range, are punched out (`MADV_REMOVE`
-    rounds inward), and only those become non-resident.
+    With 2M pages the balloon still reports 4K ranges; only a huge page a single
+    range covers entirely is punched out, the partial ones are zero-written
+    through the mapping (which populates them), so released memory ends up
+    resident zeros rather than holes.
     """
     basevm = uvm
     basevm.spawn()
@@ -844,9 +844,7 @@ def test_balloon_inflate_after_restore(uvm, microvm_factory, huge_pages):
     # Touch some memory so that the memfd holds a mix of populated and
     # never-populated pages when the balloon takes them. The new base is the
     # restore base plus a backend diff: a Firecracker Full here would fault in
-    # every page and make the whole memfd populated (see the docstring's 2M
-    # remark: a huge page the balloon releases in several 4K batches is never
-    # punched, so it would stay resident and nothing would be zero).
+    # every page and make the whole memfd populated.
     restored_base = Snapshot(
         **(base.__dict__ | {"mem": Path(vm.chroot()) / "mem_base"})
     )
