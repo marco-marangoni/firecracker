@@ -29,9 +29,10 @@
 //!
 //! Operations: a guest write (faults the page in if it is a hole, then writes and marks in KVM's
 //! log), a device marking ahead, a device write to an armed page (not marked, by definition), a
-//! discard (punches the page to a zero hole and marks it), an ineffective discard (what
-//! `MADV_REMOVE` does to a partially covered hugetlbfs page: nothing; whether it marks is one of
-//! the two bugs below), unplug and plug of a virtio-mem page, and the snapshot itself: read the
+//! discard (punches the page to a zero hole and marks it), a discard of a page that cannot be
+//! punched on its own (a partially covered hugetlbfs page: `discard_range` writes zeros to it
+//! instead, which faults it in; whether the write happens is one of the two bugs below), unplug
+//! and plug of a virtio-mem page, and the snapshot itself: read the
 //! marks, read residency (a guest write may race between the two and between the second and the
 //! reset, modelling `dirty-pages` on a running guest), classify, reset, re-arm the virtqueue
 //! pages, and have the backend apply the layout.
@@ -53,9 +54,11 @@
 //!
 //! `L` is exactly what the two fixes found during development buy: faulting in a page when it is
 //! marked ahead of a write ([`FAULT_IN_ON_MARK`]), without which a restored virtqueue page that
-//! was marked but not yet written would be a marked *base* hole, reported zero; and marking only
-//! what a discard actually punched ([`DISCARD_MARKS_ONLY_IF_EFFECTIVE`]), without which a
-//! partially covered huge page would be a marked base hole too. The order of the two reads
+//! was marked but not yet written would be a marked *base* hole, reported zero; and never marking
+//! a page a discard left untouched ([`DISCARD_ZEROES_UNPUNCHABLE_EDGES`]: `discard_range` writes
+//! zeros to the partial huge pages it cannot free, so every page it marks is a zero hole or
+//! resident zeros), without which a partially covered huge page would be a marked base hole too.
+//! The order of the two reads
 //! ([`RESIDENCY_AFTER_DIRTY`]) is what makes a racy `dirty-pages` pass preserve `I`. The
 //! `should_panic` harnesses show that dropping any of the three breaks the proof.
 
@@ -70,9 +73,10 @@ pub const PAGES: usize = 4;
 /// Fix 1: a device that marks a page dirty ahead of writing it faults the page in first
 /// (`fault_in_marked_range`).
 pub const FAULT_IN_ON_MARK: bool = true;
-/// Fix 2: a discard marks a page dirty only if it actually punched it (`discard_range` rounds a
-/// hugetlbfs range inward before marking).
-pub const DISCARD_MARKS_ONLY_IF_EFFECTIVE: bool = true;
+/// Fix 2: a discard writes zeros to the pages it cannot free (the partial huge pages at either
+/// end of a hugetlbfs range), so that the whole range it marks reads as zero. Without it such a
+/// page would be marked while still holding its old content, a base hole if never populated.
+pub const DISCARD_ZEROES_UNPUNCHABLE_EDGES: bool = true;
 /// Rule 3: residency is read after the dirty state, never before, so that a page written between
 /// the two reads is seen as resident (and reported in the next set) rather than as a dirty hole.
 pub const RESIDENCY_AFTER_DIRTY: bool = true;
@@ -294,16 +298,19 @@ impl State {
         page.fc_marked = true;
     }
 
-    /// A discard that the kernel did not carry out: `MADV_REMOVE` on a range that does not cover
-    /// a whole hugetlbfs page. Nothing changes for the guest.
-    pub fn discard_ineffective(&mut self, p: usize) {
+    /// A discard of a page the kernel cannot free on its own (part of a hugetlbfs huge page the
+    /// range does not cover entirely): `discard_range` writes zeros to it through the mapping
+    /// instead, which faults it in, and marks it. The guest reads zero either way.
+    pub fn discard_edge(&mut self, p: usize) {
         let page = &mut self.pages[p];
         if page.unplugged {
             return;
         }
-        if !DISCARD_MARKS_ONLY_IF_EFFECTIVE {
-            page.fc_marked = true;
+        if DISCARD_ZEROES_UNPUNCHABLE_EDGES {
+            page.fault_in();
+            page.memfd = Memfd::Present(0);
         }
+        page.fc_marked = true;
     }
 
     /// virtio-mem unplugs page `p`: discarded, marked, inaccessible.
@@ -591,7 +598,7 @@ mod verification {
             2 => s.device_write_armed(p, kani::any()),
             3 => s.device_write_then_mark(p, kani::any()),
             4 => s.discard(p),
-            5 => s.discard_ineffective(p),
+            5 => s.discard_edge(p),
             6 => s.unplug(p),
             7 => s.plug(p),
             8 => {
@@ -688,12 +695,12 @@ mod verification {
         assert!(s.lemma());
     }
 
-    /// Without rounding discards inward, a partially covered huge page is marked but neither
-    /// punched nor written: a marked base hole if the handler never populated it.
+    /// Without zero-writing the unpunchable edges, a partially covered huge page is marked but
+    /// neither punched nor written: a marked base hole if the handler never populated it.
     #[kani::proof]
     #[kani::unwind(5)]
     #[kani::should_panic]
-    fn without_effective_discard_check_the_invariant_breaks() {
+    fn without_zeroing_discard_edges_the_invariant_breaks() {
         let mut s = any_state();
         let p = any_index();
         kani::assume(!s.pages[p].unplugged);
@@ -749,7 +756,7 @@ mod tests {
                 2 => s.device_write_armed(p, self.byte()),
                 3 => s.device_write_then_mark(p, self.byte()),
                 4 => s.discard(p),
-                5 => s.discard_ineffective(p),
+                5 => s.discard_edge(p),
                 6 => s.unplug(p),
                 7 => s.plug(p),
                 8 => {
@@ -812,11 +819,12 @@ mod tests {
 
         // A partial hugetlbfs discard on a never-populated restored page.
         let mut s = State::restored([9; PAGES], [false; PAGES]);
-        s.pages[1].fc_marked = true; // marked though nothing was punched
+        s.pages[1].fc_marked = true; // marked though neither punched nor zero-written
         assert!(!s.lemma());
         let mut s = State::restored([9; PAGES], [false; PAGES]);
-        s.discard_ineffective(1);
+        s.discard_edge(1);
         assert!(s.lemma());
+        assert_eq!(s.pages[1].guest(), 0);
         s.snapshot(Race::default());
         s.apply_all();
         assert!(s.file_matches_guest());

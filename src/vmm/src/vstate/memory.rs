@@ -2434,10 +2434,10 @@ mod tests {
     }
 
     #[test]
-    fn test_discard_range_on_memfd() {
-        // Guest memory shared through a memfd (vhost-user, memory backend): discarding must
-        // punch a hole in the file itself, not merely drop our page table entries, so that the
-        // memory is released and every mapping of the memfd (ours, the peer's) reads zeros.
+    fn test_discard_range_on_memfd_marks_dirty_and_is_a_hole() {
+        // Guest memory shared through a memfd (vhost-user, memory backend): the discard is a
+        // hole in the file itself, visible as zeros through the peer's view of the fd, and the
+        // range is marked dirty so that a diff records it.
         let page_size = host_page_size();
         let mut backing = MemfdBacking::new(2 * page_size as u64, HugePageConfig::None).unwrap();
         let regions = backing

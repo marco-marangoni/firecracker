@@ -883,26 +883,37 @@ just unregisters.
 
 #### Discards: balloon and virtio-mem
 
-`GuestRegionMmapExt::discard_range` used `madvise(MADV_DONTNEED)` for shared
-file mappings, which only drops Firecracker's page table entries and releases
-nothing (the vhost-user memfd path inherited that, and the balloon never
-reclaimed host memory there). It now uses `madvise(MADV_REMOVE)` for shared file
-mappings, which punches a hole into the memfd: the pages are freed and read as
-zero through every mapping, exactly what `MADV_DONTNEED` achieves for anonymous
-memory. `MADV_REMOVE` rather than `fallocate(PUNCH_HOLE)` on the fd, because it
-goes through `userfaultfd_remove()` and the registered handler keeps receiving
-the `remove` event (Firecracker's `madvise` blocks until the handler has read
-it). That event is what lets the handler stop serving the range from its
-snapshot file; the recommended handling is to unregister the range, after which
-the kernel serves zero pages for it without the handler. A handler that ignores
-`remove` events, or keeps a punched range registered while its bitmap still says
-the pages are populated, produces copies that differ from the guest's view.
+*(Revised after rebasing on `main`: #6237 landed `MADV_REMOVE` for shared memfd
+mappings and the zeroing of partial huge pages independently of this work; the
+marking is what this design adds on top.)*
 
-`discard_range` also marks every discarded range dirty in Firecracker's bitmap,
-so that the next `Diff` (Firecracker-written or backend-copied) records the
-zeroed pages instead of leaving the pre-release bytes in a merged file. This
-needs `track_dirty_pages`: a `mincore`-based diff only sees resident pages and
-cannot express "this page became zero".
+`GuestRegionMmapExt::discard_range` on `main` now does three things to a range:
+frees the whole backing pages inside it (`MADV_DONTNEED` for anonymous memory,
+`MADV_REMOVE` for shared file mappings, a fresh anonymous mapping for a private
+snapshot-file mapping), writes zeros through the mapping to the partial backing
+pages at either end that cannot be freed on their own (hugetlbfs), and skips
+edges in unplugged slots. The guarantee it gives is the one this design needs:
+*after a discard, every page of the range reads as zero*, whether as a hole or
+as resident zeros. `MADV_REMOVE` rather than `fallocate(PUNCH_HOLE)` on the fd
+because it goes through `userfaultfd_remove()`, so a registered handler receives
+the `remove` event and stops serving the range from its snapshot file.
+
+This design adds one line: `discard_range` marks the whole range dirty in
+Firecracker's bitmap, after the discard, so that the next `Diff`
+(Firecracker-written or backend-copied) records the zeroed pages instead of
+leaving the pre-release bytes in a merged file. With the zeroing of edges, the
+mark is exact at 4 KiB on hugetlbfs too: a freed huge page is dirty and not
+resident (reported zero), a zero-written edge is dirty and resident (reported
+authoritative, content zero), and nothing in the range keeps its old content. An
+earlier revision of this branch rounded the mark inward to the huge page
+instead, because `MADV_REMOVE` alone left the edges with their old content; the
+zero-write supersedes that. Marking needs `track_dirty_pages`: a `mincore`-based
+diff only sees resident pages and cannot express "this page became zero".
+
+The cost noted in #6237 applies here unchanged: zero-writing an edge allocates a
+huge page the guest may never have touched, so with hugetlbfs the traditional
+balloon reclaims nothing and can increase host memory use; free page hinting and
+reporting work in whole huge pages.
 
 ### 10. Byte-for-byte identity: how it is demonstrated
 
@@ -926,9 +937,10 @@ implementations are driven from identical inputs:
   `test_layout_unplugged_slots_are_zero`); `classify` against a hand-built
   layout, the wire format of the documentation example byte for byte, and
   malformed input (`vmm_config::snapshot::tests`).
-- `discard_range` on a shared hugetlbfs mapping rounds inward to the huge page,
-  freeing and marking exactly what `MADV_REMOVE` frees
-  (`test_discard_range_on_hugetlbfs_memfd_rounds_inward`).
+- `discard_range` on a shared hugetlbfs mapping frees whole huge pages and
+  zero-writes the partial ones, and marks the whole range; the freed pages are
+  holes and the edges resident zeros
+  (`test_discard_range_on_hugetlbfs_memfd_zeroes_edges`).
 - Request validation: `mem_file_path` is required or forbidden per snapshot type
   and backend presence, checked before anything is written
   (`persist::tests::test_create_snapshot_params_validation`).
@@ -1062,10 +1074,9 @@ user can see.
    `memory::create` with a base offset, `VmResources::allocate_guest_memory`
    returning the backing for `allocate_memory_region` to continue from;
    offset-invariant unit test.
-1. *(no API)* Discards on shared memory: `discard_range` uses `MADV_REMOVE` for
-   shared file mappings, rounds a hugetlbfs range inward to the backing page
-   before punching and marks exactly what it punched; unit tests for the hole,
-   the marks and the rounding. Also fixes balloon reclaim for vhost-user.
+1. *(no API)* Dirty marking of discards: `discard_range` marks the whole range
+   after freeing and zero-writing it (the discard mechanics themselves landed on
+   `main` in #6237); unit tests for the marks on memfd and hugetlbfs memfd.
 1. *(no API)* Fault-in on mark-ahead: `fault_in_marked_range` after
    `GuestMemorySlice::new` and in `IoVecBufferMut::append_descriptor_chain`;
    unit test. (Superseded for RX buffers by the first item of the next list.)
@@ -1151,8 +1162,9 @@ user can see.
   resident pages, not promised to be exact.
 - Firecracker upholds "dirty ⇒ memfd authoritative or zero" by faulting in every
   range it marks dirty ahead of writing it (`fault_in_marked_range`), and takes
-  `mincore` after reading the dirty state. On hugetlbfs, `discard_range` frees
-  and marks whole huge pages only, as `MADV_REMOVE` does.
+  `mincore` after reading the dirty state. `discard_range` leaves every page of
+  a discarded range reading as zero (freed, or zero-written where a huge page
+  cannot be freed) before marking it.
 - Firecracker writes `Full` snapshots, backend or not; only a `Diff` with a
   backend goes to the backend: `PUT /snapshot/create Diff` then never writes
   memory, takes no `mem_file_path`, and answers 200 instead of 204.
@@ -1262,8 +1274,11 @@ document:
   dirty while `MADV_REMOVE` freed only the huge pages the range covered
   entirely: the rest was reported dirty but was neither in the memfd nor zero.
   The 2M balloon-after-restore test caught it once the backend stopped keeping
-  its own record; `discard_range` now rounds inward to the backing page for
-  shared file mappings, as the kernel does.
+  its own record. This branch first rounded the mark inward to the backing page;
+  `main` (#6237) then made `discard_range` zero-write the partial pages, which
+  restores "every page of the range reads as zero" and lets the mark cover the
+  whole range again. The Kani harness
+  `without_zeroing_discard_edges_the_invariant_breaks` keeps the rule.
 - Firecracker's `snapshot_layout` reports the layout in a single pass over two
   byte-per-page maps (`SnapshotMemoryLayout::classify`), which turned out to be
   the fastest of the formats measured, not the slowest as one might expect from
