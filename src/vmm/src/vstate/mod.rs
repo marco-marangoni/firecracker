@@ -11,6 +11,9 @@ pub mod kvm;
 pub mod memory;
 /// Resource manager for devices.
 pub mod resources;
+/// A model of diff snapshots with a memory backend, verified with Kani.
+#[cfg(any(test, kani))]
+pub mod snapshot_layout_model;
 /// Module with Vcpu implementation.
 pub mod vcpu;
 /// Module with Vm implementation.

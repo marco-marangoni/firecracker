@@ -330,7 +330,11 @@ simple rules. These rules cannot be enforced by Firecracker.
 
 - The authoritative pages returned by the `/snapshot/dirty-pages` and
   `/snapshot/create` APIs must be eventually copied into the snapshot, and the
-  zero pages must read as zero in it
+  zero pages must read as zero in it. Responses must be applied in the order
+  they were received: a page zeroed by one response and copied by the next would
+  otherwise end up zero, with nothing left to correct it. Applying them late is
+  fine; the memfd may hold a newer value by then, and the write that made it
+  newer is in a later response
 - If a response is lost (e.g. connection dropped before the body was read), that
   dirty information is gone and the next snapshot must be a `Full` snapshot,
   which Firecracker writes itself

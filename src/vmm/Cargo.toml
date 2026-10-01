@@ -85,9 +85,5 @@ harness = false
 name = "memory_access"
 harness = false
 
-[[bench]]
-name = "snapshot_layout"
-harness = false
-
 [lints]
 workspace = true
