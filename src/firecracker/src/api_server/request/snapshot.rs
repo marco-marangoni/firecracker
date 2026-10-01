@@ -60,17 +60,15 @@ fn parse_put_snapshot_create(body: &Body) -> Result<ParsedRequest, RequestError>
     )))
 }
 
-/// `PUT /snapshot/dirty-pages`: the body is reserved for future options and must currently be
-/// empty or an empty JSON object.
+/// `PUT /snapshot/dirty-pages`: no parameters. An empty body or an empty JSON object is
+/// accepted, so that fields can be added later without breaking clients that send `{}`.
 fn parse_put_snapshot_dirty_pages(body: &Body) -> Result<ParsedRequest, RequestError> {
     let raw = body.raw();
     if !raw.is_empty() {
-        let value = serde_json::from_slice::<serde_json::Value>(raw)?;
-        if value != serde_json::json!({}) {
-            return Err(RequestError::SerdeJson(serde_json::Error::custom(
-                "PUT /snapshot/dirty-pages takes no parameters",
-            )));
-        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Empty {}
+        serde_json::from_slice::<Empty>(raw)?;
     }
     Ok(ParsedRequest::new_sync(VmmAction::GetDirtyPages))
 }
@@ -507,6 +505,11 @@ mod tests {
                 "body {body:?}"
             );
         }
+        parse_put_snapshot(
+            &Body::new(r#"{"zero_chunk_size": 4096}"#),
+            Some("dirty-pages"),
+        )
+        .unwrap_err();
         parse_put_snapshot(&Body::new(r#"{"format": "ranges"}"#), Some("dirty-pages")).unwrap_err();
         parse_put_snapshot(&Body::new("not json"), Some("dirty-pages")).unwrap_err();
         // The old name is gone.

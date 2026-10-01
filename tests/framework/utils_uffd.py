@@ -117,10 +117,11 @@ class UffdHandler:
         return json.loads(raw)
 
     def copy(self, memory: dict, mem_path: str):
-        """Ask the handler to write the `memory` object returned by Firecracker
-        (`PUT /snapshot/create` or `PUT /snapshot/dirty-pages`) into `mem_path`,
-        a path inside the handler's chroot. Creates the file at `total_size` or
-        merges into an existing one.
+        """Ask the handler to apply the `memory` object returned by Firecracker
+        (`PUT /snapshot/create` for a diff, or `PUT /snapshot/dirty-pages`) to
+        `mem_path`, a path inside the handler's chroot: authoritative pages from
+        the memfd, zero pages zeroed, the rest left alone. Creates the file at
+        `total_size` or merges into an existing one.
         """
         reply = self.control({"Copy": {"mem_path": mem_path, "memory": memory}})
         done = reply["Done"]
