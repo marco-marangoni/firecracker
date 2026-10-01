@@ -38,7 +38,7 @@ use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
 use crate::vmm_config::snapshot::{
-    CreateSnapshotParams, LoadSnapshotParams, MemBackendType, SnapshotMemoryLayout,
+    CreateSnapshotParams, LoadSnapshotParams, MemBackendType, SnapshotMemoryLayout, SnapshotType,
 };
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
@@ -162,9 +162,9 @@ pub enum CreateSnapshotError {
     SerializeMicrovmState(#[from] crate::snapshot::SnapshotError),
     /// Cannot perform {0} on the snapshot backing file: {1}
     SnapshotBackingFile(&'static str, io::Error),
-    /// `mem_file_path` must not be given when a memory backend is attached: Firecracker does not write guest memory in that mode
+    /// `mem_file_path` must not be given for a Diff snapshot when a memory backend is attached: the backend produces the diff
     MemFilePathWithMemBackend,
-    /// `mem_file_path` is required when no memory backend is attached
+    /// `mem_file_path` is required
     MissingMemFilePath,
 }
 
@@ -173,18 +173,21 @@ pub const SNAPSHOT_VERSION: Version = Version::new(12, 0, 0);
 
 /// Creates a Microvm snapshot.
 ///
-/// Without a memory backend, guest memory is written to `params.mem_file_path` and `None` is
-/// returned. With a memory backend attached, no memory is written; instead the returned
-/// [`SnapshotMemoryLayout`] tells the backend which pages of the shared memfd make up the
-/// snapshot. Either way the dirty tracking state is consumed exactly as it would be by writing
-/// the corresponding memory file.
+/// Guest memory is written to `params.mem_file_path` and `None` is returned, except for a `Diff`
+/// snapshot of a microVM with a memory backend attached: then no memory is written and the
+/// returned [`SnapshotMemoryLayout`] tells the backend which pages of the shared memfd make up
+/// the diff. A `Full` snapshot always goes through Firecracker's own mapping, which with a
+/// backend faults every page in (the backend serves the ones it has not populated yet) and so
+/// produces a complete file whatever dirty state has been consumed before. Either way the dirty
+/// tracking state is consumed.
 pub fn create_snapshot(
     vmm: &mut Vmm,
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<Option<SnapshotMemoryLayout>, CreateSnapshotError> {
+    let backend_diff = vmm.mem_backend_attached && params.snapshot_type == SnapshotType::Diff;
     // Validate before saving anything, so a rejected request has no side effects.
-    let mem_file_path = match (vmm.mem_backend_attached, &params.mem_file_path) {
+    let mem_file_path = match (backend_diff, &params.mem_file_path) {
         (true, Some(_)) => return Err(CreateSnapshotError::MemFilePathWithMemBackend),
         (false, None) => return Err(CreateSnapshotError::MissingMemFilePath),
         (true, None) => None,
@@ -215,10 +218,7 @@ pub fn create_snapshot(
             )?;
             None
         }
-        None => Some(kvm_vm.snapshot_memory_layout(
-            params.snapshot_type,
-            vmm.machine_config.huge_pages.page_size(),
-        )?),
+        None => Some(kvm_vm.snapshot_memory_layout()?),
     };
 
     // We need to mark queues as dirty again for all activated devices. The reason we
@@ -746,6 +746,7 @@ pub fn send_uffd_handshake(
 #[cfg(test)]
 mod tests {
     use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
 
     use vmm_sys_util::tempfile::TempFile;
 
@@ -823,6 +824,48 @@ mod tests {
         insert_vmclock_device(&mut vmm);
 
         vmm
+    }
+
+    #[test]
+    fn test_create_snapshot_params_validation() {
+        // Rejected requests must fail before anything is saved: the vmstate path is unwritable
+        // so that a request that got past validation would fail differently.
+        let vm_info = VmInfo::default();
+        let snapshot_path = PathBuf::from("/proc/nonexistent/vmstate");
+        let params = |snapshot_type, mem_file_path| CreateSnapshotParams {
+            snapshot_type,
+            snapshot_path: snapshot_path.clone(),
+            mem_file_path,
+            sync_snapshot_files: false,
+        };
+        let mem = Some(PathBuf::from("/proc/nonexistent/mem"));
+
+        // Without a backend: `mem_file_path` required.
+        let mut vmm = default_vmm();
+        assert!(!vmm.mem_backend_attached);
+        for snapshot_type in [SnapshotType::Full, SnapshotType::Diff] {
+            assert!(matches!(
+                create_snapshot(&mut vmm, &vm_info, &params(snapshot_type, None)),
+                Err(CreateSnapshotError::MissingMemFilePath)
+            ));
+        }
+
+        // With a backend: a Full is written by Firecracker exactly as without one; only a Diff
+        // is described to the backend, and then `mem_file_path` must be absent.
+        vmm.mem_backend_attached = true;
+        assert!(matches!(
+            create_snapshot(&mut vmm, &vm_info, &params(SnapshotType::Full, None)),
+            Err(CreateSnapshotError::MissingMemFilePath)
+        ));
+        assert!(matches!(
+            create_snapshot(&mut vmm, &vm_info, &params(SnapshotType::Diff, mem)),
+            Err(CreateSnapshotError::MemFilePathWithMemBackend)
+        ));
+        // A valid Diff request gets past validation and fails on the unwritable vmstate path.
+        assert!(matches!(
+            create_snapshot(&mut vmm, &vm_info, &params(SnapshotType::Diff, None)),
+            Err(CreateSnapshotError::SnapshotBackingFile(..))
+        ));
     }
 
     #[test]

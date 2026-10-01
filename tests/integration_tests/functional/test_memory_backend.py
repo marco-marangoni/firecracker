@@ -7,19 +7,24 @@ to the ones Firecracker writes itself.
 The test framework plays the orchestrator: it calls `PUT /snapshot/create` (or
 `PUT /snapshot/dirty-pages`), receives the `memory` object and forwards it to
 the example handler's control socket, which copies the set pages out of the memfd.
+Full snapshots are Firecracker's own, memory backend or not.
 """
+
+# pylint: disable=too-many-lines
 
 import base64
 import filecmp
 import platform
 import shutil
+import struct
 from pathlib import Path
 from subprocess import TimeoutExpired
 
 import pytest
 
+import host_tools.cargo_build as build_tools
 from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel
-from framework.microvm import SnapshotType
+from framework.microvm import Snapshot, SnapshotType
 from framework.utils import get_stable_rss_mem, make_guest_dirty_memory
 from framework.utils_hugepages import HugePagesConfig
 from integration_tests.functional.test_balloon import wait_for_balloon_actual
@@ -83,128 +88,118 @@ def boot_with_mem_backend(
 PAGE_SIZE = 4096
 
 
-def decode_pages(memory):
-    """The `pages` bitmap of a `memory` object as bytes, or None for a `Full`."""
-    if "pages" not in memory:
-        return None
-    return base64.b64decode(memory["pages"], validate=True)
+def roaring_decode(data):
+    """Decode a Roaring bitmap in the portable serialization format
+    (https://github.com/RoaringBitmap/RoaringFormatSpec) into a set of ints.
+
+    Written out rather than taken from `pyroaring` so that the test checks
+    Firecracker's output against the specification independently."""
+    serial_cookie_no_runcontainer = 12346
+    serial_cookie = 12347
+    cookie = struct.unpack_from("<I", data, 0)[0]
+    pos = 4
+    if (cookie & 0xFFFF) == serial_cookie:
+        size = (cookie >> 16) + 1
+        run_bytes = (size + 7) // 8
+        run_flags = data[pos : pos + run_bytes]
+        pos += run_bytes
+        has_offsets = size >= 4
+    elif cookie == serial_cookie_no_runcontainer:
+        size = struct.unpack_from("<I", data, pos)[0]
+        pos += 4
+        run_flags = bytes(1)
+        has_offsets = True
+    else:
+        raise ValueError(f"bad Roaring cookie {cookie:#x}")
+    keys_cards = [struct.unpack_from("<HH", data, pos + 4 * i) for i in range(size)]
+    pos += 4 * size
+    if has_offsets:
+        pos += 4 * size
+    out = set()
+    for i, (key, card_minus_one) in enumerate(keys_cards):
+        card = card_minus_one + 1
+        base = key << 16
+        if run_flags[i // 8] & (1 << (i % 8)) if i // 8 < len(run_flags) else False:
+            nruns = struct.unpack_from("<H", data, pos)[0]
+            pos += 2
+            for _ in range(nruns):
+                start, length = struct.unpack_from("<HH", data, pos)
+                pos += 4
+                out.update(range(base + start, base + start + length + 1))
+        elif card <= 4096:
+            out.update(base + v for v in struct.unpack_from(f"<{card}H", data, pos))
+            pos += 2 * card
+        else:
+            for w, word in enumerate(struct.unpack_from("<1024Q", data, pos)):
+                while word:
+                    out.add(base + 64 * w + (word & -word).bit_length() - 1)
+                    word &= word - 1
+            pos += 8192
+    assert pos == len(data), f"trailing bytes in Roaring bitmap: {len(data) - pos}"
+    return out
 
 
-def decode_populated(memory):
-    """The `populated` bitmap of a `memory` object as bytes."""
-    return base64.b64decode(memory["populated"], validate=True)
+def pages(memory, field):
+    """A bitmap field of a `memory` object as a set of page indices."""
+    assert memory["bitmap_encoding"] == "roaring"
+    return roaring_decode(base64.b64decode(memory[field], validate=True))
 
 
-def page_populated(memory, offset):
-    """Whether the backing page at `offset` is reported resident."""
-    bitmap = decode_populated(memory)
-    page = offset // memory["populated_page_size"]
-    return page // 8 < len(bitmap) and bool(bitmap[page // 8] & (1 << (page % 8)))
+def authoritative_bytes(memory):
+    """Bytes the backend must copy from the memfd."""
+    return len(pages(memory, "memfd_authoritative_pages")) * memory["page_size"]
 
 
-def populated_bytes(memory):
-    """Total bytes reported resident."""
+def zero_bytes(memory):
+    """Bytes the backend must zero."""
+    return len(pages(memory, "zero_pages")) * memory["page_size"]
+
+
+def is_authoritative(memory, offset):
+    """Whether the page at `offset` is to be copied from the memfd."""
+    return offset // memory["page_size"] in pages(memory, "memfd_authoritative_pages")
+
+
+def is_zero(memory, offset):
+    """Whether the page at `offset` is to be zeroed."""
+    return offset // memory["page_size"] in pages(memory, "zero_pages")
+
+
+def class_bytes_in(memory, offset, length):
+    """(authoritative, zero) bytes within `[offset, offset + length)`."""
+    page_size = memory["page_size"]
+    window = set(range(offset // page_size, (offset + length) // page_size))
     return (
-        sum(byte.bit_count() for byte in decode_populated(memory))
-        * memory["populated_page_size"]
+        len(pages(memory, "memfd_authoritative_pages") & window) * page_size,
+        len(pages(memory, "zero_pages") & window) * page_size,
     )
-
-
-def zeroed_bytes(vm):
-    """Bytes the backend zeroed instead of reading, in its last copy for `vm`."""
-    return vm.last_backend_copy["zeroed_bytes"]
-
-
-def plugged_end(memory):
-    """End offset of the last plugged slot: the file minus a trailing unplugged range."""
-    unplugged = memory["unplugged"]
-    if (
-        unplugged
-        and unplugged[-1]["offset"] + unplugged[-1]["len"] == memory["total_size"]
-    ):
-        return unplugged[-1]["offset"]
-    return memory["total_size"]
-
-
-def in_unplugged(memory, offset):
-    """Whether `offset` lies in an `unplugged` range."""
-    return any(
-        r["offset"] <= offset < r["offset"] + r["len"] for r in memory["unplugged"]
-    )
-
-
-def page_set(memory, page):
-    """Whether `page` is to be copied: its bit is set, or this is a `Full` and it is plugged."""
-    bitmap = decode_pages(memory)
-    offset = page * memory["page_size"]
-    if bitmap is None:
-        return offset < memory["total_size"] and not in_unplugged(memory, offset)
-    return page // 8 < len(bitmap) and bool(bitmap[page // 8] & (1 << (page % 8)))
 
 
 def check_layout(memory, total_size):
     """Sanity checks on a `memory` object returned by Firecracker."""
     assert memory["total_size"] == total_size
     assert memory["page_size"] == PAGE_SIZE
-    unplugged = memory["unplugged"]
-    for rng in unplugged:
-        assert rng["len"] > 0
-        assert rng["offset"] % PAGE_SIZE == 0
-        assert rng["len"] % PAGE_SIZE == 0
-        assert rng["offset"] + rng["len"] <= total_size
-    # sorted and merged
-    for prev, cur in zip(unplugged, unplugged[1:]):
-        assert prev["offset"] + prev["len"] < cur["offset"]
-    bitmap = decode_pages(memory)
-    if bitmap is not None:
-        # The bitmap covers the file up to the last plugged slot, whatever is dirty.
-        covered_pages = -(-plugged_end(memory) // PAGE_SIZE)
-        assert len(bitmap) == -(-covered_pages // 8)
-        # Bits past the last plugged page, and bits of unplugged slots, are clear.
-        for page in range(covered_pages, len(bitmap) * 8):
-            assert not page_set(memory, page)
-        for rng in unplugged:
-            assert set_bytes_in(memory, rng["offset"], rng["len"]) == 0
-    # `populated`: backing-page granularity, same extent, nothing in unplugged slots.
-    backing = memory["populated_page_size"]
-    assert backing in (PAGE_SIZE, 2 * 2**20)
-    populated = decode_populated(memory)
-    covered = -(-plugged_end(memory) // backing)
-    assert len(populated) == -(-covered // 8)
-    for page in range(covered, len(populated) * 8):
-        assert not page_populated(memory, page * backing)
-    for rng in unplugged:
-        for offset in range(rng["offset"], rng["offset"] + rng["len"], backing):
-            assert not page_populated(memory, offset)
+    assert memory["bitmap_encoding"] == "roaring"
+    authoritative = pages(memory, "memfd_authoritative_pages")
+    zero = pages(memory, "zero_pages")
+    # Within the file, and disjoint.
+    assert all(p < total_size // PAGE_SIZE for p in authoritative | zero)
+    assert not authoritative & zero
 
 
-def covered_bytes(ranges):
-    """Total number of bytes covered by a range list."""
-    return sum(rng["len"] for rng in ranges)
+def wire_bytes(memory, field):
+    """Size of a bitmap field as sent, before base64."""
+    return len(base64.b64decode(memory[field], validate=True))
 
 
-def set_bytes(memory):
-    """Total number of bytes to copy according to `memory`."""
-    bitmap = decode_pages(memory)
-    if bitmap is None:
-        return memory["total_size"] - covered_bytes(memory["unplugged"])
-    return sum(byte.bit_count() for byte in bitmap) * memory["page_size"]
+def copied_bytes(vm):
+    """Bytes the backend copied from the memfd in its last copy for `vm`."""
+    return vm.last_backend_copy["copied_bytes"]
 
 
-def set_pages(memory):
-    """Sorted list of the pages to copy."""
-    return [
-        page
-        for page in range(memory["total_size"] // memory["page_size"])
-        if page_set(memory, page)
-    ]
-
-
-def set_bytes_in(memory, offset, length):
-    """Bytes to copy within `[offset, offset + length)`."""
-    page_size = memory["page_size"]
-    first, last = offset // page_size, (offset + length) // page_size
-    return sum(1 for page in range(first, last) if page_set(memory, page)) * page_size
+def zeroed_bytes(vm):
+    """Bytes the backend zeroed in its last copy for `vm`."""
+    return vm.last_backend_copy["zeroed_bytes"]
 
 
 def differing_pages(path_a, path_b, page_size=4096):
@@ -224,27 +219,32 @@ def differing_pages(path_a, path_b, page_size=4096):
 
 
 @pytest.mark.parametrize("huge_pages", PAGE_CONFIGS)
-def test_boot_full_snapshot_restores(uvm, microvm_factory, huge_pages):
+def test_boot_diff_snapshot_restores(uvm, microvm_factory, huge_pages):
     """
-    Boot with a memory backend, take a full snapshot through it and restore
-    from the resulting memory file (with the plain `File` backend for 4K pages,
-    through a UFFD handler for 2M pages).
+    Boot with a memory backend, take a diff snapshot through it into a fresh
+    file (against a booted microVM that is a complete memory file: unchanged
+    pages are zero) and restore from it (with the plain `File` backend for 4K
+    pages, through a UFFD handler for 2M pages). A Full written by Firecracker
+    itself over the same paused state is byte-identical.
     """
     vm = boot_with_mem_backend(uvm, huge_pages=huge_pages)
     make_guest_dirty_memory(vm.ssh, amount_mib=32)
 
-    snapshot = vm.snapshot_full()
+    snapshot = vm.snapshot_diff()
     memory = vm.last_snapshot_memory
     check_layout(memory, MEM_SIZE_MIB * 2**20)
-    assert not memory["unplugged"]
-    assert set_bytes(memory) == MEM_SIZE_MIB * 2**20
     assert snapshot.mem.stat().st_size == MEM_SIZE_MIB * 2**20
-    # A freshly booted guest has touched some, but not all, of its memory. What it has not
-    # touched is not resident, and the backend zeroed it instead of reading it: the two
-    # complement each other exactly (the memfd is authoritative for every page at boot).
-    populated = populated_bytes(memory)
-    assert 32 * 2**20 <= populated < MEM_SIZE_MIB * 2**20, populated
-    assert zeroed_bytes(vm) == MEM_SIZE_MIB * 2**20 - populated
+    # A freshly booted guest has touched some, but not all, of its memory; everything it
+    # touched since boot is dirty and resident: authoritative. What it never touched is
+    # unchanged (zero since boot), and nothing was discarded, so nothing is zero.
+    authoritative = authoritative_bytes(memory)
+    assert 32 * 2**20 <= authoritative < MEM_SIZE_MIB * 2**20, authoritative
+    assert zero_bytes(memory) == 0
+    assert copied_bytes(vm) == authoritative
+    assert zeroed_bytes(vm) == 0
+    # Firecracker's own Full of the same state, written through its mapping.
+    full = vm.snapshot_full(mem_path="mem_full", vmstate_path="vmstate_full")
+    assert not differing_pages(snapshot.mem, full.mem)
     vm.kill()
 
     restored = microvm_factory.build_from_snapshot(
@@ -273,7 +273,7 @@ def test_diff_self_consistency(uvm, huge_pages):
     diff = vm.snapshot_diff(mem_path="mem_diff")
     diff_memory = vm.last_snapshot_memory
     check_layout(diff_memory, MEM_SIZE_MIB * 2**20)
-    dirty_bytes = set_bytes(diff_memory)
+    dirty_bytes = authoritative_bytes(diff_memory) + zero_bytes(diff_memory)
     # The workload dirtied at least what it wrote, and not everything.
     assert 64 * 2**20 <= dirty_bytes < MEM_SIZE_MIB * 2**20
     assert diff.mem.stat().st_size == MEM_SIZE_MIB * 2**20
@@ -339,7 +339,7 @@ def test_precopy_dirty_pages(uvm, huge_pages):
         make_guest_dirty_memory(vm.ssh, amount_mib=16)
         memory = vm.dirty_pages(copy_to="mem_precopy")
         check_layout(memory, MEM_SIZE_MIB * 2**20)
-        assert set_bytes(memory) > 0, "a running guest dirties something"
+        assert authoritative_bytes(memory) > 0, "a running guest dirties something"
 
     # Final pass while paused, merged into the same file.
     vm.pause()
@@ -362,12 +362,23 @@ def test_dirty_pages_are_consumed(uvm):
 
     first = vm.dirty_pages()
     check_layout(first, MEM_SIZE_MIB * 2**20)
-    assert set_bytes(first) >= 16 * 2**20
+    assert authoritative_bytes(first) >= 16 * 2**20
     second = vm.dirty_pages()
+    check_layout(second, MEM_SIZE_MIB * 2**20)
     # Only the virtqueue pages, re-marked after every reset so that they are part of the next
-    # set, remain.
-    assert set_bytes(second) < 2**20
-    assert set_pages(second) == set_pages(vm.dirty_pages())
+    # set, remain. They are faulted in when marked, so they are authoritative, never zero.
+    assert authoritative_bytes(second) < 2**20
+    assert zero_bytes(second) == 0
+    # On the wire, a nearly empty set is a few hundred bytes (2 per page), not 32 KiB per GiB,
+    # and an empty one is the 8-byte header.
+    assert wire_bytes(second, "memfd_authoritative_pages") < 1024
+    assert wire_bytes(second, "zero_pages") == 8
+    third = vm.dirty_pages()
+    assert second["memfd_authoritative_pages"] == third["memfd_authoritative_pages"]
+    # Unknown fields in the body are rejected without consuming anything; `{}` is fine.
+    with pytest.raises(RuntimeError, match="zero_chunk_size"):
+        vm.api.snapshot_dirty_pages.put(zero_chunk_size=4096)
+    assert vm.dirty_pages() == third
 
 
 def test_pause_invariant(uvm):
@@ -404,10 +415,11 @@ def test_pause_invariant(uvm):
 def test_cross_check_with_firecracker_snapshot(uvm, microvm_factory):
     """
     Restore one microVM with a memory backend and one without from the same
-    base snapshot, keep both paused, and compare a backend-made `Full` with a
-    Firecracker-made one. The guest did not run in either, so this checks
-    layout and `total_size` end to end (including pages the backend never
-    faulted in, which it has to source from the snapshot file).
+    base snapshot, keep both paused, and compare a backend-made `Diff` rebased
+    onto the base, and a `Full` written by Firecracker through the backend
+    (which faults in every page the backend has not populated), with a plain
+    Firecracker-made `Full`. The guest did not run in either, so this checks
+    layout and `total_size` end to end.
     """
     basevm = uvm
     basevm.spawn()
@@ -425,8 +437,17 @@ def test_cross_check_with_firecracker_snapshot(uvm, microvm_factory):
         base, resume=False, uffd_handler_name="on_demand", mem_backend=True
     )
     assert with_backend.mem_backend is not None
-    backend_snap = with_backend.snapshot_full(mem_path="mem_backend")
+    backend_diff = with_backend.snapshot_diff(mem_path="mem_backend_diff")
+    assert backend_diff.mem.stat().st_size == MEM_SIZE_MIB * 2**20
+    backend_snap = with_backend.snapshot_full(
+        mem_path="mem_backend", vmstate_path="vmstate_full"
+    )
     assert backend_snap.mem.stat().st_size == MEM_SIZE_MIB * 2**20
+    # Rebasing modifies the base in place; keep the original for the comparisons below.
+    base_copy = Path(with_backend.chroot()) / "mem_base_copy"
+    shutil.copy(base.mem, base_copy)
+    build_tools.run_rebase_snap_bin(base_copy, backend_diff.mem)
+    assert filecmp.cmp(base_copy, backend_snap.mem, shallow=False)
 
     plain = microvm_factory.build()
     plain.spawn()
@@ -451,10 +472,10 @@ def test_cross_check_with_firecracker_snapshot(uvm, microvm_factory):
 @pytest.mark.parametrize("huge_pages", PAGE_CONFIGS)
 def test_restore_with_backend_snapshot_after_running(uvm, microvm_factory, huge_pages):
     """
-    Restore with a memory backend, run a workload, snapshot through the backend
-    (a mix of faulted-in pages from the memfd and untouched pages from the
-    snapshot file) and restore that with `File` (4K only), `Uffd` and
-    `SharedMemfd`.
+    Restore with a memory backend, run a workload, take a diff through the
+    backend, rebase it onto the base (a mix of faulted-in pages from the memfd
+    and untouched pages of the base) and restore that with `File` (4K only),
+    `Uffd` and `SharedMemfd`. The rebased diff equals Firecracker's own Full.
     """
     basevm = uvm
     basevm.spawn()
@@ -471,8 +492,11 @@ def test_restore_with_backend_snapshot_after_running(uvm, microvm_factory, huge_
     vm.memory_monitor = None
     vm.ssh.check_output("echo hello > /tmp/marker")
     make_guest_dirty_memory(vm.ssh, amount_mib=32)
-    snapshot = vm.snapshot_full(mem_path="mem_from_backend")
+    diff = vm.snapshot_diff(mem_path="mem_from_backend")
+    full = vm.snapshot_full(mem_path="mem_full", vmstate_path="vmstate_full")
     vm.kill()
+    snapshot = diff.rebase_snapshot(base)
+    assert filecmp.cmp(snapshot.mem, full.mem, shallow=False)
 
     variants = [
         {"uffd_handler_name": "on_demand"},
@@ -486,8 +510,9 @@ def test_restore_with_backend_snapshot_after_running(uvm, microvm_factory, huge_
         assert restored.ssh.check_output("cat /tmp/marker").stdout.strip() == "hello"
         if restored.mem_backend is not None:
             # A restored backend instance snapshots correctly in its new mode, too.
-            again = restored.snapshot_full(mem_path="mem_again")
+            again = restored.snapshot_diff(mem_path="mem_again")
             assert again.mem.stat().st_size == MEM_SIZE_MIB * 2**20
+            check_layout(restored.last_snapshot_memory, MEM_SIZE_MIB * 2**20)
         restored.kill()
 
 
@@ -529,8 +554,9 @@ def test_fault_all_handler_as_backend(uvm, microvm_factory):
 
 def test_virtio_mem_unplugged_slots(uvm, microvm_factory):
     """
-    With virtio-mem, `total_size` includes the hotplug region and the unplugged
-    slots are reported in `unplugged` and zeroed in the memory file.
+    With virtio-mem, `total_size` includes the hotplug region; unplugged slots
+    are zero pages, and an unplugged region of any size costs a few bytes per
+    256 MiB on the wire.
     """
     vm = uvm
     vm.memory_monitor = None
@@ -548,37 +574,56 @@ def test_virtio_mem_unplugged_slots(uvm, microvm_factory):
 
     total_size = (MEM_SIZE_MIB + 512) * 2**20
 
-    # Nothing plugged yet: the whole hotplug region is unplugged. A `Full` has
-    # no bitmap: everything outside `unplugged` is copied.
-    snapshot = vm.snapshot_full(mem_path="mem_unplugged")
+    # Nothing plugged yet: the whole hotplug region is unplugged. It is dirty and never
+    # resident, so zero: 512 MiB is 131072 pages, two 65536-page Roaring containers holding
+    # one run each, 25 bytes on the wire (4 cookie, 1 run flags, 2 x 4 key/cardinality, 2 x 6
+    # run). In the file it is zero. (A diff of a booted microVM
+    # into a fresh file is a complete memory file.)
+    snapshot = vm.snapshot_diff(mem_path="mem_unplugged")
     memory = vm.last_snapshot_memory
     check_layout(memory, total_size)
-    assert "pages" not in memory
-    assert covered_bytes(memory["unplugged"]) == 512 * 2**20
-    assert set_bytes(memory) == MEM_SIZE_MIB * 2**20
-
-    # A `Diff` right away: its bitmap ends with DRAM, since the hotplug region
-    # that follows is unplugged, however large it is.
-    vm.resume()
-    vm.pause()
-    memory = vm.dirty_pages()
-    check_layout(memory, total_size)
-    assert len(decode_pages(memory)) == MEM_SIZE_MIB * 2**20 // PAGE_SIZE // 8
+    assert wire_bytes(memory, "zero_pages") == 25
+    assert (
+        wire_bytes(memory, "memfd_authoritative_pages")
+        < MEM_SIZE_MIB * 2**20 // PAGE_SIZE // 8
+    )
+    authoritative, zero = class_bytes_in(memory, MEM_SIZE_MIB * 2**20, 512 * 2**20)
+    assert authoritative == 0
+    assert zero == 512 * 2**20
     assert snapshot.mem.stat().st_size == total_size
     with open(snapshot.mem, "rb") as mem:
         mem.seek(MEM_SIZE_MIB * 2**20)
         assert mem.read(512 * 2**20) == bytes(512 * 2**20)
 
-    # Plug one slot's worth and make the guest use it.
+    # A `Diff` right away: the hotplug region is still all zero pages (the unplug state is
+    # reported every time), nothing dirty in DRAM but the virtqueue pages. Merge it into the
+    # file so that nothing consumed goes missing from it.
+    vm.resume()
+    vm.pause()
+    memory = vm.dirty_pages(copy_to="mem_unplugged")
+    check_layout(memory, total_size)
+    assert authoritative_bytes(memory) < 16 * 2**20
+    assert zero_bytes(memory) == 512 * 2**20
+
+    # Plug one slot's worth and make the guest use it: what the guest touched in that slot is
+    # authoritative, the rest of it unchanged (zero since boot), the unplugged rest zero pages.
     vm.resume()
     vm.api.memory_hotplug.patch(requested_size_mib=128)
     make_guest_dirty_memory(vm.ssh, amount_mib=64)
-    snapshot = vm.snapshot_full(mem_path="mem_plugged", vmstate_path="vmstate_plugged")
+    # Merge the diff into the first file to get a complete memory file to restore from, and
+    # check it against Firecracker's own Full of the same state.
+    vm.snapshot_diff(mem_path="mem_unplugged", vmstate_path="vmstate_plugged")
     memory = vm.last_snapshot_memory
     check_layout(memory, total_size)
-    assert covered_bytes(memory["unplugged"]) == (512 - 128) * 2**20
-    assert set_bytes(memory) == (MEM_SIZE_MIB + 128) * 2**20
-    assert "pages" not in memory
+    authoritative, zero = class_bytes_in(
+        memory, (MEM_SIZE_MIB + 128) * 2**20, (512 - 128) * 2**20
+    )
+    assert (authoritative, zero) == (0, (512 - 128) * 2**20)
+    authoritative, zero = class_bytes_in(memory, MEM_SIZE_MIB * 2**20, 128 * 2**20)
+    assert authoritative > 0
+    assert zero == 0
+    snapshot = vm.snapshot_full(mem_path="mem_plugged", vmstate_path="vmstate_plugged")
+    assert not differing_pages(snapshot.mem, snapshot.mem.parent / "mem_unplugged")
     vm.kill()
 
     restored = microvm_factory.build_from_snapshot(snapshot)
@@ -592,9 +637,9 @@ def test_virtio_mem_unplugged_slots(uvm, microvm_factory):
 def test_virtio_mem_unplug_after_use(uvm, microvm_factory):
     """
     Unplug memory the guest has used, and merge a `Diff` taken afterwards into
-    the base that still holds the old bytes. `unplugged` tells the backend to
-    zero those slots, so the merged file equals a fresh `Full`; a restored VM
-    can plug the slots back and use them.
+    the base that still holds the old bytes. The unplugged slots are zero
+    pages, so the merged file equals a fresh `Full`; a restored VM can plug the
+    slots back and use them.
     """
     vm = uvm
     vm.memory_monitor = None
@@ -616,8 +661,11 @@ def test_virtio_mem_unplug_after_use(uvm, microvm_factory):
     vm.hotplug_memory(256)
     vm.ssh.check_output("mount -o remount,size=300M -t tmpfs tmpfs /dev/shm")
     vm.ssh.check_output("dd if=/dev/urandom of=/dev/shm/data bs=1M count=200")
+    vm.pause()
+    assert class_bytes_in(
+        vm.dirty_pages(), (MEM_SIZE_MIB + 256) * 2**20, 256 * 2**20
+    ) == (0, 256 * 2**20)
     base = vm.snapshot_full(mem_path="mem_base")
-    assert covered_bytes(vm.last_snapshot_memory["unplugged"]) == 256 * 2**20
     vm.resume()
 
     # Unplug one slot's worth. The guest migrates the data away first, so the
@@ -631,13 +679,11 @@ def test_virtio_mem_unplug_after_use(uvm, microvm_factory):
     diff = vm.snapshot_diff(mem_path="mem_merged", vmstate_path="vmstate_diff")
     diff_memory = vm.last_snapshot_memory
     check_layout(diff_memory, total_size)
-    assert covered_bytes(diff_memory["unplugged"]) == (512 - 128) * 2**20
-    # The unplug marked the slot dirty, but as long as it is unplugged the API
-    # describes it through `unplugged` only: no bit is set for it, and the bitmap
-    # ends with the last plugged slot however much unplugged memory follows.
-    plugged_end_offset = (MEM_SIZE_MIB + 128) * 2**20
-    assert plugged_end(diff_memory) == plugged_end_offset
-    assert len(decode_pages(diff_memory)) == plugged_end_offset // PAGE_SIZE // 8
+    # The unplugged slots (the one just unplugged, with its old bytes still in `base`, and the
+    # never-plugged ones) are zero pages.
+    assert class_bytes_in(
+        diff_memory, (MEM_SIZE_MIB + 128) * 2**20, (512 - 128) * 2**20
+    ) == (0, (512 - 128) * 2**20)
     full = vm.snapshot_full(mem_path="mem_full", vmstate_path="vmstate_full")
     assert filecmp.cmp(diff.mem, full.mem, shallow=False)
     # The unplugged slots are zero in the file, whatever the base had there.
@@ -645,17 +691,20 @@ def test_virtio_mem_unplug_after_use(uvm, microvm_factory):
         mem.seek((MEM_SIZE_MIB + 128) * 2**20)
         assert mem.read((512 - 128) * 2**20) == bytes((512 - 128) * 2**20)
 
-    # Dirty tracking is independent of reporting: unplug the remaining slot and
-    # plug it back with no API call in between. It is plugged at the time of the
-    # call, so the marks the unplug left are reported: its pages became zero.
+    # Unplug the remaining slot and plug it back with no API call in between. It is plugged at
+    # the time of the call and dirty from the unplug; whatever the guest has not touched again
+    # is a hole, so zero, the rest authoritative. Together they cover the slot.
     vm.resume()
     vm.hotplug_memory(0)
     vm.hotplug_memory(128)
     vm.pause()
     replugged = vm.dirty_pages()
     check_layout(replugged, total_size)
-    assert set_bytes_in(replugged, MEM_SIZE_MIB * 2**20, 128 * 2**20) == 128 * 2**20
-    assert covered_bytes(replugged["unplugged"]) == (512 - 128) * 2**20
+    authoritative, zero = class_bytes_in(replugged, MEM_SIZE_MIB * 2**20, 128 * 2**20)
+    assert authoritative + zero == 128 * 2**20, (authoritative, zero)
+    assert class_bytes_in(
+        replugged, (MEM_SIZE_MIB + 128) * 2**20, (512 - 128) * 2**20
+    ) == (0, (512 - 128) * 2**20)
     vm.kill()
 
     # Restore, plug everything back and use it.
@@ -678,31 +727,29 @@ def check_diff_identity_across_inflate(vm, base, amount_mib, min_zeroed_mib):
     """Inflate the balloon (guest is running), then take a `Diff` and a `Full`
     and check that rebasing the diff onto `base` yields the full copy.
 
-    Balloon inflation punches holes into the shared memfd. Those pages must be
-    part of the diff (Firecracker marks discarded ranges dirty), and their
-    content in both copies must be zero; a missing or stale page shows up as a
-    mismatch. Firecracker also reports them as not populated, and the backend
-    zeroes them in the target instead of reading them: at least
-    `min_zeroed_mib` worth. The backend may only do so for pages the memfd is
-    authoritative for; after a restore, a released page the handler never
-    populated is still served from the snapshot file (Firecracker never faulted
-    it in either, so it is not resident) and is copied, not zeroed. With 2M
-    pages after a restore that is nearly all of them: the balloon frees 4K
-    pages, so few huge pages get punched entirely, and the handler only learns
-    about those through `remove` events.
+    Balloon inflation punches holes into the shared memfd. Those pages are dirty
+    (Firecracker marks discarded ranges) and not resident, so they are zero
+    pages: the backend zeroes at least `min_zeroed_mib` worth without reading
+    guest memory, and the content in both copies is zero. With 2M pages the
+    balloon frees 4K pages and `MADV_REMOVE` only frees a huge page covered by
+    one release; Firecracker marks (and the backend zeroes) exactly those, so
+    `min_zeroed_mib` is 0 and nothing else can be assumed about the dirty set.
     """
     inflate_balloon(vm, amount_mib)
     diff = vm.snapshot_diff(mem_path="mem_diff")
     diff_memory = vm.last_snapshot_memory
     check_layout(diff_memory, MEM_SIZE_MIB * 2**20)
-    assert set_bytes(diff_memory) >= amount_mib * 2**20
+    if min_zeroed_mib:
+        assert (
+            authoritative_bytes(diff_memory) + zero_bytes(diff_memory)
+            >= amount_mib * 2**20
+        )
     zeroed = zeroed_bytes(vm)
     assert zeroed >= min_zeroed_mib * 2**20, zeroed
-    # Every zeroed page was a dirty, unpopulated one.
-    assert zeroed <= set_bytes(diff_memory)
-    assert zeroed <= MEM_SIZE_MIB * 2**20 - populated_bytes(diff_memory)
+    assert zeroed == zero_bytes(diff_memory)
+    # The Full right after is Firecracker's own: released pages are unregistered from the uffd
+    # and read as zero through its mapping, whatever the base has there.
     full = vm.snapshot_full(mem_path="mem_full", vmstate_path="vmstate_full")
-    assert zeroed_bytes(vm) >= min_zeroed_mib * 2**20
     rebased = diff.rebase_snapshot(base)
     assert filecmp.cmp(rebased.mem, full.mem, shallow=False)
 
@@ -766,8 +813,8 @@ def test_balloon_inflate_after_restore(uvm, microvm_factory, huge_pages):
     must reflect that.
 
     With 2M pages the balloon still reports 4K ranges; only huge pages the
-    guest released entirely are punched out, and the handler has to round the
-    `remove` ranges inward the same way.
+    guest released entirely, in one range, are punched out (`MADV_REMOVE`
+    rounds inward), and only those become non-resident.
     """
     basevm = uvm
     basevm.spawn()
@@ -795,9 +842,16 @@ def test_balloon_inflate_after_restore(uvm, microvm_factory, huge_pages):
     )
     vm.memory_monitor = None
     # Touch some memory so that the memfd holds a mix of populated and
-    # never-populated pages when the balloon takes them.
-    make_guest_dirty_memory(vm.ssh, amount_mib=32)
-    restored_base = vm.snapshot_full(mem_path="mem_base")
+    # never-populated pages when the balloon takes them. The new base is the
+    # restore base plus a backend diff: a Firecracker Full here would fault in
+    # every page and make the whole memfd populated (see the docstring's 2M
+    # remark: a huge page the balloon releases in several 4K batches is never
+    # punched, so it would stay resident and nothing would be zero).
+    restored_base = Snapshot(
+        **(base.__dict__ | {"mem": Path(vm.chroot()) / "mem_base"})
+    )
+    shutil.copy(base.mem, restored_base.mem)
+    vm.snapshot_diff(mem_path="mem_base")
     vm.resume()
 
     check_diff_identity_across_inflate(
@@ -838,7 +892,9 @@ def test_diff_mincore_self_consistency(uvm):
     diff = vm.make_snapshot(SnapshotType.DIFF_MINCORE, mem_path="mem_diff")
     diff_memory = vm.last_snapshot_memory
     check_layout(diff_memory, MEM_SIZE_MIB * 2**20)
-    assert set_bytes(diff_memory) >= 64 * 2**20
+    # With mincore as the dirty source, dirty ⇒ resident: nothing can be zero.
+    assert authoritative_bytes(diff_memory) >= 64 * 2**20
+    assert zero_bytes(diff_memory) == 0
 
     full = vm.snapshot_full(mem_path="mem_full", vmstate_path="vmstate_full")
     rebased = diff.rebase_snapshot(base)
@@ -859,12 +915,15 @@ def test_two_dram_regions(uvm, microvm_factory):
     vm.memory_monitor = None
     make_guest_dirty_memory(vm.ssh, amount_mib=32)
 
-    snapshot = vm.snapshot_full()
+    snapshot = vm.snapshot_diff()
     memory = vm.last_snapshot_memory
     check_layout(memory, mem_size_mib * 2**20)
-    # Both regions are plugged and adjacent in file space: every bit is set.
-    assert set_bytes(memory) == mem_size_mib * 2**20
-    assert memory["unplugged"] == []
+    # Both regions are plugged and adjacent in file space; the second region (past the 32-bit
+    # gap, from 3 GiB of file offset on) has authoritative pages since the guest touched some
+    # of it, and nothing was discarded so nothing is zero.
+    assert zero_bytes(memory) == 0
+    authoritative, _ = class_bytes_in(memory, 3 * 2**30, (mem_size_mib - 3072) * 2**20)
+    assert authoritative > 0
     assert snapshot.mem.stat().st_size == mem_size_mib * 2**20
     vm.kill()
 
@@ -902,9 +961,12 @@ def test_snapshot_right_after_restore(uvm, microvm_factory, snapshot_type):
 
     if snapshot_type == SnapshotType.DIFF:
         diff = vm.snapshot_diff(mem_path="mem_diff")
-        dirty = set_bytes(vm.last_snapshot_memory)
-        # A handful of pages, not nothing and not everything.
+        memory = vm.last_snapshot_memory
+        dirty = authoritative_bytes(memory) + zero_bytes(memory)
+        # A handful of pages, not nothing and not everything; all of them were written (by the
+        # restore) so all are resident: authoritative.
         assert 0 < dirty <= 2**20, dirty
+        assert zero_bytes(memory) == 0
         full = vm.snapshot_full(mem_path="mem_full", vmstate_path="vmstate_full")
         assert filecmp.cmp(diff.rebase_snapshot(base).mem, full.mem, shallow=False)
     else:
@@ -958,19 +1020,33 @@ def test_negative_api(uvm, microvm_factory, guest_kernel, rootfs):
     with pytest.raises(RuntimeError, match="No memory backend"):
         plain.api.snapshot_dirty_pages.put()
     plain.pause()
-    with pytest.raises(RuntimeError, match="mem_file_path"):
-        plain.api.snapshot_create.put(snapshot_path="vmstate", snapshot_type="Full")
+    for snapshot_type in ("Full", "Diff"):
+        with pytest.raises(RuntimeError, match="mem_file_path"):
+            plain.api.snapshot_create.put(
+                snapshot_path="vmstate", snapshot_type=snapshot_type
+            )
     plain.resume()
     plain.ssh.check_output("true")
     plain.kill()
 
-    # With a backend: mem_file_path must be absent; a dead backend does not fail the request.
+    # With a backend: a Full is Firecracker's own (mem_file_path required); for a Diff
+    # mem_file_path must be absent; unknown fields are rejected before anything is written or
+    # consumed; a dead backend does not fail a Diff.
     backed = boot_with_mem_backend(microvm_factory.build(guest_kernel, rootfs))
     backed.pause()
     with pytest.raises(RuntimeError, match="mem_file_path"):
+        backed.api.snapshot_create.put(snapshot_path="vmstate", snapshot_type="Full")
+    with pytest.raises(RuntimeError, match="mem_file_path"):
         backed.api.snapshot_create.put(
-            snapshot_path="vmstate", mem_file_path="mem", snapshot_type="Full"
+            snapshot_path="vmstate", mem_file_path="mem", snapshot_type="Diff"
         )
+    with pytest.raises(RuntimeError, match="zero_chunk_size"):
+        backed.api.snapshot_create.put(
+            snapshot_path="vmstate_bad", snapshot_type="Diff", zero_chunk_size=4096
+        )
+    with pytest.raises(RuntimeError, match="zero_chunk_size"):
+        backed.api.snapshot_dirty_pages.put(zero_chunk_size=4096)
+    assert not (Path(backed.chroot()) / "vmstate_bad").exists()
     backed.resume()
     backed.ssh.check_output("true")
 
@@ -978,7 +1054,7 @@ def test_negative_api(uvm, microvm_factory, guest_kernel, rootfs):
     backed.ssh.check_output("true")
     backed.pause()
     memory = backed.api.snapshot_create.put(
-        snapshot_path="vmstate", snapshot_type="Full"
+        snapshot_path="vmstate", snapshot_type="Diff"
     ).json()["memory"]
     check_layout(memory, MEM_SIZE_MIB * 2**20)
     with pytest.raises((ConnectionError, FileNotFoundError, OSError)):
@@ -990,8 +1066,12 @@ def test_negative_api(uvm, microvm_factory, guest_kernel, rootfs):
 
 @pytest.mark.parametrize("snapshot_type", [SnapshotType.FULL, SnapshotType.DIFF])
 def test_snapshot_types_with_backend(uvm, snapshot_type):
-    """`snapshot_type` is echoed in the response and the file has the full size either way."""
+    """The file has the full size either way: a Full is written by Firecracker (204, no
+    layout), a Diff by the backend from the layout in the 200 response."""
     vm = boot_with_mem_backend(uvm)
     snapshot = vm.make_snapshot(snapshot_type)
     assert snapshot.mem.stat().st_size == MEM_SIZE_MIB * 2**20
-    assert vm.last_snapshot_memory["total_size"] == MEM_SIZE_MIB * 2**20
+    if snapshot_type == SnapshotType.DIFF:
+        assert vm.last_snapshot_memory["total_size"] == MEM_SIZE_MIB * 2**20
+    else:
+        assert vm.last_snapshot_memory is None

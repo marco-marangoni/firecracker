@@ -328,23 +328,40 @@ which read awkwardly inside `mem_backend`.
 
 ### 7. `PUT /snapshot/create` with a memory backend
 
-Request:
+*(Revised three times. The response format changed from a dirty bitmap plus an
+`unplugged` range list plus a `populated` bitmap to two bitmaps that classify
+every page; the backend path was then restricted to `Diff` snapshots, a `Full`
+being written by Firecracker itself whether or not a backend is attached; and
+the two bitmaps, first chunked and trailing-trimmed, then run-length compressed,
+became Roaring bitmaps. The history is in the decisions below and in §14.)*
+
+The rule: **Firecracker writes `Full` snapshots; the backend produces `Diff`
+snapshots.** A `Full` with a backend attached is exactly a `Full` without one:
+`mem_file_path` required, `dump` through Firecracker's mapping, 204. Reading
+through the mapping faults in every page the backend has not populated (the
+backend serves it from its snapshot file, as for any other fault), so the result
+is complete and depends on nothing else, at the cost of populating the whole
+memfd after a lazy restore. That cost is accepted: a `Full` is the recovery path
+(lost `Diff` response) and the bootstrap, not the steady state, and it is the
+same cost a `Full` after a UFFD restore has today.
+
+Request, for a `Diff`:
 
 ```json
 {
-  "snapshot_type": "Full" | "Diff",
+  "snapshot_type": "Diff",
   "snapshot_path": "/path/vmstate"
 }
 ```
 
-`mem_file_path` becomes optional in `CreateSnapshotParams`. With a memory
-backend connected it must be absent (400 otherwise: Firecracker does not write
-guest memory in this mode); without one it must be present, as today. The
-request carries no `mem_backend` field: whether a backend is connected is a
-property of the instance, fixed at boot or restore, and repeating it here would
-only add a way to get a 400.
+`mem_file_path` becomes optional in `CreateSnapshotParams`. For a `Diff` with a
+memory backend connected it must be absent (400 otherwise: Firecracker does not
+write guest memory in this mode); in every other case it must be present, as
+today. The request carries no `mem_backend` field: whether a backend is
+connected is a property of the instance, fixed at boot or restore, and repeating
+it here would only add a way to get a 400. There are no other parameters.
 
-Response, with a backend: `200 OK` with
+Response: `200 OK` with
 
 ```json
 {
@@ -352,111 +369,145 @@ Response, with a backend: `200 OK` with
   "memory": {
     "total_size": 65536,
     "page_size": 4096,
-    "pages": "AxA=",
-    "unplugged": [
-      { "offset": 32768, "len": 16384 }
-    ],
-    "populated_page_size": 4096,
-    "populated": "//A="
+    "bitmap_encoding": "roaring",
+    "memfd_authoritative_pages": "OjAAAAEAAAAAAAIAEAAAAAAAAQAMAA==",
+    "zero_pages": "OjAAAAEAAAAAAAMAEAAAAAgACQAKAAsA"
   }
 }
 ```
 
-(A 64 KiB guest, for the sake of a readable example: `AxA=` decodes to the two
-bytes `0x03 0x10`, so pages 0, 1 and 12 are to be copied; pages 8 to 11 are an
-unplugged virtio-mem slot, to be zeroed; `//A=` is `0xff 0xf0`: pages 0 to 7 and
-12 to 15 are resident, the unplugged ones are not. A 1 GiB guest has a 32 KiB
-bitmap. A `Full` response has no `pages` field but does have `populated`.)
+(A 64 KiB guest, for the sake of a readable example: each set is one Roaring
+array container, 16 and 20 bytes. Pages 0, 1 and 12 are to be copied from the
+memfd; pages 8 to 11, an unplugged virtio-mem slot, are to be zeroed; every
+other page is unchanged.)
 
-- `total_size` is the size of a full memory file (sum of all region sizes,
-  including the hotplug region); the peer creates the target at that size.
-- `page_size` is the granularity of `pages`, in bytes. It is the host page size
-  (4096 today), not the backing page size: on hugetlbfs the bits are still per 4
-  KiB page.
-- `pages` is a bitmap with one bit per `page_size` bytes of the memory file,
-  standard base64 (RFC 4648, padded). Byte `i`, bit `b` (least significant bit
-  first) stands for the page at offset `(8 * i + b) * page_size`. A set bit
-  means: this page of the target must be brought up to date with guest memory.
-  For a booted microVM the bytes are read from the memfd; after a restore the
-  backend reads pages it has not populated from its own snapshot file instead
-  (§9). The bitmap covers the file from offset 0 to the end of the last plugged
-  slot, `ceil(plugged_end / page_size / 8)` bytes, whatever is dirty; pages past
-  its end are clear, and bits of unplugged slots are never set. Absent for a
-  `Full`, which consists of every page outside `unplugged`.
-- `unplugged` are the currently unplugged virtio-mem slots, as sorted,
-  page-aligned, non-overlapping `{offset, len}` pairs. The peer must zero them
-  in the target: a fresh `dump`/`dump_dirty` output has zeros there, and a slot
-  unplugged since the last diff would otherwise keep stale bytes in a merged
-  file. (Firecracker's own in-place merge into an existing memory file does
-  leave stale bytes there; restore never maps them, so both are valid, and
-  zeroing is what makes the peer's file byte-identical to a fresh one.) `pages`
-  and `unplugged` are disjoint: the bitmap says what to copy, the list what to
-  zero.
+Every page of the memory file is in exactly one of three classes, and the two
+bitmaps name two of them:
 
-All offsets are memfd offsets, which by §1 are file offsets. No per-region
-information is needed by the peer, so none is returned. The bitmap is one bitmap
-over the whole file, not one per region, for the same reason.
+- **memfd authoritative** (`memfd_authoritative_pages`): the content is in the
+  memfd; the peer copies it.
+- **zero** (`zero_pages`): the page must read as zero in the file the peer
+  produces. How is the peer's business (write zeros, punch, or tell its storage
+  the range is zero).
+- **unchanged** (neither): not touched since the dirty state was last consumed.
+  Not part of the diff. Firecracker has nothing to say about it and the memfd
+  may not hold it (after a restore it may still be only in the peer's snapshot
+  file); the file the diff is applied to already has it.
 
-Without a backend the response stays `204 No Content`. A new
-`VmmData::SnapshotMemory(SnapshotMemoryResponse)` variant carries the body
-through the existing API plumbing (`SnapshotMemoryLayout` is the `memory`
-object, `SnapshotMemoryResponse` adds `snapshot_type`).
+`total_size` is the size of a full memory file, all regions including the
+hotplug region whether plugged or not; the peer creates the target at that size.
+Both sets are Roaring bitmaps of page indices (file offset / `page_size`, the
+host page size), disjoint, in the portable serialization format, then base64;
+`bitmap_encoding` names the serialization so a peer fails cleanly if it ever
+changes.
+
+The classification is `dirty ∧ resident` → authoritative, `dirty ∧ ¬resident` →
+zero, `¬dirty` → unchanged, where *dirty* is the union of KVM's log and
+Firecracker's `AtomicBitmap` (every page written or discarded since the last
+consumption, and every page of an unplugged virtio-mem slot) and *resident* is
+`mincore(2)` over Firecracker's mapping, taken *after* the dirty state is read.
+Nothing is aggregated or rounded: each page is classified on its own. Unplugged
+slots are dirty and never resident, so they are zero pages; Roaring stores them
+as one run per 65536-page container, a few bytes whatever the size of the
+hotplug region.
 
 Procedure, on the VMM thread, inside the paused API loop:
 
 1. require `Paused`, as today;
+1. validate `mem_file_path`, before anything is written;
 1. `save_state` and write vmstate to `snapshot_path`, as today (this runs
    `prepare_save`: block drain, net RX buffer reset);
-1. compute `pages`: `Diff` → allocate the bitmap up to the end of the last
-   plugged slot; for every plugged slot, take the KVM dirty log (or `mincore`)
-   and OR it with Firecracker's `AtomicBitmap`; skip unplugged slots (they go
-   into `unplugged`); reset both bitmaps. `Full` → no bitmap, just `unplugged`,
-   and reset both bitmaps, mirroring what `snapshot_memory_to_file` does for
-   `Full` today;
+1. read the dirty state: `KVM_GET_DIRTY_LOG` (or `mincore`, when tracking is
+   off) ORed with Firecracker's bitmap per plugged slot;
+1. `mincore` over every plugged slot;
+1. classify (`SnapshotMemoryLayout::classify`: `dirty & resident`,
+   `dirty - resident`, then `optimize()` to pick run containers; one function
+   shared with the benchmark), reset Firecracker's dirty bitmap;
 1. `mark_virtio_queue_memory_dirty`, as today, so queue pages are in the next
    diff;
-1. return the body.
+1. serialise: Roaring portable format then base64 per set, and return the body.
 
-The bit layout is KVM's: `KVM_GET_DIRTY_LOG` fills an array of `u64` in which
-bit `j` of word `i` is page `64 * i + j` of the slot, which on a little-endian
-host is byte for byte the layout above. Building the response is therefore an OR
-of the two per-slot bitmaps into the right position of one `Vec<u8>`, with no
-bit reshuffling; the peer can read the bytes back as little-endian `u64` words
-if it prefers.
+#### Invariant: dirty ⇒ memfd authoritative or zero
 
-What the bitmap promises: every plugged page whose guest-visible content changed
-since the dirty state was last consumed has its bit set, including pages that
-became zero because they were released by the balloon, or because their slot was
-unplugged and plugged again in between. It may also have bits set for pages that
-did not change (today: the virtqueue pages re-marked after every reset); copying
-an extra page is always correct. Today the set bits are exactly the pages
-`dump_dirty` (or `dump`) would write, and unit tests assert that (§10), but that
-is a property of this implementation, not a promise to the peer: a future dirty
-tracking mechanism (`KVM_CAP_DIRTY_LOG_RING`, manual clearing, coarser tracking)
-may over-approximate without changing the API.
+The two-bitmap format only works if a dirty page's content is never somewhere
+else than the memfd. Everything that marks a page dirty *after* writing it
+satisfies that trivially: KVM's log, block completions
+(`mark_dirty_mem_and_unwrap`), `discard_range`. Two paths mark *before* writing,
+because the write happens through a raw pointer that has lost its `vm-memory`
+context: `GuestMemorySlice::new` (virtqueue rings, at activation and at every
+`mark_virtio_queue_memory_dirty`) and `IoVecBufferMut::load_descriptor_chain`
+(virtio-net RX buffers, marked when parsed, filled when a frame arrives). After
+a UFFD restore such a page can be marked while still a hole in the memfd, its
+content only in the backend's snapshot file; it would be reported
+`dirty ∧ ¬resident`, "zero", and the backend would zero a page the guest sees as
+content. This was the case the first version of the design worked around by
+making the backend track what it had populated (§14).
 
-Unplugged slots, in one place. Dirty *tracking* and *reporting* are independent:
-`discard_range` marks every discarded range dirty in Firecracker's bitmap,
-whether the balloon or a virtio-mem unplug caused it, and that mark survives
-until the next consumption. Reporting then depends on the slot's state at the
-time of the call. A slot that is unplugged at that moment is described by
-`unplugged` alone: its bits are never set, whatever the bitmap says, and the
-peer's obligation is that every byte of every `unplugged` range is zero in the
-file it produces. A slot that was unplugged and plugged again before the call is
-plugged now, so the marks the unplug left are reported like any other dirty
-page: its content became zero and the peer must copy it (zeros, or whatever the
-guest wrote since). Keeping unplugged slots out of the bitmap, and ending the
-bitmap with the last plugged slot, is what gives the size guarantee above: an
-operator can configure a hotplug region of any size and leave it unplugged
-without the API responses growing by a byte, and an unplug event does not
-produce a burst of set bits in the next response either. (Firecracker's own
-`dump_dirty` seeks over unplugged slots as well; the stale bytes it leaves in an
-in-place merge are never mapped by restore.)
+Both paths now fault the range in right after marking it
+(`fault_in_marked_range`: one volatile read per page). Through a UFFD mapping
+that brings the snapshot content into the memfd; on a booted microVM it maps a
+zero page for never-touched memory and is a plain load otherwise; on hugetlbfs
+it installs Firecracker's huge PTE, which is what `mincore` reports there. The
+cost is bounded by the ring sizes plus the RX buffers in flight, a few dozen
+pages per device. The RX case is not a race: the tap write happens strictly
+after the parse, so at the time of the read the page is either already the
+guest's content or a hole that must become content before it is written. A unit
+test punches a range, marks it through `GuestMemorySlice::new`, and checks
+`mincore` reports it resident (`test_fault_in_marked_range`).
+
+Two more properties the comment on the tracking task lists, and where they hold:
+
+- *A write is eventually marked dirty, or its page is permanently dirty.* KVM
+  marks on the fault after each reset; block marks on completion; the RX buffer
+  is marked at parse time and re-marked after a reset by
+  `prepare_dirty_tracking_reset` (§8); the rings are re-marked after every
+  consumption by `mark_virtio_queue_memory_dirty`. Nothing writes guest memory
+  outside those paths except vhost-user backends (the pre-existing gap).
+- *`mincore` is taken after the dirty bitmaps.* A page written between the two
+  reads is dirty in the next set and resident now: reported authoritative
+  (correct, the memfd holds it) rather than zero. The other order could report a
+  page as zero that was written just after `mincore` and before the log was
+  read.
+
+#### Decision: `Full` snapshots are Firecracker's, not the backend's
+
+An earlier revision had the backend produce `Full` snapshots too, from a layout
+computed as `resident → authoritative`, `discarded ∧ ¬resident → zero`, else
+unchanged, where *discarded* was a second, never-consumed `AtomicBitmap` set by
+`discard_range`. It was needed because a `Full` cannot use the tracked dirty
+state (a previous diff consumed it), and `mincore` alone cannot tell a page the
+balloon released since the last diff (a hole that must read zero) from a page
+never touched since restore (a hole that must read the base's content);
+`test_balloon_inflate_after_restore` caught a `Full` bringing released pages
+back from the base before the bitmap existed.
+
+That `Full` was not what its name promised: its "unchanged" pages meant "the
+base's content", so the orchestrator needed the base to assemble a memory file
+from it. It was a `Diff` over the whole history since restore, reconstructible
+after the diffs had been consumed, and that was its only genuine use: recovering
+from a lost `Diff` response. On a booted microVM it added nothing over a `Diff`.
+Routing `Full` through Firecracker's own `dump` instead gives a file that
+depends on neither the base nor any consumed state (the fault handler supplies
+the base content, the kernel supplies zeros for discarded ranges, the memfd
+supplies the rest), keeps the recovery contract as it is today, and removes: the
+`discarded` bitmap and its write on every discard; the `Full` arm of the
+classification; the handler's "copy unchanged gaps from the base" mode; and the
+hugetlbfs question of what a partial discard means for a `Full`. What it costs
+is the population of the memfd that a `Full` after a lazy restore causes, and a
+`Full` blocking if the handler is dead. Both are the behaviour of a `Full` after
+a UFFD restore today.
+
+Two alternatives were considered for the lost-response case and set aside: an
+`ack_previous` flag letting the next request fold the previous set back in
+(small, but a new stateful protocol element for a rare event), and telling
+orchestrators a lost response ends the snapshot lineage (simplest, but weaker
+than what `File`/`Uffd` users have). The `Full` path needs neither.
 
 Failure handling:
 
-- If step 2 fails, nothing has been consumed and the error is returned as today.
-- If step 3 fails while taking the KVM log, the bitmaps are folded back with
+- If the vmstate write fails, nothing has been consumed and the error is
+  returned as today.
+- If reading the KVM log or `mincore` fails, the bitmaps are folded back with
   `store_dirty_bitmap`, as `dump_dirty` does today, and an error is returned.
 - Once the body is handed to the API thread, the dirty set is consumed. If the
   HTTP client loses the response (disconnect mid-write), Firecracker cannot
@@ -465,6 +516,100 @@ Failure handling:
   file today.
 - The backend is never consulted, so a dead backend does not fail the request;
   the orchestrator finds out when it tries to use the memfd.
+
+#### Decision: two class bitmaps, not dirty + populated + unplugged
+
+The previous format shipped the dirty bitmap up to the last plugged slot, an
+`unplugged` range list, and a `populated` bitmap at backing-page granularity,
+and left the peer to combine them: dirty ∧ populated → copy, dirty ∧ ¬populated
+→ zero, unplugged → zero, plus the peer's own record of what it had populated
+through UFFD to route never-populated pages to the base. The two-bitmap format
+was chosen over it, and over the alternative of shipping `dirty` and `mincore`
+raw and letting the peer AND them, because the peer's rule becomes trivial and
+needs no state (each bit says what to do; in particular the peer no longer needs
+`PopulatedPages` for the copy, §9, which was the most subtle part of the
+reference handler and the source of two bugs found by the tests), and because
+only Firecracker holds both inputs at the same instant, so only it can classify
+exactly.
+
+#### Decision: Roaring bitmaps, no chunking
+
+The first two-bitmap version reported `zero_pages` per caller-chosen chunk
+(`zero_chunk_size`, default 512 KiB; a chunk was zero only if all its pages
+were, and the zero pages of a mixed chunk were moved to the authoritative set,
+which is safe since a hole reads as zero) and trimmed trailing zero bytes from
+both bitmaps, so that an unplugged hotplug region at the end of the file cost
+nothing. That bought a 128× smaller zero bitmap and a free unplugged tail, at
+the price of a request parameter with validation and two error variants, the
+"pages past the end are clear" rule, the mixed-chunk move, a `Diff` whose zero
+set was approximate at the chunk boundary, and a special case (unplugged slots
+in the middle of the file, or a region not ending at a chunk boundary) in every
+explanation.
+
+A compressed representation of the full page sets does better on every axis: no
+granularity, no trim rule, no rounding, unplugged slots anywhere in the file for
+free. Two were implemented and measured. The second version was PackBits (TIFF's
+byte-oriented RLE) over full-length bitmaps: dependency-free, a dozen lines to
+decode, bounded at +1/128 on dense input. The shipped version is
+[Roaring](https://roaringbitmap.org), chosen over it because:
+
+- it is a standard with a published portable format and implementations in every
+  mainstream language, so a backend deserializes with a library call instead of
+  carrying a codec of its own;
+- the deserialized form is a set with constant-time `contains` and ordered
+  iteration, so a backend copies straight from it (the reference handler's
+  `runs()` iterates the two sets and never materialises a bitmap) and a fault
+  handler could consult it directly;
+- run containers make unplugged and released memory cost a few bytes per 256 MiB
+  rather than two bytes per 4 MiB, and sparse sets cost 2 bytes per page rather
+  than a byte per 8 pages plus RLE records;
+- the dense worst case is the same 8 KiB per 65536 pages as a plain bitmap, by
+  construction, where PackBits could reach +1/128.
+
+The cost is a dependency in Firecracker (`roaring`, with `bytemuck` and
+`byteorder`; 0.11 is needed for run containers) and in the example handler, and
+an encode that is slower than a byte pass on dense input (2.8 ms against 1.9 ms
+for the 25% churn case below), which is in the noise next to
+`KVM_GET_DIRTY_LOG`.
+
+Benchmark (`src/vmm/benches/snapshot_layout.rs`, criterion, 1 GiB guest,
+synthetic dirty/resident inputs; "encode" is Firecracker turning the two
+per-page inputs into the JSON body, "decode" is a peer parsing it and counting
+pages per class; `current` is the dirty + populated + unplugged format, `raw`
+ships `dirty` and `mincore` trimmed at 4 KiB, `packbits` the previous version,
+`new` the shipped Roaring format):
+
+| scenario               | format   | body (bytes) | FC encode | peer decode |
+| :--------------------- | :------- | -----------: | --------: | ----------: |
+| idle-diff              | current  |       87,494 |    862 µs |      206 µs |
+| idle-diff              | raw      |       87,446 |    789 µs |      194 µs |
+| idle-diff              | packbits |        3,560 |    367 µs |      106 µs |
+| idle-diff              | new      |        1,549 |    625 µs |        3 µs |
+| churn25-diff           | current  |       87,494 |  1,567 µs |      243 µs |
+| churn25-diff           | raw      |       87,450 |  1,402 µs |      179 µs |
+| churn25-diff           | packbits |       44,744 |  1,903 µs |      172 µs |
+| churn25-diff           | new      |       43,873 |  2,822 µs |       86 µs |
+| balloon50-diff         | current  |       87,494 |    893 µs |      206 µs |
+| balloon50-diff         | raw      |       87,366 |    767 µs |      179 µs |
+| balloon50-diff         | packbits |        2,660 |    703 µs |      103 µs |
+| balloon50-diff         | new      |        1,549 |    895 µs |        4 µs |
+| idle-diff+8x-unplugged | current  |       87,532 |    859 µs |      206 µs |
+| idle-diff+8x-unplugged | raw      |      436,974 |  5,908 µs |    1,068 µs |
+| idle-diff+8x-unplugged | packbits |       14,524 |  7,389 µs |      864 µs |
+| idle-diff+8x-unplugged | new      |        2,145 |  7,402 µs |        9 µs |
+
+Reading it: the body is the smallest of every format in every scenario (idle and
+balloon: 1.5 KiB, 2 bytes per dirty page; 8 GiB unplugged: 2 KiB; dense churn:
+the plain-bitmap size); peer decode is near zero because deserializing is a
+`memcpy` per container and counting is a cardinality lookup, whereas every other
+format walks bytes. The encode column includes building the Roaring sets from
+the per-page inputs (the harness inserts runs the way `snapshot_layout` does)
+and is dominated by that on the unplugged row, where both the harness and the
+packbits variant touch 9 GiB-worth of input; the shipped code inserts an
+unplugged slot as one range. The encode column excludes `KVM_GET_DIRTY_LOG` and
+`mincore` (identical for all formats and larger than any of these numbers: 0.1
+ms per GiB on hugetlbfs, 1.8 ms per GiB on tmpfs for `mincore` alone). The
+chunked variant that preceded both measured 43.8 KiB in every diff scenario.
 
 #### Decision: a bitmap, not a range list
 
@@ -496,10 +641,10 @@ replaced it with the bitmap:
   the late pre-copy passes that decide downtime. With a bitmap the peer makes
   that trade itself, per pass, by merging runs across small gaps to save copy
   calls, and Firecracker has no opinion about it.
-- The peer already keeps a per-page bitmap of what it populated (§9) and a
-  hugetlbfs peer rounds decisions to its backing page; both are bitwise
-  operations on same-shaped arrays. Against a range list they are a splitting
-  loop.
+- A peer that keeps per-page state of its own (what it populated through UFFD,
+  for serving faults) and a hugetlbfs peer that rounds decisions to its backing
+  page do bitwise operations on same-shaped arrays. Against a range list they
+  are a splitting loop.
 - Everything that may change how the bitmap is produced
   (`KVM_CAP_DIRTY_LOG_RING`, `KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2`,
   over-approximation) produces a bitmap naturally and needs no API change.
@@ -527,85 +672,6 @@ dirty information, and it is a handful of huge extents. A binary response
 `MediaType`) can be added later for peers that measure the base64 cost; it does
 not change the JSON contract.
 
-#### Decision: report populated pages (`populated`), from `mincore`
-
-Every response also carries `populated`, one bit per *backing* page
-(`populated_page_size`: 4 KiB, or 2 MiB on hugetlbfs), same extent as `pages`,
-set when `mincore(2)` reports the page resident in Firecracker's mapping of the
-slot. It is taken right before the dirty state is consumed, consumes nothing,
-and is present for `Full` as well.
-
-The problem it solves: a dirty page that is a hole in the memfd (released by the
-balloon or free page reporting, never touched after boot) reads as zeros, and a
-backend has no way to know that without reading it. On tmpfs the read is cheap
-(`copy_file_range` skips holes) and `lseek(SEEK_HOLE)` would tell anyway; on
-hugetlbfs neither works: `lseek` is `default_llseek` (whole file is data),
-`cachestat` returns `EOPNOTSUPP`, `FIEMAP` is not implemented, and reading a
-hole is a 2 MiB zero-fill through `read()`. After a large inflation the final
-copy pass would zero-fill gigabytes. Firecracker is the only party that can
-answer cheaply: `mincore` over its own mapping costs 0.09 ms per GiB on
-hugetlbfs (one page-table walk entry per huge page) and 1.8 ms per GiB on tmpfs
-(the same walk the `mincore` diff does).
-
-What `mincore` means differs between the two backings, and the field is defined
-so that both are covered. On tmpfs it reports page-cache residency: present ⇔
-the page has content, whoever wrote it; absent ⇔ hole, or swapped out. On
-hugetlbfs it reports *Firecracker's own huge PTEs*: present ⇔ content that
-Firecracker has touched since the page was last allocated; absent ⇔ hole, or
-content written only by another process through its own mapping. Verified on
-5.10 with two mappings of one memfd: a write through mapping B leaves `mincore`
-on A clear until A reads the page; `MADV_REMOVE` of a whole huge page clears it
-on both; a partial punch (8 KiB inside a huge page) leaves the page allocated
-and present, with its bytes intact on 5.10 and zeroed on newer kernels. The
-partial-punch case is the reason to prefer asking the kernel over Firecracker
-tracking its own discards: the page stays present, the backend reads it, and
-gets whatever the guest sees, whatever the kernel did. The other-process case is
-the backend itself (it knows what it wrote; `UFFDIO_COPY` installs Firecracker's
-PTE, so uffd-populated pages show as present) or a vhost-user backend writing RX
-buffers the guest has not touched, a pre-existing gap. The swap case is the
-existing `mincore` diff requirement. All three are documented rather than
-engineered around.
-
-The backend's per-page rule becomes three-way: uffd-registered and never
-populated by the backend → snapshot file (the backend's own knowledge, and it
-must come first: such a page is never resident in Firecracker's mapping, so
-`populated` alone would call it zero); otherwise `populated` clear → write or
-punch zeros, do not read; otherwise → memfd. `pages` says *what* to copy and is
-unchanged; `populated` only refines *where from*.
-
-What it does not deliver, measured: after a UFFD *restore* on hugetlbfs, the
-pages the balloon releases are mostly pages the guest never touched since the
-restore, which the handler never populated and Firecracker never faulted in.
-They are dirty (the discard marks them), not resident, and correctly classified
-as "snapshot file" by the handler, so they are copied from the base, not zeroed;
-`populated` cannot help, and only whole huge pages released in a single balloon
-batch are punched and become zeroable through the `remove` event. In the same
-test on 4 KiB pages, or after a *boot* on either page size, the released memory
-is zeroed almost entirely (the integration tests assert ≥64 MiB and ≥96 MiB of
-128 MiB respectively). A backend that wants the restore + hugetlbfs case too
-must decide the source from its own records (it can treat a page it never
-populated and that is dirty only because of a discard as zero if it unregisters
-the range), which is the design's original rule and needs nothing more from
-Firecracker.
-
-Another lesson from the same tests: the handler must *write* zeros for these
-pages, not punch holes in the target. `rebase-snap` and `snapshot-editor` treat
-a hole in a diff file as "page not in the diff", and Firecracker's own
-`dump_dirty` writes explicit zeros for released pages for the same reason.
-Punching is only correct for `unplugged` ranges (which restore never maps) and
-for a fresh full file.
-
-Rejected: Firecracker tracking discards itself (a second `AtomicBitmap` written
-by `discard_range`, cleared on balloon deflate, masked against the KVM log at
-consumption). It needs kernel-version reasoning for partial punches, a deflate
-hook, and cannot express "never touched since boot", which is the boot-time
-`Full` win. Rejected: 4 KiB granularity for `populated` on hugetlbfs. `mincore`
-returns 512 identical entries per huge page, so nothing would be gained and the
-bitmap would be 512 times larger; the backend already rounds source decisions to
-the backing page. Rejected: making it opt-in. It is 64 bytes per GiB on
-hugetlbfs and 32 KiB per GiB (the size of `pages`) on tmpfs, where it also saves
-the read of every never-touched page in a boot-time `Full`.
-
 ### 8. `PUT /snapshot/dirty-pages`: pre-copy passes
 
 ```json
@@ -613,12 +679,14 @@ PUT /snapshot/dirty-pages
 {}
 ```
 
-Response: `200 OK` with the same `memory` object as §7, or an error.
+Response: `200 OK` with the same `memory` object as §7, or an error. There are
+no parameters; an empty body and `{}` are both accepted, and unknown fields are
+rejected, so that parameters can be added later.
 
 Semantics:
 
-- Callable in `Running` or `Paused`. Consuming: the same computation as step 3
-  of §7 for `Diff`, followed by `mark_virtio_queue_memory_dirty`.
+- Callable in `Running` or `Paused`. Consuming: the same computation as steps
+  4–6 of §7 for `Diff`, followed by `mark_virtio_queue_memory_dirty`.
 - Before resetting, Firecracker calls a new
   `VirtioDevice::prepare_dirty_tracking_reset` hook on every activated device.
   virtio-net marks RX buffers dirty when it *parses* them
@@ -638,8 +706,8 @@ Semantics:
   below.
 
 `PUT` rather than `GET` because the request has a side effect (it consumes the
-dirty set); the empty body keeps room for additive fields. The path names what
-is returned (pages) rather than how it is encoded.
+dirty set); the body is a JSON object so that fields can be added. The path
+names what is returned (pages) rather than how it is encoded.
 
 #### Decision: dirty pages only with a memory backend
 
@@ -680,11 +748,12 @@ memory backends:
 - A control socket of the handler's own, unrelated to Firecracker, on which the
   orchestrator (the test framework) sends
   `{"Copy": {"mem_path": "...", "memory": <the object returned by Firecracker>}}`
-  (one request per connection). The handler writes the set pages into `mem_path`
-  (creating the file at `total_size`, merging into an existing file for diffs,
-  zeroing `unplugged`, `copy_file_range` with a read/write fallback) and replies
-  `{"Done": {"success": true|false, "message": "..."}}`. This is one module
-  shared by all example handlers.
+  (one request per connection). The handler applies the layout to `mem_path`
+  (creating the file at `total_size`, merging into an existing file otherwise):
+  authoritative runs are copied from the memfd (`copy_file_range` with a
+  read/write fallback), zero runs are written as zeros, the rest is left alone.
+  It replies `{"Done": {"success", "message", "copied_bytes", "zeroed_bytes"}}`.
+  This is one module shared by all example handlers.
 
 The split reflects the real deployment: the orchestrator talks HTTP to
 Firecracker and whatever it likes to its backend; Firecracker talks to the
@@ -698,30 +767,29 @@ That holds for a booted microVM, but not after a restore: the memfd starts
 empty, and a page only holds content once the handler has served a fault for it.
 For every other page a read through Firecracker's mapping would fault and the
 handler would serve the snapshot file, which is therefore the guest-visible
-content and what Firecracker's own `dump` would have written. The copy must
-follow the same rule:
+content and what Firecracker's own `dump` writes (and, with a backend attached,
+still does write for a `Full`: the fault handler is how it gets those bytes).
 
-| Page                                                     | Read from                  |
-| :------------------------------------------------------- | :------------------------- |
-| uffd-registered, never populated by the handler          | snapshot file, same offset |
-| populated by the handler, Firecracker reports resident   | memfd                      |
-| populated by the handler, Firecracker reports not        | zero (a hole)              |
-| in a range received as uffd `remove` event, not resident | zero (a hole)              |
-| unplugged virtio-mem slot                                | zero                       |
+With the two-bitmap format and the "dirty ⇒ authoritative or zero" invariant
+(§7) the handler's rule for a diff is the bitmaps, nothing else:
 
-The first distinction only the handler can make, and it can do so exactly and
-for free: it is the only party that populates pages, and it is told about every
-discard. `uffd_utils.rs` keeps one bit per page (`PopulatedPages`), set on every
-successful populate and for every range it unregisters on `remove`. The second
-distinction, hole or content within the memfd, is Firecracker's `populated`
-bitmap (§7). The copy routine walks the received `pages` in backing-page steps,
-classifies each page (`PageSource::{SnapshotFile, Memfd, Zero}`), merges
-consecutive pages of the same source into runs, and copies or zeroes each run
-(`zero_range`: `fallocate(PUNCH_HOLE)`, falling back to writing zeros). Since
-the memfd and the snapshot file share one layout, this is a matter of offsets.
-The handler's `Done` reply reports `zeroed_bytes`, which is how the tests
-observe the saving. Alternatives in which Firecracker determines the source
-entirely were considered and rejected (§13).
+| Page                           | Read from            |
+| :----------------------------- | :------------------- |
+| in `memfd_authoritative_pages` | memfd                |
+| in `zero_pages`                | zero                 |
+| neither                        | not part of the diff |
+
+`copy_pages` decodes both bitmaps (`DecodedLayout`), walks the file in page
+order producing runs of the same class (`PageClass::{Authoritative, Zero}`;
+unchanged pages are the gaps), and copies or zeroes each run. Zeros are written,
+never punched: to `rebase-snap` a hole in a diff file means "not in the diff",
+whereas a released page *is* in the diff and must overwrite the base's old
+bytes, which is also what Firecracker's own `dump_dirty` does. Since the memfd
+and the snapshot file share one layout, all of this is a matter of offsets. The
+handler's `PopulatedPages` is gone: it existed only for the copy decision (fault
+serving never consulted it; `UFFDIO_COPY` reports `EEXIST` for a page already
+populated, and an unregistered range faults no more). The `remove` handler now
+just unregisters.
 
 #### Discards: balloon and virtio-mem
 
@@ -734,12 +802,11 @@ zero through every mapping, exactly what `MADV_DONTNEED` achieves for anonymous
 memory. `MADV_REMOVE` rather than `fallocate(PUNCH_HOLE)` on the fd, because it
 goes through `userfaultfd_remove()` and the registered handler keeps receiving
 the `remove` event (Firecracker's `madvise` blocks until the handler has read
-it). That event is what lets the handler treat the range as memfd-authoritative
-(third row above); the recommended handling is to unregister the range, after
-which the kernel serves zero pages for it without the handler. A handler that
-ignores `remove` events, or keeps a punched range registered while its bitmap
-still says the pages are populated, produces copies that differ from the guest's
-view.
+it). That event is what lets the handler stop serving the range from its
+snapshot file; the recommended handling is to unregister the range, after which
+the kernel serves zero pages for it without the handler. A handler that ignores
+`remove` events, or keeps a punched range registered while its bitmap still says
+the pages are populated, produces copies that differ from the guest's view.
 
 `discard_range` also marks every discarded range dirty in Firecracker's bitmap,
 so that the next `Diff` (Firecracker-written or backend-copied) records the
@@ -756,13 +823,27 @@ test. Identity is therefore established in two layers.
 Rust unit tests (`src/vmm/src/vstate/memory.rs`, `persist.rs`), where both
 implementations are driven from identical inputs:
 
-- Given the same `(kvm_bitmap, firecracker_bitmap, plugged)` input, the bitmap
-  produced for a `Diff` has exactly the pages `dump_dirty` writes set
+- Given the same `(kvm_bitmap, firecracker_bitmap, plugged, residency)` input,
+  applying the `Diff` layout (copy authoritative, zero the zero pages, leave the
+  rest) onto a base file yields `dump_dirty`'s output over the same base
   (property-style test over random bitmaps, including a trailing slot whose page
-  count is not a multiple of 64 and unplugged slots); the bitmap for a `Full`
-  has exactly the pages `dump` writes set.
-- Copying the set pages from a memfd into a file yields a file identical to
-  `dump_dirty`'s / `dump`'s output.
+  count is not a multiple of 64, unplugged slots and punched plugged pages,
+  `test_dirty_layout_matches_dump_dirty`).
+- The classification itself: written pages resident, punched pages not,
+  re-touched pages resident again, each page on its own; unplugged slots are
+  zero pages and a 1 GiB unplugged region is under 32 bytes on the wire
+  (`test_layout_classifies_resident_and_holes`,
+  `test_layout_unplugged_slots_are_zero`); `classify` against a hand-built
+  layout, the wire format of the documentation example byte for byte, and
+  malformed input (`vmm_config::snapshot::tests`).
+- `discard_range` on a shared hugetlbfs mapping rounds inward to the huge page,
+  freeing and marking exactly what `MADV_REMOVE` frees
+  (`test_discard_range_on_hugetlbfs_memfd_rounds_inward`).
+- Request validation: `mem_file_path` is required or forbidden per snapshot type
+  and backend presence, checked before anything is written
+  (`persist::tests::test_create_snapshot_params_validation`).
+- The invariant: marking a range through `GuestMemorySlice::new` faults it in
+  (`test_fault_in_marked_range`).
 - The memfd offset of every region equals the offset `dump` writes it at, with
   and without a hotplug region.
 
@@ -778,10 +859,12 @@ the backend's copy of all plugged pages; `M_diff(t0,t1)` is the backend's sparse
 file of the pages returned by a `Diff` `snapshot/create` at `t1`; `rebase` is
 the existing `rebase-snap` tool / `Snapshot.rebase_snapshot`.
 
-1. Full snapshot layout: boot with a backend, run a workload, pause,
-   `snapshot/create Full` → `M_full(t0)`. Assert size `total_size` and that
-   Firecracker restores from it (`File` backend) with a healthy guest.
-   (`test_boot_full_snapshot_restores`)
+1. First diff of a booted microVM: boot with a backend, run a workload, pause,
+   `snapshot/create Diff` into a fresh file → `M(t0)`, a complete memory file
+   since unchanged pages are zero after a boot. Assert size `total_size`, that
+   it equals Firecracker's own `Full` of the same state, and that Firecracker
+   restores from it (`File` backend) with a healthy guest.
+   (`test_boot_diff_snapshot_restores`)
 1. Diff self-consistency (the backend-side analogue of
    `test_snapshot_basic.py::test_cmp_full_and_first_diff_mem`): resume, run a
    workload, pause, `snapshot/create Diff` → `M_diff(t0,t1)`; still paused,
@@ -803,28 +886,32 @@ the existing `rebase-snap` tool / `Snapshot.rebase_snapshot`.
    stronger.)
 1. Cross-check against a Firecracker-made snapshot: restore one VM with a
    backend and one without from the same base snapshot, keep both paused, take a
-   backend `Full` and a classic `Full`, compare. This exercises the
-   snapshot-file source for never-populated pages end to end. Correction: the
-   two are *not* byte-identical, because KVM writes the kvmclock pages (wall
-   clock, per-vCPU time info) with the current time when their MSRs are set at
-   restore. The test computes the pages at which the classic copy differs from
-   the base (a handful) and requires every difference of the backend copy, to
-   the base and to the classic copy, to be within that set.
-   (`test_cross_check_with_firecracker_snapshot`)
+   backend `Diff` rebased onto the base, a `Full` written by Firecracker through
+   the backend (every never-populated page faulted in), and a classic `Full`,
+   compare. Correction: the two are *not* byte-identical, because KVM writes the
+   kvmclock pages (wall clock, per-vCPU time info) with the current time when
+   their MSRs are set at restore. The test computes the pages at which the
+   classic copy differs from the base (a handful) and requires every difference
+   of the backend copy, to the base and to the classic copy, to be within that
+   set. (`test_cross_check_with_firecracker_snapshot`)
 1. Balloon: (a) boot with a backend, `M_full(t0)`, inflate while running,
    `Diff`, `Full`, `rebase == Full`, which needs the discarded ranges both
    punched (zeros in `Full`) and marked dirty (present in `Diff`); (b) same
    after a restore with a backend, where the handler receives `remove` events
    for a mix of populated and never-populated pages, then deflate, reuse the
-   memory and restore from the result; (c) Firecracker's RSS drops on inflate
-   with memfd-backed memory. (`test_balloon_inflate_at_boot`,
+   memory and restore from the result (with 2M pages, only whole huge pages the
+   guest released in one range are freed and marked, so the test only checks
+   identity there); (c) Firecracker's RSS drops on inflate with memfd-backed
+   memory. (`test_balloon_inflate_at_boot`,
    `test_balloon_inflate_after_restore`, `test_balloon_inflate_reclaims_memory`;
    the plain-memory counterpart of (a) is
    `test_balloon.py::test_balloon_inflate_marks_pages_dirty`.)
-1. virtio-mem: `total_size` includes the hotplug region, `unplugged` covers the
-   unplugged slots and they are zero in the file, before and after plugging; the
-   result restores with the plugged size intact.
-   (`test_virtio_mem_unplugged_slots`)
+1. virtio-mem: `total_size` includes the hotplug region; unplugged slots are
+   zero pages and zero in the file, the zero bitmap of a 768 MiB file with 512
+   MiB unplugged is 192 bytes on the wire, a plugged slot is authoritative where
+   touched; the result restores with the plugged size intact.
+   (`test_virtio_mem_unplugged_slots`, `test_virtio_mem_unplug_after_use`, which
+   also checks a replugged slot is fully classified as authoritative or zero)
 1. Variants: hugetlbfs 2M for 1–4, the restore-with-backend model change and the
    balloon-after-restore test (`PAGE_CONFIGS`; restores of 2M snapshots go
    through the UFFD handler since `File` rejects them);
@@ -844,11 +931,13 @@ Compatibility tests (all in the same file unless noted):
   `Uffd` and with `File`; restore with `Uffd`/`SharedMemfd` → snapshot → restore
   with `SharedMemfd`; in each case the resulting VM snapshots correctly in its
   new mode.
-- Negative: `snapshot/create` with `mem_file_path` and a backend → 400; without
-  `mem_file_path` and no backend → 400; `dirty-pages` without a backend → 400;
-  `machine-config.mem_backend` with `File`/`Uffd` → 400; unreachable backend
-  fails `InstanceStart`; backend process killed → VM keeps running,
-  `snapshot/create` still returns a bitmap, the orchestrator's copy fails.
+- Negative: `snapshot/create Diff` with `mem_file_path` and a backend → 400;
+  `Full` without `mem_file_path`, backend or not → 400; `dirty-pages` without a
+  backend → 400; unknown fields on either endpoint → 400 without consuming or
+  writing anything; `machine-config.mem_backend` with `File`/`Uffd` → 400;
+  unreachable backend fails `InstanceStart`; backend process killed → VM keeps
+  running, `snapshot/create Diff` still returns the layout, the orchestrator's
+  copy fails.
 
 ### 11. Security and operational notes
 
@@ -860,9 +949,10 @@ Compatibility tests (all in the same file unless noted):
   backend socket. `copy_file_range` is only used by the backend.
 - The memfd is sealed against resize; Firecracker keeps its own fd, so backend
   death never invalidates guest memory.
-- API response size: `pages` is 43 KiB of base64 per GiB of guest memory,
-  independent of the dirty set (§7). The API server's payload limit applies to
-  requests only; responses are streamed as today for `GET /vm/config`.
+- API response size: at most 44 KiB of base64 per GiB of guest memory per set (a
+  dense random dirty set), a few KiB for an idle guest, under 100 bytes per GiB
+  of unplugged or released memory (§7). The API server's payload limit applies
+  to requests only; responses are streamed as today for `GET /vm/config`.
 - Seccomp for discards: the VMM thread's `madvise` rule is unrestricted, so
   `MADV_REMOVE` needs no filter change.
 - Metrics:
@@ -878,21 +968,22 @@ parentheses):
    `memory::create` with a base offset, `VmResources::allocate_guest_memory`
    returning the backing for `allocate_memory_region` to continue from;
    offset-invariant unit test. (Mergeable alone, no API change.)
-1. Bitmap computation shared with file writing:
+1. Layout computation shared with file writing:
    `GuestMemorySlot::for_each_dirty_batch` is the single definition of "which
    pages a diff contains", used by both `dump_dirty` and
-   `GuestMemoryExtension::dirty_layout`; `full_layout`; `SlotFileOffsets`;
-   property-style identity tests against `dump`/`dump_dirty` over random
-   bitmaps, including fold-back on error;
-   `SnapshotMemoryLayout::{set_range, page_is_set}` and a base64 serde adapter
-   for `pages`. (Mergeable alone.)
+   `GuestMemoryExtension::snapshot_layout`; `mincore_resident`;
+   `SnapshotMemoryLayout::classify` as the single definition of the three
+   classes; `fault_in_marked_range`; property-style identity tests against
+   `dump_dirty` over random bitmaps and residency, including fold-back on error;
+   a serde adapter (Roaring portable format, base64) for the page sets.
+   (Mergeable alone.)
 1. Handshake and boot: `send_uffd_handshake(&[RawFd])`, `uffd_mappings`,
    `MachineConfig.mem_backend` (only `SharedMemfd` accepted), handshake in
    `build_microvm_for_boot` after all regions are registered with KVM,
    `Vmm.mem_backend_attached`.
-1. `PUT /snapshot/create` with a backend: `mem_file_path: Option`, both
+1. `PUT /snapshot/create Diff` with a backend: `mem_file_path: Option`, both
    rejections, `KvmVm::snapshot_memory_layout`, `VmmData::SnapshotMemory`, 200
-   body, swagger.
+   body, swagger. `Full` unchanged.
 1. `PUT /snapshot/dirty-pages`: `VmmAction::GetDirtyPages`, `Vmm::dirty_pages`,
    `VirtioDevice::prepare_dirty_tracking_reset` with the virtio-net
    implementation (`return_parsed_rx_buffers`, shared with `prepare_save`),
@@ -900,12 +991,12 @@ parentheses):
 1. `snapshot/load` with `backend_type: SharedMemfd`: memfd-backed memory, uffd
    registered on the shmem mapping, handshake with `[uffd, memfd]`.
 1. Discards on shared memory: `discard_range` with `MADV_REMOVE` for shared file
-   mappings, dirty marking of every discarded range, unit tests for the hole and
-   the dirty bits. (Mergeable alone; also fixes balloon reclaim for vhost-user.)
+   mappings, rounded inward to the backing page, dirty marking of exactly the
+   freed range, unit tests for the hole, the dirty bits and the hugetlbfs
+   rounding. (Mergeable alone; also fixes balloon reclaim for vhost-user.)
 1. Example handlers: `Handshake` with all fds, `fstat`-based fd classification,
-   optional memory file, `PopulatedPages`, `MemorySource`/`copy_pages` walking
-   the bitmap in runs with snapshot-file fallback (and a dependency-free base64
-   decoder), control socket, unit tests for each.
+   optional memory file, `copy_pages` walking both bitmaps in runs (and a
+   dependency-free base64 decoder), control socket, unit tests for each.
 1. Python framework and integration tests as listed in §10.
 1. Docs: `shared-memfd.md` (user), this document, `snapshot-support.md`,
    `handling-page-faults-on-snapshot-resume.md`, `ballooning.md`, CHANGELOG;
@@ -935,32 +1026,38 @@ Remaining before this leaves developer preview:
 - No synchronisation between Firecracker and the backend at snapshot time. The
   pause invariant of the `firecracker` binary is what makes this correct, and it
   is documented and tested as such.
-- Dirty information is exchanged over the HTTP API as one base64 bitmap over the
-  whole memory file, one bit per `page_size` bytes, in the `snapshot/create`
-  response (final, consistent set) and from `PUT /snapshot/dirty-pages`
-  (pre-copy, consuming, any state). A range list was the first choice and was
-  replaced after measuring it (§7). The bitmap is a superset of the modified
-  pages, not promised to be exact.
-- `PUT /snapshot/create` with a backend never writes memory and takes no
-  `mem_file_path`; the response code changes from 204 to 200 in that mode only.
+- Dirty information is exchanged over the HTTP API as two bitmaps that classify
+  every page of the memory file: `memfd_authoritative_pages` (dirty ∧ resident)
+  and `zero_pages` (dirty ∧ ¬resident), as Roaring bitmaps of host-page indices
+  in the portable format, base64-encoded, in the `snapshot/create` response
+  (final, consistent set) and from `PUT /snapshot/dirty-pages` (pre-copy,
+  consuming, any state). A range list was the first choice and was replaced
+  after measuring it (§7); a dirty bitmap plus `unplugged` list plus `populated`
+  bitmap was the second and was replaced by the two class bitmaps after
+  measuring those; chunked, trailing-trimmed class bitmaps were the third,
+  PackBits-compressed full-length ones the fourth, and Roaring replaced both
+  after measuring (§7). The authoritative set is a superset of the modified
+  resident pages, not promised to be exact.
+- Firecracker upholds "dirty ⇒ memfd authoritative or zero" by faulting in every
+  range it marks dirty ahead of writing it (`fault_in_marked_range`), and takes
+  `mincore` after reading the dirty state. On hugetlbfs, `discard_range` frees
+  and marks whole huge pages only, as `MADV_REMOVE` does.
+- Firecracker writes `Full` snapshots, backend or not; only a `Diff` with a
+  backend goes to the backend: `PUT /snapshot/create Diff` then never writes
+  memory, takes no `mem_file_path`, and answers 200 instead of 204.
 - `PUT /snapshot/dirty-pages` is rejected without a memory backend. A
   non-consuming variant is possible later if a use case appears.
 - A lost `Diff` response is the orchestrator's problem; it falls back to `Full`.
 - Restore with a backend always uses a uffd for population; file population with
   sharing is deferred.
-- Firecracker does not tell the backend where the bytes of a page come from.
-  After a restore a page is either in the memfd (populated by the backend,
-  possibly written since) or still only in the backend's source (registered,
-  never populated), and only the backend knows which, from state it already
-  owns: the pages it populated and the `remove` events it received. Two
-  alternatives were rejected: populating every page of the bitmap before
-  answering (`MADV_POPULATE_READ` or reading through the mapping, as `dump`
-  does) makes a backend-made `Full` after a lazy restore fault in all of guest
-  memory, which is the cost this design exists to avoid; and Firecracker
-  classifying pages itself (memfd presence via `SEEK_HOLE`/`mincore` plus a
-  bitmap of the ranges it discarded, reported as a second `source` bitmap) is
-  possible additively but needs two presence mechanisms (tmpfs vs hugetlbfs) and
-  is unreliable under host swap with `mincore`.
+- Firecracker tells the backend where the bytes of every *changed* page come
+  from (memfd or zero); for unchanged pages the backend knows (zero after a
+  boot, the base after a restore). Earlier versions of this design had the
+  backend decide from its own record of what it had populated through UFFD,
+  because a dirty page could still be unpopulated; the invariant above removed
+  that case. Populating every dirty page eagerly (`MADV_POPULATE_READ` over the
+  whole set) was rejected as too expensive for a lazy restore; faulting in only
+  the few pages marked ahead of a write is the cheap version of the same idea.
 - Balloon/virtio-mem discards punch holes into the memfd (`MADV_REMOVE`, so the
   uffd `remove` event is preserved) and are marked dirty.
 - The peer cannot rely on finding those holes in the memfd itself. On tmpfs
@@ -970,10 +1067,10 @@ Remaining before this leaves developer preview:
   "absent" whether it is a hole or not), `cachestat` returns `EOPNOTSUPP`,
   `FIEMAP` is not implemented. (An earlier version of this document claimed
   `mincore` worked for the peer on both; it does not on hugetlbfs.) Firecracker
-  therefore reports residency in *its* mapping as `populated` (§7). This is also
-  why `unplugged` stays an explicit list rather than being folded into `pages`
-  and inferred from holes: a hotplug region can be gigabytes of never-plugged
-  memory.
+  therefore folds residency in *its* mapping into the classification (§7). On
+  hugetlbfs `mincore` is per huge page: a dirty 4 KiB page in a resident huge
+  page is authoritative, one in a non-resident huge page is zero; both are
+  right.
 
 ### 14. Corrections made in retrospect
 
@@ -1013,3 +1110,50 @@ document:
   the guest allocates fresh memory and to explode when a process rewrites memory
   it already owns, which is the pre-copy steady state; it was replaced by a
   fixed-size bitmap (§7).
+- The second version exchanged that bitmap up to the last plugged slot, an
+  `unplugged` range list, and (later) a `populated` bitmap from `mincore`, and
+  had the backend combine them with its own record of what it had populated
+  through UFFD. Three things replaced it with the two class bitmaps of §7: the
+  backend's rule needed per-page state and had two bugs found only by tests (a
+  wrong source at a huge-page boundary; punching holes into a diff, which
+  `rebase-snap` reads as "absent"); a backend `Full` after a consumed diff on a
+  restored microVM copied balloon-released pages back from the base, because
+  nothing remembered the discard once the dirty mark was gone; and the measured
+  formats (§7) showed the class bitmaps to be half the size and 2–4× cheaper on
+  both sides.
+- The third version chunked `zero_pages` at a caller-chosen granularity and
+  trimmed trailing zero bytes from both bitmaps, to keep the zero bitmap small
+  and an unplugged tail free. A compressed representation of the full page sets
+  achieves both without a parameter, a trim rule or any rounding, and handles
+  unplugged slots anywhere in the file; `zero_chunk_size`, its validation and
+  `DirtyPagesParams` are gone, `dirty-pages` takes no body again, and
+  `bitmap_encoding` names the serialization. PackBits over full-length bitmaps
+  was implemented first (dependency-free, a dozen lines to decode); Roaring
+  replaced it for being a standard with libraries everywhere, for constant-time
+  membership on the decoded form, and for being smaller still in every scenario
+  measured (§7), at the cost of one dependency.
+- "Dirty ⇒ memfd authoritative" did not hold for pages marked ahead of a write
+  (virtqueue rings, RX buffers) after a UFFD restore. Faulting those ranges in
+  when they are marked (`fault_in_marked_range`) made it hold, and made the
+  backend's `PopulatedPages` unnecessary: that record was "memfd is
+  authoritative here", fed by the handler's own populates and by `remove`
+  events; residency now covers the former and the dirty mark `discard_range`
+  leaves covers the latter, from the other end of the same events.
+- The third version had the backend produce `Full` snapshots from a layout that
+  needed a persistent `discarded` bitmap in Firecracker (a `Full` cannot use the
+  consumed dirty state, and residency cannot tell a released hole from a
+  never-touched one). Such a `Full` still depended on the base for its unchanged
+  pages, so it was a whole-history `Diff` under another name, useful only to
+  recover from a lost `Diff` response. `Full` now goes through Firecracker's own
+  `dump` with a backend attached as without; the bitmap, the `Full`
+  classification and the handler's base-copy mode are gone (§7).
+- On hugetlbfs, `discard_range` marked every 4 KiB page of the requested range
+  dirty while `MADV_REMOVE` freed only the huge pages the range covered
+  entirely: the rest was reported dirty but was neither in the memfd nor zero.
+  The 2M balloon-after-restore test caught it once the backend stopped keeping
+  its own record; `discard_range` now rounds inward to the backing page for
+  shared file mappings, as the kernel does.
+- Firecracker's `snapshot_layout` reports the layout in a single pass over two
+  byte-per-page maps (`SnapshotMemoryLayout::classify`), which turned out to be
+  the fastest of the formats measured, not the slowest as one might expect from
+  "Firecracker does more work": one bitmap to base64 instead of two dominates.

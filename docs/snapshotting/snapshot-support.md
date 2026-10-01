@@ -216,12 +216,13 @@ block I/O that the kernel completes after the pause (drained by
 
 > [!NOTE]
 >
-> When a [memory backend](shared-memfd.md) is attached to the microVM,
+> When a [memory backend](shared-memfd.md) is attached to the microVM, a `Diff`
 > `PUT /snapshot/create` does not write guest memory to `mem_file_path` (which
 > must then be omitted). It writes the microVM state file and answers `200 OK`
-> with a bitmap of the pages of the shared guest memory that make up the
-> snapshot, for the backend to copy. Everything below about full and diff
-> snapshots applies to the memory file the backend produces.
+> with bitmaps of the pages of the shared guest memory that make up the diff,
+> for the backend to copy or zero. `Full` snapshots are written by Firecracker
+> as usual. Everything below about full and diff snapshots applies to the memory
+> file the backend produces.
 
 Now that the microVM is paused, you can create a snapshot, which can be either a
 `full`one or a `diff` one. Full snapshots always create a complete, resume-able
@@ -457,9 +458,9 @@ snapshot. Accepted values are:
   handling page faults in the user space.
 - `SharedMemfd` - like `Uffd`, but guest memory is backed by a single memfd
   which is handed to the page fault handler together with the uffd, so that the
-  handler can produce memory snapshots itself. `PUT /snapshot/create` then
-  reports the pages to copy instead of writing a memory file. See
-  [memory backend](shared-memfd.md).
+  handler can produce diff memory snapshots itself. A `Diff`
+  `PUT /snapshot/create` then reports the pages to copy or zero instead of
+  writing a memory file. See [memory backend](shared-memfd.md).
 
 The meaning of `backend_path` depends on the `backend_type` chosen:
 

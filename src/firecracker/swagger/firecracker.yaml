@@ -767,15 +767,18 @@ paths:
       summary: Creates a full or diff snapshot. Post-boot only.
       description:
         Creates a snapshot of the microVM state. The microVM should be
-        in the `Paused` state. Without a memory backend attached, guest memory
-        is written to `mem_file_path` and the response is 204. With a memory
-        backend attached (see `MachineConfiguration.mem_backend` and the
-        `SharedMemfd` backend type of `/snapshot/load`), `mem_file_path` must
-        be absent, no guest memory is written, and the response is 200 with a
+        in the `Paused` state. Guest memory is written to `mem_file_path` and
+        the response is 204, except for a `Diff` snapshot with a memory backend
+        attached (see `MachineConfiguration.mem_backend` and the `SharedMemfd`
+        backend type of `/snapshot/load`), where `mem_file_path` must be absent,
+        no guest memory is written, and the response is 200 with a
         `SnapshotMemory` body telling the backend which pages of the shared
-        memfd make up the snapshot. Because a paused microVM does not run device
+        memfd make up the diff. Because a paused microVM does not run device
         emulation, the backend can copy those pages at any time before the
-        microVM is resumed.
+        microVM is resumed. A `Full` snapshot with a memory backend is written
+        by Firecracker like any other; it reads every page through its own
+        mapping, so after a lazy restore this faults the whole of guest memory
+        in.
       operationId: createSnapshot
       parameters:
         - name: body
@@ -786,7 +789,7 @@ paths:
             $ref: "#/definitions/SnapshotCreateParams"
       responses:
         200:
-          description: Snapshot state created; pages to copy (memory backend attached)
+          description: Snapshot state created; pages of the diff (memory backend attached)
           schema:
             $ref: "#/definitions/SnapshotMemory"
         204:
@@ -804,7 +807,7 @@ paths:
     put:
       summary: Reports and resets the guest memory dirtied since the last snapshot. Post-boot only.
       description:
-        Returns a bitmap of the pages of the shared guest memory written since
+        Returns bitmaps of the pages of the shared guest memory written since
         the last snapshot or the last call to this endpoint, and resets dirty
         tracking, so that a memory backend can perform pre-copy passes while the
         microVM runs. Only allowed when a memory backend is attached. Callable in
@@ -1561,27 +1564,17 @@ definitions:
           3) Path to the UDS where a process is listening for the same control
           payload, accompanied by the guest memory memfd (and the UFFD on restore)
 
-  MemoryRange:
-    type: object
-    description: A page-aligned byte range in guest memory file / memfd offset space.
-    required:
-      - offset
-      - len
-    properties:
-      offset:
-        type: integer
-        format: int64
-      len:
-        type: integer
-        format: int64
-
   SnapshotMemory:
     type: object
     description: >-
-      Which pages of the shared guest memory a snapshot consists of. Pages whose bit is set in
-      `pages` are copied from the memfd into the memory file at the same offset; `unplugged`
-      (currently unplugged virtio-mem slots) are zeroed in the memory file. The memory file is
-      `total_size` bytes long.
+      Which pages of the shared guest memory a diff snapshot consists of, and where their
+      content is. Pages in `memfd_authoritative_pages` are copied from the memfd into the memory
+      file at the same offset; pages in `zero_pages` must read as zero in the memory file; every
+      other page is unchanged and not part of the diff. The memory file is `total_size` bytes
+      long. Both sets are Roaring bitmaps of page indices in the portable serialization format,
+      base64-encoded: an idle guest, a released balloon and an unplugged virtio-mem region of any
+      size cost a few bytes each, a dense dirty set at most 8 KiB per 65536 pages, and membership
+      of any page can be tested in constant time.
     required:
       - memory
     properties:
@@ -1590,61 +1583,52 @@ definitions:
         enum:
           - Full
           - Diff
-        description: Present in `PUT /snapshot/create` responses only.
+        description: Present in `PUT /snapshot/create` responses only, where it is always `Diff`.
       memory:
         type: object
         required:
           - total_size
           - page_size
-          - unplugged
-          - populated_page_size
-          - populated
+          - bitmap_encoding
+          - memfd_authoritative_pages
+          - zero_pages
         properties:
           total_size:
             type: integer
             format: int64
-            description: Size of a full guest memory file, in bytes.
+            description: >-
+              Size of a full guest memory file, in bytes, including the virtio-mem hotplug
+              region whether plugged or not.
           page_size:
             type: integer
             format: int64
-            description: Granularity of `pages`, in bytes (the host page size, 4096).
-          pages:
+            description: Granularity of both bitmaps, in bytes (the host page size).
+          bitmap_encoding:
+            type: string
+            enum:
+              - roaring
+            description: >-
+              How the bitmaps are serialized before base64. `roaring` is the Roaring bitmap
+              portable serialization format (https://github.com/RoaringBitmap/RoaringFormatSpec),
+              as produced by every Roaring library. Reject any other value: the field exists so
+              that a backend fails cleanly if a future Firecracker changes the binary format.
+          memfd_authoritative_pages:
             type: string
             format: byte
             description: >-
-              Standard base64 (RFC 4648, padded) of a bitmap covering the memory file from
-              offset 0 to the end of the last plugged slot (ceil(plugged_end / page_size / 8)
-              bytes, whatever is dirty). Byte i, bit b (least significant first) is the page at
-              offset (8 * i + b) * page_size; a set bit means the page must be copied. Set for at
-              least every plugged page whose content changed since the dirty tracking state was
-              last consumed, including pages released by the balloon (which read as zero). Bits
-              of unplugged slots are never set; pages past the end of the bitmap are clear.
-              Absent for a Full snapshot, which consists of every page outside `unplugged`.
-          unplugged:
-            type: array
-            description: Sorted, page-aligned, non-overlapping ranges to zero in the memory file.
-            items:
-              $ref: "#/definitions/MemoryRange"
-          populated_page_size:
-            type: integer
-            format: int64
-            description: >-
-              Granularity of `populated`, in bytes: the backing page size of guest memory (4096,
-              or 2097152 with hugetlbfs).
-          populated:
+              Standard base64 (RFC 4648, padded) of a Roaring bitmap whose members are page
+              indices: page i is the `page_size` bytes at file offset i * page_size. A member
+              page's content is in the memfd and must be copied. These are the pages written
+              since the dirty tracking state was last consumed that are resident in Firecracker's
+              mapping.
+          zero_pages:
             type: string
             format: byte
             description: >-
-              Standard base64 of a bitmap with one bit per `populated_page_size` bytes, same
-              byte/bit layout and same extent as `pages` (up to the end of the last plugged
-              slot). A set bit means the backing page is resident in Firecracker's mapping of
-              guest memory (mincore(2)): a read through it returns the page's content. A clear
-              bit means such a read returns zeros, unless another process wrote the page through
-              a mapping of its own and Firecracker has not touched it since (hugetlbfs), or the
-              page is swapped out (host swap must be disabled). A backend may zero, rather than
-              read, a dirty page whose bit is clear, provided the page is not one it has to serve
-              from a snapshot file itself. Bits of unplugged slots are clear. Reflects the state
-              when the response was computed; consumes nothing.
+              Same encoding. A member page must read as zero in the memory file: it was written
+              or discarded since the dirty state was last consumed and is not resident any more
+              (released by the balloon or free page reporting, or part of an unplugged virtio-mem
+              slot). Disjoint from `memfd_authoritative_pages`.
 
   Metrics:
     type: object
@@ -1807,8 +1791,9 @@ definitions:
       mem_file_path:
         type: string
         description:
-          Path to the file that will contain the guest memory. Required unless a
-          memory backend is attached, in which case it must be absent.
+          Path to the file that will contain the guest memory. Required, except
+          for a `Diff` snapshot with a memory backend attached, where it must be
+          absent.
       snapshot_path:
         type: string
         description: Path to the file that will contain the microVM state.

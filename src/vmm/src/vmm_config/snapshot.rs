@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 /// For crates that depend on `vmm` we export.
+use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
 use super::machine_config::HugePageConfig;
@@ -51,8 +52,9 @@ pub struct CreateSnapshotParams {
     pub snapshot_type: SnapshotType,
     /// Path to the file that will contain the microVM state.
     pub snapshot_path: PathBuf,
-    /// Path to the file that will contain the guest memory. Mandatory unless a memory backend
-    /// is attached to the microVM, in which case it must be absent.
+    /// Path to the file that will contain the guest memory. Mandatory, except for a `Diff`
+    /// snapshot of a microVM with a memory backend attached, where it must be absent: the
+    /// backend produces the diff from the layout returned in the response.
     #[serde(default)]
     pub mem_file_path: Option<PathBuf>,
     /// Whether to fsync the snapshot state and guest memory files.
@@ -200,239 +202,166 @@ pub struct Vm {
     pub state: VmState,
 }
 
-/// A page-aligned byte range, in guest memory file offset space (which is also the offset space
-/// of the memfd handed to a memory backend).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-pub struct MemoryRange {
-    /// Offset of the first byte of the range.
-    pub offset: u64,
-    /// Length of the range in bytes.
-    pub len: u64,
+/// Describes, to a memory backend, which pages of the guest memory file a diff snapshot consists
+/// of and where their content is. Returned by `PUT /snapshot/create` (`Diff`) and
+/// `PUT /snapshot/dirty-pages` when a memory backend is attached. (`Full` snapshots are written
+/// by Firecracker itself, backend or not.)
+///
+/// Every page of the file falls in exactly one of three classes:
+///
+/// - **memfd authoritative**: the backend must copy it from the memfd;
+/// - **zero**: the backend must make it read as zero in the file it produces;
+/// - **neither**: the page is unchanged since the dirty state was last consumed, so the base
+///   the diff applies to already holds its content.
+///
+/// The classification is `dirty ∧ resident` / `dirty ∧ ¬resident` / `¬dirty`, where *dirty* is
+/// the union of KVM's dirty log and Firecracker's own bitmap (every page written or discarded
+/// since the dirty state was last consumed; every page of an unplugged virtio-mem slot) and
+/// *resident* is `mincore(2)` on Firecracker's mapping, taken after the dirty state. Firecracker
+/// upholds "dirty ⇒ memfd authoritative or zero" by faulting in every page it marks dirty ahead
+/// of writing it ([`crate::vstate::memory::fault_in_marked_range`]).
+///
+/// Both sets are [Roaring bitmaps](https://roaringbitmap.org) of page indices (file offset /
+/// `page_size`), sent in Roaring's portable serialization format, base64-encoded. Roaring
+/// stores each 65536-page chunk as a sorted array (sparse), a plain bitmap (dense) or a run
+/// list (long runs), so an idle guest, a released balloon and an unplugged hotplug region of
+/// any size all cost a few bytes per chunk, a dense random dirty set costs at most 8 KiB per
+/// chunk (the plain bitmap), and a backend can test any page in constant time without
+/// decompressing anything.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct SnapshotMemoryLayout {
+    /// Size of a full guest memory file (sum of all region sizes, including the virtio-mem
+    /// hotplug region, plugged or not).
+    pub total_size: u64,
+    /// Granularity of both bitmaps, in bytes (the host page size).
+    pub page_size: u64,
+    /// How the bitmaps are encoded on the wire (before base64). Always `roaring` today; the
+    /// field lets a backend fail cleanly if a future Firecracker changes the binary format.
+    #[serde(default)]
+    pub bitmap_encoding: BitmapEncoding,
+    /// The pages (file offset / `page_size`) to copy from the memfd into the file at the same
+    /// offset. Serialised as standard, padded base64 of the Roaring portable format.
+    #[serde(with = "roaring_base64")]
+    pub memfd_authoritative_pages: RoaringBitmap,
+    /// The pages that must read as zero in the file. Disjoint from the authoritative set.
+    /// Serialised as standard, padded base64 of the Roaring portable format.
+    #[serde(with = "roaring_base64")]
+    pub zero_pages: RoaringBitmap,
 }
 
-/// Describes which pages of the guest memory file a snapshot consists of. Returned by
-/// `PUT /snapshot/create` and `PUT /snapshot/dirty-pages` when a memory backend is attached.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub struct SnapshotMemoryLayout {
-    /// Size of a full guest memory file (sum of all region sizes).
-    pub total_size: u64,
-    /// Granularity of `pages`, in bytes (the host page size).
-    pub page_size: u64,
-    /// One bit per `page_size` bytes of the memory file: byte `i`, bit `b` (least significant
-    /// first) is the page at offset `(8 * i + b) * page_size`. A set bit means the page must be
-    /// copied from guest memory into the memory file at the same offset. For a diff snapshot
-    /// every plugged page whose content changed since the dirty state was last consumed is set
-    /// (the pages `dump_dirty` writes). Bits of currently unplugged slots are never set;
-    /// `unplugged` describes those.
-    ///
-    /// The bitmap covers the file from offset 0 up to the end of the last plugged slot,
-    /// `ceil(plugged_end / page_size / 8)` bytes, whatever is dirty: its length depends on the
-    /// plug state only, and unplugged memory at the end of the file (the hotplug region) costs
-    /// nothing, however large. Pages past its end are clear.
-    ///
-    /// Absent for a full snapshot, which consists of every plugged page: everything not in
-    /// `unplugged`.
-    ///
-    /// Serialised as standard, padded base64.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "base64_bytes"
-    )]
-    pub pages: Option<Vec<u8>>,
-    /// Ranges that must be zeroed in the memory file: the currently unplugged virtio-mem slots.
-    /// Sorted, merged and page-aligned.
-    pub unplugged: Vec<MemoryRange>,
-    /// Granularity of `populated`, in bytes: the backing page size of guest memory (4096, or
-    /// 2 MiB with hugetlbfs).
-    pub populated_page_size: u64,
-    /// One bit per `populated_page_size` bytes of the memory file, same byte/bit layout and same
-    /// extent (up to the end of the last plugged slot) as `pages`. A set bit means the backing
-    /// page is resident in Firecracker's mapping of guest memory (`mincore(2)`), so that a read
-    /// through that mapping returns its content. A clear bit means a read would return zeros,
-    /// unless another process wrote the page through a mapping of its own and Firecracker has
-    /// not touched it since (hugetlbfs, where `mincore` reports Firecracker's page tables), or
-    /// the page is swapped out (host swap must be off). A backend that is told a page is dirty
-    /// but not populated can therefore write zeros to it instead of reading guest memory,
-    /// provided it is not a page the backend itself has to serve from a snapshot file.
-    ///
-    /// Bits of unplugged slots are clear. Describes the state at the time the layout was taken
-    /// and does not consume anything.
-    ///
-    /// Serialised as standard, padded base64.
-    #[serde(with = "base64_vec")]
-    pub populated: Vec<u8>,
+/// Wire encoding of the bitmaps of a [`SnapshotMemoryLayout`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BitmapEncoding {
+    /// Roaring bitmap, portable serialization format
+    /// (<https://github.com/RoaringBitmap/RoaringFormatSpec>).
+    #[default]
+    Roaring,
 }
 
 impl SnapshotMemoryLayout {
-    /// Creates the layout of a full snapshot: no bitmap, every page outside `unplugged` is set.
-    /// `populated` is all clear and sized for `plugged_end`; fill it with
-    /// [`Self::set_populated_range`].
-    pub fn full(
-        total_size: u64,
-        page_size: u64,
-        populated_page_size: u64,
-        plugged_end: u64,
-        unplugged: Vec<MemoryRange>,
-    ) -> Self {
+    /// An empty layout: nothing authoritative, nothing zero.
+    pub fn new(total_size: u64, page_size: u64) -> Self {
         Self {
             total_size,
             page_size,
-            pages: None,
-            unplugged,
-            populated_page_size,
-            populated: Self::bitmap_for(populated_page_size, plugged_end),
+            bitmap_encoding: BitmapEncoding::Roaring,
+            memfd_authoritative_pages: RoaringBitmap::new(),
+            zero_pages: RoaringBitmap::new(),
         }
     }
 
-    /// Creates the layout of a diff snapshot with all-clear bitmaps covering the file up to
-    /// `plugged_end`, the end offset of the last plugged slot.
-    pub fn diff(
+    /// Page index of file offset `offset`. Page indices are `u32`: 16 TiB of 4 KiB pages.
+    pub fn page(&self, offset: u64) -> u32 {
+        u32::try_from(offset / self.page_size).expect("offset beyond 16 TiB of pages")
+    }
+
+    /// Whether the page at file offset `offset` is to be copied from the memfd.
+    pub fn page_is_authoritative(&self, offset: u64) -> bool {
+        self.memfd_authoritative_pages.contains(self.page(offset))
+    }
+
+    /// Whether the page at file offset `offset` is to be zeroed.
+    pub fn page_is_zero(&self, offset: u64) -> bool {
+        self.zero_pages.contains(self.page(offset))
+    }
+
+    /// Marks the page at file offset `offset` authoritative.
+    pub fn set_authoritative(&mut self, offset: u64) {
+        let page = self.page(offset);
+        self.memfd_authoritative_pages.insert(page);
+    }
+
+    /// Marks the page at file offset `offset` zero.
+    pub fn set_zero(&mut self, offset: u64) {
+        let page = self.page(offset);
+        self.zero_pages.insert(page);
+    }
+
+    /// Builds the layout from the sets of `dirty` and `resident` pages (page indices):
+    /// `dirty ∧ resident` is authoritative, `dirty ∧ ¬resident` is zero. This is the single
+    /// definition of the classification. Both results are run-optimised for the wire.
+    pub fn classify(
         total_size: u64,
         page_size: u64,
-        populated_page_size: u64,
-        plugged_end: u64,
+        dirty: &RoaringBitmap,
+        resident: &RoaringBitmap,
     ) -> Self {
+        let mut authoritative = dirty & resident;
+        let mut zero = dirty - resident;
+        authoritative.optimize();
+        zero.optimize();
         Self {
             total_size,
             page_size,
-            pages: Some(Self::bitmap_for(page_size, plugged_end)),
-            unplugged: Vec::new(),
-            populated_page_size,
-            populated: Self::bitmap_for(populated_page_size, plugged_end),
+            bitmap_encoding: BitmapEncoding::Roaring,
+            memfd_authoritative_pages: authoritative,
+            zero_pages: zero,
         }
     }
 
-    /// An all-clear bitmap with one bit per `page_size` bytes up to `end`.
-    fn bitmap_for(page_size: u64, end: u64) -> Vec<u8> {
-        let pages = usize::try_from(end.div_ceil(page_size)).unwrap_or(usize::MAX);
-        vec![0u8; pages.div_ceil(8)]
+    /// Number of pages to copy from the memfd.
+    pub fn authoritative_pages(&self) -> u64 {
+        self.memfd_authoritative_pages.len()
     }
 
-    /// Whether the backing page at file offset `offset` is populated.
-    pub fn page_is_populated(&self, offset: u64) -> bool {
-        let page = offset / self.populated_page_size;
-        let byte = usize::try_from(page / 8).unwrap();
-        self.populated
-            .get(byte)
-            .is_some_and(|b| b & (1 << (page % 8)) != 0)
-    }
-
-    /// Sets the `populated` bits of the `len` bytes at file offset `offset` (both
-    /// `populated_page_size`-aligned).
-    ///
-    /// # Panics
-    ///
-    /// If the range lies past the end of the bitmap.
-    pub fn set_populated_range(&mut self, offset: u64, len: u64) {
-        let first = offset / self.populated_page_size;
-        let last = (offset + len).div_ceil(self.populated_page_size);
-        for page in first..last {
-            let byte = usize::try_from(page / 8).unwrap();
-            self.populated[byte] |= 1 << (page % 8);
-        }
-    }
-
-    /// Number of populated backing pages.
-    pub fn populated_pages(&self) -> u64 {
-        self.populated
-            .iter()
-            .map(|b| u64::from(b.count_ones()))
-            .sum()
-    }
-
-    /// Whether the page at file offset `offset` must be copied.
-    pub fn page_is_set(&self, offset: u64) -> bool {
-        match &self.pages {
-            None => {
-                offset < self.total_size
-                    && !self
-                        .unplugged
-                        .iter()
-                        .any(|r| r.offset <= offset && offset < r.offset + r.len)
-            }
-            Some(pages) => {
-                let page = offset / self.page_size;
-                let byte = usize::try_from(page / 8).unwrap();
-                pages.get(byte).is_some_and(|b| b & (1 << (page % 8)) != 0)
-            }
-        }
-    }
-
-    /// Sets the bits of the `len` bytes at file offset `offset` (both `page_size`-aligned).
-    ///
-    /// # Panics
-    ///
-    /// If this is a full layout (no bitmap) or the range lies past the end of the bitmap.
-    pub fn set_range(&mut self, offset: u64, len: u64) {
-        let pages = self.pages.as_mut().expect("set_range on a full layout");
-        let first = offset / self.page_size;
-        let last = (offset + len).div_ceil(self.page_size);
-        for page in first..last {
-            let byte = usize::try_from(page / 8).unwrap();
-            pages[byte] |= 1 << (page % 8);
-        }
-    }
-
-    /// Number of pages to copy.
-    pub fn set_pages(&self) -> u64 {
-        match &self.pages {
-            None => {
-                let unplugged: u64 = self.unplugged.iter().map(|r| r.len).sum();
-                (self.total_size - unplugged) / self.page_size
-            }
-            Some(pages) => pages.iter().map(|b| u64::from(b.count_ones())).sum(),
-        }
+    /// Bytes to zero.
+    pub fn zero_bytes(&self) -> u64 {
+        self.zero_pages.len() * self.page_size
     }
 }
 
-mod base64_vec {
+/// Serde adapter: a [`RoaringBitmap`] as standard, padded base64 of its portable serialization.
+mod roaring_base64 {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&STANDARD.encode(bytes))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
-        STANDARD
-            .decode(String::deserialize(deserializer)?)
-            .map_err(serde::de::Error::custom)
-    }
-}
-
-mod base64_bytes {
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD;
+    use roaring::RoaringBitmap;
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(
-        bytes: &Option<Vec<u8>>,
+        bitmap: &RoaringBitmap,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        match bytes {
-            Some(bytes) => serializer.serialize_str(&STANDARD.encode(bytes)),
-            None => serializer.serialize_none(),
-        }
+        let mut bytes = Vec::with_capacity(bitmap.serialized_size());
+        bitmap
+            .serialize_into(&mut bytes)
+            .map_err(serde::ser::Error::custom)?;
+        serializer.serialize_str(&STANDARD.encode(bytes))
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<Option<Vec<u8>>, D::Error> {
-        match Option::<String>::deserialize(deserializer)? {
-            Some(s) => STANDARD
-                .decode(s)
-                .map(Some)
-                .map_err(serde::de::Error::custom),
-            None => Ok(None),
-        }
+    ) -> Result<RoaringBitmap, D::Error> {
+        let bytes = STANDARD
+            .decode(String::deserialize(deserializer)?)
+            .map_err(serde::de::Error::custom)?;
+        RoaringBitmap::deserialize_from(&bytes[..]).map_err(serde::de::Error::custom)
     }
 }
 
 /// Body of a successful `PUT /snapshot/create` or `PUT /snapshot/dirty-pages` when a memory
 /// backend is attached.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct SnapshotMemoryResponse {
     /// The snapshot type, present only for `PUT /snapshot/create`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -445,108 +374,114 @@ pub struct SnapshotMemoryResponse {
 mod tests {
     use super::*;
 
+    fn pages(layout: &RoaringBitmap) -> Vec<u32> {
+        layout.iter().collect()
+    }
+
     #[test]
     fn test_snapshot_memory_layout_bits() {
-        // Diff: 16 pages, all plugged.
-        let mut layout = SnapshotMemoryLayout::diff(16 * 4096, 4096, 4096, 16 * 4096);
-        assert_eq!(layout.pages.as_deref(), Some(&[0u8, 0][..]));
-        assert_eq!(layout.set_pages(), 0);
-        assert_eq!(layout.populated, vec![0u8, 0]);
-        assert_eq!(layout.populated_pages(), 0);
+        let mut layout = SnapshotMemoryLayout::new(16 * 4096, 4096);
+        assert!(layout.memfd_authoritative_pages.is_empty());
+        assert!(layout.zero_pages.is_empty());
+        assert_eq!(layout.authoritative_pages(), 0);
+        assert_eq!(layout.zero_bytes(), 0);
+        assert!(!layout.page_is_authoritative(0));
+        assert!(!layout.page_is_zero(0));
 
-        layout.set_range(0, 2 * 4096);
-        layout.set_range(8 * 4096, 4096);
-        assert_eq!(layout.pages.as_deref(), Some(&[0b11u8, 0b1][..]));
-        assert_eq!(layout.set_pages(), 3);
-        assert!(layout.page_is_set(0));
-        assert!(layout.page_is_set(4096));
-        assert!(!layout.page_is_set(2 * 4096));
-        assert!(layout.page_is_set(8 * 4096));
-        assert!(!layout.page_is_set(1 << 40));
+        layout.set_authoritative(0);
+        layout.set_authoritative(12 * 4096);
+        assert_eq!(pages(&layout.memfd_authoritative_pages), vec![0, 12]);
+        assert!(layout.page_is_authoritative(0));
+        assert!(!layout.page_is_authoritative(4096));
+        assert!(layout.page_is_authoritative(12 * 4096));
+        assert!(!layout.page_is_authoritative(1 << 40));
+        assert_eq!(layout.authoritative_pages(), 2);
 
-        // The bitmap covers the plugged part of the file only, rounded up to whole bytes; its
-        // length does not depend on what is set.
-        let layout = SnapshotMemoryLayout::diff(64 * 4096, 4096, 4096, 13 * 4096);
-        assert_eq!(layout.pages.as_ref().unwrap().len(), 2);
-        assert!(!layout.page_is_set(63 * 4096));
-        let layout = SnapshotMemoryLayout::diff(64 * 4096, 4096, 4096, 0);
-        assert_eq!(layout.pages.as_deref(), Some(&[][..]));
-        assert!(layout.populated.is_empty());
+        layout.set_zero(8 * 4096);
+        layout.set_zero(9 * 4096);
+        assert_eq!(pages(&layout.zero_pages), vec![8, 9]);
+        assert!(layout.page_is_zero(8 * 4096));
+        assert!(layout.page_is_zero(9 * 4096));
+        assert!(!layout.page_is_zero(10 * 4096));
+        assert_eq!(layout.zero_bytes(), 2 * 4096);
+    }
 
-        // `populated` has its own, coarser granularity (the backing page): 13 4K pages plugged
-        // are 7 8K backing pages, one byte.
-        let mut layout = SnapshotMemoryLayout::diff(64 * 4096, 4096, 8192, 13 * 4096);
-        assert_eq!(layout.populated.len(), 1);
-        layout.set_populated_range(2 * 8192, 8192);
-        assert_eq!(layout.populated, vec![0b100]);
-        assert!(!layout.page_is_populated(8192));
-        assert!(layout.page_is_populated(2 * 8192));
-        assert!(layout.page_is_populated(2 * 8192 + 4096));
-        assert!(!layout.page_is_populated(3 * 8192));
-        assert!(!layout.page_is_populated(1 << 40));
-        assert_eq!(layout.populated_pages(), 1);
-
-        // Full: no bitmap, everything but `unplugged` is set.
-        let layout = SnapshotMemoryLayout::full(
-            16 * 4096,
-            4096,
-            4096,
-            16 * 4096,
-            vec![MemoryRange {
-                offset: 8 * 4096,
-                len: 4 * 4096,
-            }],
+    #[test]
+    fn test_snapshot_memory_layout_classify() {
+        // 20 pages: dirty 0,1,3,8..16, resident everything but 3 and 8..16.
+        let mut dirty = RoaringBitmap::new();
+        dirty.insert(0);
+        dirty.insert(1);
+        dirty.insert(3);
+        dirty.insert_range(8..16);
+        let mut resident = RoaringBitmap::new();
+        resident.insert_range(0..20);
+        resident.remove(3);
+        resident.remove_range(8..16);
+        let layout = SnapshotMemoryLayout::classify(20 * 4096, 4096, &dirty, &resident);
+        assert_eq!(pages(&layout.memfd_authoritative_pages), vec![0, 1]);
+        assert_eq!(
+            pages(&layout.zero_pages),
+            vec![3, 8, 9, 10, 11, 12, 13, 14, 15]
         );
-        assert!(layout.pages.is_none());
-        assert_eq!(layout.populated.len(), 2);
-        assert_eq!(layout.set_pages(), 12);
-        assert!(layout.page_is_set(0));
-        assert!(layout.page_is_set(7 * 4096));
-        assert!(!layout.page_is_set(8 * 4096));
-        assert!(!layout.page_is_set(11 * 4096));
-        assert!(layout.page_is_set(12 * 4096));
-        assert!(!layout.page_is_set(16 * 4096));
+        assert_eq!(layout.authoritative_pages(), 2);
+        assert_eq!(layout.zero_bytes(), 9 * 4096);
+        assert!((&layout.memfd_authoritative_pages & &layout.zero_pages).is_empty());
+        assert_eq!(layout, {
+            let mut expected = SnapshotMemoryLayout::new(20 * 4096, 4096);
+            expected.set_authoritative(0);
+            expected.set_authoritative(4096);
+            expected.set_zero(3 * 4096);
+            for p in 8..16 {
+                expected.set_zero(p * 4096);
+            }
+            expected
+        });
     }
 
     #[test]
     fn test_snapshot_memory_layout_json() {
-        // The example of docs/snapshotting/shared-memfd-design.md: pages 0, 1 and 12 set, the
-        // slot at pages 8..12 unplugged.
-        // Pages 0..8 and 12..16 are populated (the unplugged slot is not).
-        let mut layout = SnapshotMemoryLayout::diff(16 * 4096, 4096, 4096, 16 * 4096);
-        layout.set_range(0, 2 * 4096);
-        layout.set_range(12 * 4096, 4096);
-        layout.unplugged.push(MemoryRange {
-            offset: 8 * 4096,
-            len: 4 * 4096,
-        });
-        layout.set_populated_range(0, 8 * 4096);
-        layout.set_populated_range(12 * 4096, 4 * 4096);
+        // The example of docs/snapshotting/shared-memfd-design.md: a 64 KiB guest, pages 0, 1
+        // and 12 authoritative, pages 8..12 (an unplugged slot) zero. Roaring portable format,
+        // no run containers (tiny sets stay array containers).
+        let mut layout = SnapshotMemoryLayout::new(16 * 4096, 4096);
+        layout.set_authoritative(0);
+        layout.set_authoritative(4096);
+        layout.set_authoritative(12 * 4096);
+        for page in 8..12 {
+            layout.set_zero(page * 4096);
+        }
         let json = serde_json::to_string(&layout).unwrap();
         assert_eq!(
             json,
-            r#"{"total_size":65536,"page_size":4096,"pages":"AxA=","unplugged":[{"offset":32768,"len":16384}],"populated_page_size":4096,"populated":"//A="}"#
+            r#"{"total_size":65536,"page_size":4096,"bitmap_encoding":"roaring","memfd_authoritative_pages":"OjAAAAEAAAAAAAIAEAAAAAAAAQAMAA==","zero_pages":"OjAAAAEAAAAAAAMAEAAAAAgACQAKAAsA"}"#
         );
         let back: SnapshotMemoryLayout = serde_json::from_str(&json).unwrap();
         assert_eq!(back, layout);
 
-        // A full layout has no `pages` field at all, but does have `populated`.
-        let mut full =
-            SnapshotMemoryLayout::full(16 * 4096, 4096, 4096, 16 * 4096, layout.unplugged.clone());
-        full.populated = layout.populated.clone();
-        let json = serde_json::to_string(&full).unwrap();
-        assert_eq!(
-            json,
-            r#"{"total_size":65536,"page_size":4096,"unplugged":[{"offset":32768,"len":16384}],"populated_page_size":4096,"populated":"//A="}"#
-        );
+        // A 1 GiB guest with nothing dirty: two empty bitmaps, 8 bytes each.
+        let empty = SnapshotMemoryLayout::new(1 << 30, 4096);
+        let json = serde_json::to_string(&empty).unwrap();
+        assert!(json.len() < 200, "{json}");
         assert_eq!(
             serde_json::from_str::<SnapshotMemoryLayout>(&json).unwrap(),
-            full
+            empty
+        );
+
+        // A 1 GiB guest entirely unplugged: one run per 65536-page chunk, 4 chunks.
+        let mut unplugged = RoaringBitmap::new();
+        unplugged.insert_range(0..(1u32 << 18));
+        let layout =
+            SnapshotMemoryLayout::classify(1 << 30, 4096, &unplugged, &RoaringBitmap::new());
+        assert!(
+            layout.zero_pages.serialized_size() < 64,
+            "{}",
+            layout.zero_pages.serialized_size()
         );
 
         let response = SnapshotMemoryResponse {
             snapshot_type: Some(SnapshotType::Diff),
-            memory: layout,
+            memory: layout.clone(),
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.starts_with(r#"{"snapshot_type":"Diff","memory":{"#));
@@ -555,14 +490,20 @@ mod tests {
             response
         );
 
-        // Invalid base64 is rejected, in either bitmap.
-        serde_json::from_str::<SnapshotMemoryLayout>(
-            r#"{"total_size":4096,"page_size":4096,"pages":"!!","unplugged":[],"populated_page_size":4096,"populated":"AA=="}"#,
+        // Invalid base64 or Roaring is rejected, in either bitmap; an unknown encoding too;
+        // the encoding field defaults.
+        for bad in [
+            r#"{"total_size":4096,"page_size":4096,"bitmap_encoding":"roaring","memfd_authoritative_pages":"!!","zero_pages":"OjAAAAAAAAA="}"#,
+            r#"{"total_size":4096,"page_size":4096,"bitmap_encoding":"roaring","memfd_authoritative_pages":"OjAAAAAAAAA=","zero_pages":"!!"}"#,
+            r#"{"total_size":4096,"page_size":4096,"bitmap_encoding":"roaring","memfd_authoritative_pages":"AQ==","zero_pages":"OjAAAAAAAAA="}"#,
+            r#"{"total_size":4096,"page_size":4096,"bitmap_encoding":"packbits","memfd_authoritative_pages":"OjAAAAAAAAA=","zero_pages":"OjAAAAAAAAA="}"#,
+        ] {
+            serde_json::from_str::<SnapshotMemoryLayout>(bad).unwrap_err();
+        }
+        let empty: SnapshotMemoryLayout = serde_json::from_str(
+            r#"{"total_size":4096,"page_size":4096,"memfd_authoritative_pages":"OjAAAAAAAAA=","zero_pages":"OjAAAAAAAAA="}"#,
         )
-        .unwrap_err();
-        serde_json::from_str::<SnapshotMemoryLayout>(
-            r#"{"total_size":4096,"page_size":4096,"unplugged":[],"populated_page_size":4096,"populated":"!!"}"#,
-        )
-        .unwrap_err();
+        .unwrap();
+        assert_eq!(empty, SnapshotMemoryLayout::new(4096, 4096));
     }
 }

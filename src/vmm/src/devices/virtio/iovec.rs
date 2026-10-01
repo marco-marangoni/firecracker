@@ -14,7 +14,7 @@ use vm_memory::{
 use super::iov_deque::{IovDeque, IovDequeError};
 use super::queue::FIRECRACKER_MAX_QUEUE_SIZE;
 use crate::devices::virtio::queue::DescriptorChain;
-use crate::vstate::memory::GuestMemoryMmap;
+use crate::vstate::memory::{GuestMemoryMmap, fault_in_marked_range};
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum IoVecError {
@@ -277,9 +277,14 @@ impl<const L: u16> IoVecBufferMut<L> {
                 })?;
             // We need to mark the area of guest memory that will be mutated through this
             // IoVecBufferMut as dirty ahead of time, as we loose access to all
-            // vm-memory related information after converting down to iovecs.
+            // vm-memory related information after converting down to iovecs. Marking ahead of
+            // the write also requires faulting the pages in, so that a dirty page is always
+            // memfd authoritative for a memory backend (see `fault_in_marked_range`).
             slice.bitmap().mark_dirty(0, desc.len as usize);
-            let iov_base = slice.ptr_guard_mut().as_ptr().cast::<c_void>();
+            let base = slice.ptr_guard_mut().as_ptr();
+            // SAFETY: `base..base + desc.len` is the mapping `get_slice` just validated.
+            unsafe { fault_in_marked_range(base, desc.len as usize) };
+            let iov_base = base.cast::<c_void>();
 
             if self.vecs.is_full() {
                 self.vecs.pop_back(nr_iovecs);

@@ -1017,7 +1017,7 @@ class Microvm:
         """`PUT /snapshot/dirty-pages`: fetch (and consume) the pages dirtied since the
         last snapshot or the last call, for a pre-copy pass. Requires a memory backend.
 
-        With `copy_to`, also asks the backend to copy those pages into that file
+        With `copy_to`, also asks the backend to apply them to that file
         (chroot-relative path), as an orchestrator would.
         """
         memory = self.api.snapshot_dirty_pages.put().json()["memory"]
@@ -1058,7 +1058,10 @@ class Microvm:
         # Notify monitor that snapshot is being created
         if self.memory_monitor:
             self.memory_monitor.set_threshold_for_snapshot()
-        if self.mem_backend is None:
+        if self.mem_backend is None or snapshot_type == SnapshotType.FULL:
+            # Full snapshots are always written by Firecracker itself, memory backend
+            # or not (with one, through its mapping: the backend serves whatever it
+            # has not populated yet).
             self.api.snapshot_create.put(
                 mem_file_path=str(mem_path),
                 snapshot_path=str(vmstate_path),
@@ -1066,10 +1069,10 @@ class Microvm:
                 sync_snapshot_files=sync_snapshot_files,
             )
         else:
-            # With a memory backend attached Firecracker does not write guest memory;
-            # it tells us which pages of the shared memfd make up the snapshot, and
-            # we (the orchestrator) have the backend copy them. The VM stays paused,
-            # so the copy can happen at any time before the resume.
+            # A diff with a memory backend attached: Firecracker does not write guest
+            # memory; it tells us which pages of the shared memfd make up the diff,
+            # and we (the orchestrator) have the backend copy them. The VM stays
+            # paused, so the copy can happen at any time before the resume.
             response = self.api.snapshot_create.put(
                 snapshot_path=str(vmstate_path),
                 snapshot_type=snapshot_type.api_type,

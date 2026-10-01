@@ -231,7 +231,7 @@ pub enum VmmActionError {
 /// The enum represents the response sent by the VMM in case of success. The response is either
 /// empty, when no data needs to be sent, or an internal VMM structure.
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum VmmData {
     /// The balloon device configuration.
     BalloonConfig(BalloonDeviceConfig),

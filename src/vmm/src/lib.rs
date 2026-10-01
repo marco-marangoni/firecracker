@@ -159,7 +159,7 @@ use crate::vmm_config::machine_config::MachineConfig;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vmm_config::mmds::MmdsConfig;
 use crate::vmm_config::net::NetworkInterfaceConfig;
-use crate::vmm_config::snapshot::{SnapshotMemoryLayout, SnapshotType};
+use crate::vmm_config::snapshot::SnapshotMemoryLayout;
 use crate::vmm_config::vsock::VsockDeviceConfig;
 pub use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{GuestMemoryMmap, GuestMemoryRegion};
@@ -517,10 +517,7 @@ impl Vmm {
         self.device_manager.prepare_dirty_tracking_reset();
 
         let layout = kvm_vm
-            .snapshot_memory_layout(
-                SnapshotType::Diff,
-                self.machine_config.huge_pages.page_size(),
-            )
+            .snapshot_memory_layout()
             .map_err(|err| VmmError::DirtyPages(err.to_string()))?;
 
         // Queue pages are not tracked at runtime; mark them so the next set includes them, as

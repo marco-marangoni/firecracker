@@ -19,14 +19,16 @@ and this project adheres to
   `snapshot/load.mem_backend.backend_type: SharedMemfd` has its guest memory
   backed by a single memfd laid out like a memory snapshot file, which is handed
   to the page fault handler process through the existing UFFD handshake (as an
-  additional file descriptor). `PUT /snapshot/create` then takes no
-  `mem_file_path` and answers `200 OK` with a bitmap of the pages that make up
-  the snapshot, and the new `PUT /snapshot/dirty-pages` endpoint returns (and
-  resets) the pages dirtied since the last snapshot for pre-copy while the guest
-  runs. Both also report which backing pages are resident in Firecracker's
-  mapping (`populated`, from `mincore(2)`), so that a backend can zero released
-  or never-touched pages instead of reading them, which matters on hugetlbfs
-  where a hole costs a full 2 MiB read. See
+  additional file descriptor). A `Diff` `PUT /snapshot/create` then takes no
+  `mem_file_path` and answers `200 OK` with two sets of pages classifying every
+  page of the memory file, as base64-encoded Roaring bitmaps:
+  `memfd_authoritative_pages` (copy from the memfd) and `zero_pages` (make it
+  read as zero), every other page being unchanged; `Full` snapshots are written
+  by Firecracker as without a backend. The new `PUT /snapshot/dirty-pages`
+  endpoint returns (and resets) the same bitmaps for pre-copy while the guest
+  runs. Firecracker guarantees that a page it reports dirty is either in the
+  memfd or zero (pages it marks dirty ahead of writing are faulted in), so a
+  backend needs no record of its own to produce a diff. See
   [memory backend](docs/snapshotting/shared-memfd.md).
 
 ### Changed

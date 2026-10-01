@@ -591,32 +591,16 @@ impl KvmVm {
             .collect()
     }
 
-    /// Describes which pages of the guest memory (in memory file / memfd offset space) a
-    /// snapshot of the given type consists of, without writing anything. This is the memory
-    /// backend counterpart of [`Self::snapshot_memory_to_file`] and consumes the dirty tracking
-    /// state in the same way: a `Diff` layout covers the pages `dump_dirty` would write (plus
-    /// the dirty pages of unplugged slots) and resets both bitmaps on success; a `Full` layout
-    /// covers all plugged slots and resets both bitmaps. Both carry the `populated` bitmap at
-    /// `backing_page_size` granularity.
+    /// Describes, for a memory backend, which pages of the guest memory file a diff snapshot
+    /// consists of and where their content is, without writing anything. This is the memory
+    /// backend counterpart of [`Self::snapshot_memory_to_file`] with [`SnapshotType::Diff`] and
+    /// consumes the dirty tracking state in the same way: KVM's log is read (which resets it)
+    /// and Firecracker's bitmaps are reset on success. See [`SnapshotMemoryLayout`].
     pub(crate) fn snapshot_memory_layout(
         &self,
-        snapshot_type: SnapshotType,
-        backing_page_size: usize,
     ) -> Result<SnapshotMemoryLayout, CreateSnapshotError> {
-        match snapshot_type {
-            SnapshotType::Diff => {
-                let dirty_bitmap = self.get_dirty_bitmap()?;
-                Ok(self
-                    .guest_memory()
-                    .dirty_layout(&dirty_bitmap, backing_page_size)?)
-            }
-            SnapshotType::Full => {
-                let layout = self.guest_memory().full_layout(backing_page_size)?;
-                self.reset_dirty_bitmap();
-                self.guest_memory().reset_dirty();
-                Ok(layout)
-            }
-        }
+        let dirty_bitmap = self.get_dirty_bitmap()?;
+        Ok(self.guest_memory().snapshot_layout(&dirty_bitmap)?)
     }
 
     /// Takes a snapshot of the virtual machine running inside the given [`Vmm`] and saves it to
