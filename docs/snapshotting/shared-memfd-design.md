@@ -427,6 +427,96 @@ Procedure, on the VMM thread, inside the paused API loop:
    diff;
 1. serialise: Roaring portable format then base64 per set, and return the body.
 
+#### Reading and resetting the dirty state without losing a mark
+
+There is no atomic read-and-reset step, and none is needed, because the two
+sources of marks are consumed in two different ways that each cannot lose a
+write; this is also exactly how `dump_dirty` has always consumed them.
+
+- *KVM's log* is read with `KVM_GET_DIRTY_LOG`, which the kernel implements as
+  an atomic fetch-and-clear per slot. vCPUs run concurrently with a
+  `dirty-pages` request; a page written after the fetch is in the next log.
+  Nothing on Firecracker's side resets this log separately for a `Diff`.
+
+- *Firecracker's `AtomicBitmap`* is read in step 4 and cleared in step 6, which
+  is not atomic. It does not need to be, because every writer of that bitmap
+  runs on the VMM thread, the thread that is executing the request: block I/O
+  completions (`mark_dirty_mem_and_unwrap`), virtio-net RX buffer parsing
+  (`IoVecBufferMut`), balloon and virtio-mem discards (`discard_range`), and
+  `mark_virtio_queue_memory_dirty` itself. An API request is handled between two
+  iterations of the event loop, so no device handler can interleave with steps
+  4–6. The guest can only make KVM's log dirty, never this bitmap.
+
+  The one writer that is not on the VMM thread is device activation: a vCPU
+  thread handling the guest's `DRIVER_OK` write calls `Queue::initialize`, which
+  marks (and faults in) the rings, while holding the device's mutex, and sets
+  the device activated before releasing it. If that lands between steps 4 and 6
+  the marks are cleared, but step 7 locks each device in turn and re-marks the
+  rings of every device that is activated at that moment, so it either waits for
+  the activation to finish and re-marks, or runs before it and leaves the
+  activation's own marks intact. The same race exists for `dump_dirty` today and
+  is closed the same way; the model in `snapshot_layout_model.rs` has it as
+  "rings are re-armed after every consumption".
+
+What *is* racy with a running guest is the guest's own writes between reading
+KVM's log and reading `mincore`, and between `mincore` and the reset, which is
+why the order of the two reads matters (next section) and why the set is a
+superset rather than a snapshot: the Kani harnesses
+`operations_preserve_invariant` and
+`without_residency_after_dirty_the_invariant_breaks` cover exactly those two
+interleavings.
+
+#### What changes when device I/O leaves the VMM thread
+
+The argument above leans on one fact about today's Firecracker: every writer of
+Firecracker's dirty bitmap runs on the thread that consumes it. Moving device
+emulation to I/O threads removes that fact, and the design has to stop relying
+on it rather than re-derive it per device. Four changes, in order of weight:
+
+1. **Consume Firecracker's bitmap with an atomic swap.** `AtomicBitmap` already
+   has `get_and_reset()` (a per-word atomic exchange). Step 4 becomes "swap each
+   region's bitmap out and build the dirty set from the swapped words", and step
+   6 disappears: a mark set after the swap belongs to the next set, exactly as
+   with `KVM_GET_DIRTY_LOG`. The fold-back on error (`store_dirty_bitmap`) must
+   then OR back both KVM's words and the swapped words. `dump_dirty` has the
+   same read-then-reset and should get the same change.
+1. **Mark after writing, never only before.** With a swap, "mark at t₁, consume
+   at t₂, write at t₃" loses the write for good, and with a net I/O thread an RX
+   buffer can be parsed between `prepare_dirty_tracking_reset` and the swap and
+   filled afterwards. The fix is for `IoVecBufferMut` to mark the written range
+   after the tap read (it holds the slices; this costs nothing). That makes the
+   invariant a local property of each write with no ordering argument, makes
+   `prepare_dirty_tracking_reset` unnecessary, and makes `fault_in_marked_range`
+   unnecessary for RX buffers (a page marked after a write is resident). The
+   same change is an improvement to the single-threaded code and should not wait
+   for I/O threads.
+1. **Virtqueue rings.** The used ring is written through a raw pointer without a
+   mark; the re-mark of every activated device's rings after each consumption
+   covers it, with or without I/O threads, because the re-mark is unconditional
+   and happens after the swap. The fault-in at activation stays necessary (the
+   `should_panic` harness in `snapshot_layout_model.rs` shows what breaks
+   without it). The cleaner end state is for `Queue::add_used` to mark after
+   writing, after which rings are ordinary pages and both the re-mark and the
+   activation race described above go away.
+1. **Make the pause invariant explicit.** `Paused` today means "vCPUs stopped
+   and the VMM thread parked in the paused API loop", which is what lets the
+   backend copy after `snapshot/create` with nothing writing guest memory. With
+   I/O threads, pause must quiesce them: stop queue processing, drain in-flight
+   completions (an io_uring block write landing after the layout was computed is
+   the failure to design against), acknowledge, and only then run
+   `create_snapshot`; resume reverses it. `prepare_save` already drains block
+   devices; this generalises it into a precondition of `Paused`. It is the one
+   item that is real engineering rather than a local change, and it is needed by
+   every snapshot path, not only the memory backend.
+
+Discards are already in the right shape (`discard_range` punches, then marks:
+after the swap the mark lands in the next set, which zeroes the page; before it,
+the page is a dirty hole in this set), and the `mincore`-after-dirty rule is
+unaffected. The Kani model should gain device operations at the race points
+(today only guest writes race), consumption as a swap, and the two variants of
+item 2; the expectation is that mark-after-write proves and mark-ahead with a
+concurrent device does not, which would be the formal reason for the change.
+
 #### Invariant: dirty ⇒ memfd authoritative or zero
 
 The two-bitmap format only works if a dirty page's content is never somewhere
@@ -961,58 +1051,79 @@ Compatibility tests (all in the same file unless noted):
 
 ### 12. Work breakdown
 
-Implemented (one branch, `snapshot-improvements`; a mergeable split is given in
-parentheses):
+The branch `snapshot-improvements` holds everything below as one uncommitted
+change. The split is the order in which it should land, each item mergeable on
+its own and reviewable in isolation; items marked *(no API)* change nothing a
+user can see.
 
-1. Single memfd for DRAM + hotplug: `MemfdBacking` in `vstate/memory.rs`,
+**Landed on the branch**
+
+1. *(no API)* Single memfd for DRAM and hotplug: `MemfdBacking`,
    `memory::create` with a base offset, `VmResources::allocate_guest_memory`
    returning the backing for `allocate_memory_region` to continue from;
-   offset-invariant unit test. (Mergeable alone, no API change.)
-1. Layout computation shared with file writing:
-   `GuestMemorySlot::for_each_dirty_batch` is the single definition of "which
-   pages a diff contains", used by both `dump_dirty` and
-   `GuestMemoryExtension::snapshot_layout`; `mincore_resident`;
-   `SnapshotMemoryLayout::classify` as the single definition of the three
-   classes; `fault_in_marked_range`; property-style identity tests against
-   `dump_dirty` over random bitmaps and residency, including fold-back on error;
-   a serde adapter (Roaring portable format, base64) for the page sets.
-   (Mergeable alone.)
+   offset-invariant unit test.
+1. *(no API)* Discards on shared memory: `discard_range` uses `MADV_REMOVE` for
+   shared file mappings, rounds a hugetlbfs range inward to the backing page
+   before punching and marks exactly what it punched; unit tests for the hole,
+   the marks and the rounding. Also fixes balloon reclaim for vhost-user.
+1. *(no API)* Fault-in on mark-ahead: `fault_in_marked_range` after
+   `GuestMemorySlice::new` and in `IoVecBufferMut::append_descriptor_chain`;
+   unit test. (Superseded for RX buffers by the first item of the next list.)
+1. *(no API)* Layout computation: `GuestMemorySlot::for_each_dirty_batch` as the
+   single definition of "which pages a diff contains", shared with `dump_dirty`;
+   `mincore_resident`; `SnapshotMemoryLayout::classify` as the single definition
+   of the three classes; the Roaring serde adapter; property-style identity
+   tests against `dump_dirty` over random bitmaps and residency, including
+   fold-back on error; the `roaring` dependency.
+1. *(no API)* The Kani model `vstate/snapshot_layout_model.rs`: nine harnesses
+   (base case, inductive step, paused and racy-then-paused correctness, three
+   rule checks, two backend-misuse checks), run by `test_kani.py`.
 1. Handshake and boot: `send_uffd_handshake(&[RawFd])`, `uffd_mappings`,
-   `MachineConfig.mem_backend` (only `SharedMemfd` accepted), handshake in
+   `MachineConfig.mem_backend` (only `SharedMemfd`), handshake in
    `build_microvm_for_boot` after all regions are registered with KVM,
-   `Vmm.mem_backend_attached`.
-1. `PUT /snapshot/create Diff` with a backend: `mem_file_path: Option`, both
+   `Vmm.mem_backend_attached`; swagger.
+1. `snapshot/load` with `backend_type: SharedMemfd`: memfd-backed memory, uffd
+   registered on the shmem mapping, handshake with `[uffd, memfd]`; swagger.
+1. `PUT /snapshot/create Diff` with a backend: `mem_file_path: Option`, the two
    rejections, `KvmVm::snapshot_memory_layout`, `VmmData::SnapshotMemory`, 200
-   body, swagger. `Full` unchanged.
+   body; `Full` unchanged; swagger.
 1. `PUT /snapshot/dirty-pages`: `VmmAction::GetDirtyPages`, `Vmm::dirty_pages`,
    `VirtioDevice::prepare_dirty_tracking_reset` with the virtio-net
-   implementation (`return_parsed_rx_buffers`, shared with `prepare_save`),
-   swagger.
-1. `snapshot/load` with `backend_type: SharedMemfd`: memfd-backed memory, uffd
-   registered on the shmem mapping, handshake with `[uffd, memfd]`.
-1. Discards on shared memory: `discard_range` with `MADV_REMOVE` for shared file
-   mappings, rounded inward to the backing page, dirty marking of exactly the
-   freed range, unit tests for the hole, the dirty bits and the hugetlbfs
-   rounding. (Mergeable alone; also fixes balloon reclaim for vhost-user.)
+   implementation; swagger. (The hook goes away with mark-after-write, next
+   list.)
 1. Example handlers: `Handshake` with all fds, `fstat`-based fd classification,
-   optional memory file, `copy_pages` walking both bitmaps in runs (and a
-   dependency-free base64 decoder), control socket, unit tests for each.
-1. Python framework and integration tests as listed in §10.
-1. Docs: `shared-memfd.md` (user), this document, `snapshot-support.md`,
-   `handling-page-faults-on-snapshot-resume.md`, `ballooning.md`, CHANGELOG;
-   `INVARIANT` comment in `ApiServerAdapter::handle_request`.
+   optional memory file, `copy_pages` from the two Roaring sets, control socket,
+   unit tests.
+1. Python framework and integration tests (§10); docs: `shared-memfd.md`, this
+   document, `snapshot-support.md`,
+   `handling-page-faults-on-snapshot-resume.md`, `ballooning.md`, CHANGELOG.
 
-Remaining before this leaves developer preview:
+**Next, before leaving developer preview**
 
-1. Metrics (`mem_backend.*`, §11).
-1. Test variants not yet run: aarch64.
-1. A decision on whether Firecracker's own `Diff` should keep writing zero pages
-   for discarded ranges on anonymous memory (introduced by item 7; correct, but
-   larger diff files after an inflate).
-1. Hugetlbfs and the balloon reclaim little with plain inflation, since the
-   driver releases 4 KiB pages and `MADV_REMOVE` only frees huge pages the range
-   covers entirely (as before). Free page reporting, which reports whole page
-   blocks, is the way to reclaim on hugetlbfs; untested with a backend.
+1. *(no API)* Mark after writing in `IoVecBufferMut` (§7, "What changes when
+   device I/O leaves the VMM thread", item 2); then remove
+   `prepare_dirty_tracking_reset` and the RX-buffer call to
+   `fault_in_marked_range`. Extend the Kani model with device operations at the
+   race points and a `should_panic` harness for mark-ahead under concurrency.
+1. *(no API)* Consume Firecracker's bitmap with `get_and_reset()` in both
+   `snapshot_layout` and `dump_dirty`; fold back the swapped words on error.
+   Model consumption as a swap in Kani.
+1. Metrics: `mem_backend.*` (§11).
+1. aarch64 run of the integration tests.
+1. Decide whether Firecracker's own `Diff` keeps writing zero pages for
+   discarded ranges on anonymous memory (introduced by the discard change;
+   correct, larger diff files after an inflate).
+1. Free page reporting with a backend on hugetlbfs: untested; it is the way to
+   reclaim there, since plain inflation frees only huge pages a single release
+   covers.
+
+**Later, with the I/O-thread work**
+
+1. Quiesce I/O threads as part of `Paused` (§7, item 4): stop queue processing,
+   drain in-flight completions, acknowledge before `create_snapshot`. A
+   precondition for every snapshot path.
+1. *(no API)* `Queue::add_used` marks after writing; remove the per-consumption
+   ring re-mark and the activation special case.
 
 ### 13. Decisions taken
 
