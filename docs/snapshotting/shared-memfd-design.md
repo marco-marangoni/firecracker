@@ -572,12 +572,12 @@ an encode that is slower than a byte pass on dense input (2.8 ms against 1.9 ms
 for the 25% churn case below), which is in the noise next to
 `KVM_GET_DIRTY_LOG`.
 
-Benchmark (`src/vmm/benches/snapshot_layout.rs`, criterion, 1 GiB guest,
-synthetic dirty/resident inputs; "encode" is Firecracker turning the two
-per-page inputs into the JSON body, "decode" is a peer parsing it and counting
-pages per class; `current` is the dirty + populated + unplugged format, `raw`
-ships `dirty` and `mincore` trimmed at 4 KiB, `packbits` the previous version,
-`new` the shipped Roaring format):
+Benchmark (a criterion harness written for this decision and not kept in the
+tree, 1 GiB guest, synthetic dirty/resident inputs; "encode" is Firecracker
+turning the two per-page inputs into the JSON body, "decode" is a peer parsing
+it and counting pages per class; `current` is the dirty + populated + unplugged
+format, `raw` ships `dirty` and `mincore` trimmed at 4 KiB, `packbits` the
+previous version, `new` the shipped Roaring format):
 
 | scenario               | format   | body (bytes) | FC encode | peer decode |
 | :--------------------- | :------- | -----------: | --------: | ----------: |
