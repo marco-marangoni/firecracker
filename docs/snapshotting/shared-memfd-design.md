@@ -587,6 +587,16 @@ is the population of the memfd that a `Full` after a lazy restore causes, and a
 `Full` blocking if the handler is dead. Both are the behaviour of a `Full` after
 a UFFD restore today.
 
+The model (§13) pins the two halves of this decision: no response Firecracker
+could return makes a `Full` assemblable from the memfd after a lazy restore
+(`full_from_the_memfd_alone_is_impossible`), and Firecracker cannot even name
+the pages concerned (`firecracker_cannot_tell_base_holes_from_zero_holes`: two
+reachable states identical in everything Firecracker observes whose guests read
+differently). It also shows that the backend needs nothing from Firecracker for
+a full file of its own (`backend_full_is_correct`: `pread` plus the base for the
+pages its handler never served), and that a `Full` ends the lineage of the
+responses before it (`applying_a_response_from_before_a_full_breaks`).
+
 Two alternatives were considered for the lost-response case and set aside: an
 `ack_previous` flag letting the next request fold the previous set back in
 (small, but a new stateful protocol element for a rare event), and telling
@@ -1086,9 +1096,11 @@ user can see.
    of the three classes; the Roaring serde adapter; property-style identity
    tests against `dump_dirty` over random bitmaps and residency, including
    fold-back on error; the `roaring` dependency.
-1. *(no API)* The Kani model `vstate/snapshot_layout_model.rs`: nine harnesses
-   (base case, inductive step, paused and racy-then-paused correctness, three
-   rule checks, two backend-misuse checks), run by `test_kani.py`.
+1. *(no API)* The Kani model `vstate/snapshot_layout_model.rs`: seventeen
+   harnesses (base case, inductive step, paused and racy-then-paused
+   correctness, three rule checks, three backend-misuse checks, chunked
+   application on hugetlbfs, and the five `Full` results above), over 4 KiB and
+   huge-page backing, run by `test_kani.py`.
 1. Handshake and boot: `send_uffd_handshake(&[RawFd])`, `uffd_mappings`,
    `MachineConfig.mem_backend` (only `SharedMemfd`), handshake in
    `build_microvm_for_boot` after all regions are registered with KVM,

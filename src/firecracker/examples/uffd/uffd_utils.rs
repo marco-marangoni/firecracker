@@ -442,9 +442,10 @@ impl UffdHandler {
 
     /// Handles a uffd `remove` event for `[start, end)`: Firecracker has discarded the range
     /// (balloon, virtio-mem), so it now reads as zero. The range is unregistered, after which the
-    /// kernel serves zero pages for it without us. Nothing else to record: Firecracker's own
-    /// `discarded` bitmap is what tells a later snapshot that the range is zero rather than the
-    /// snapshot file's content.
+    /// kernel serves zero pages for it without us. Nothing else to record: the discard is in the
+    /// next snapshot response as `pages_to_zero`, and the registration itself is the record of
+    /// which holes still read as the snapshot file (registered: never served) and which as zero
+    /// (unregistered), should a backend ever need to tell them apart.
     ///
     /// The event is page (4 KiB) granular even for hugetlbfs-backed memory, while only whole
     /// backing pages can be punched out or unregistered. Like `hugetlbfs_punch_hole`, round
