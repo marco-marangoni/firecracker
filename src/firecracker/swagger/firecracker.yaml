@@ -1568,8 +1568,8 @@ definitions:
     type: object
     description: >-
       Which pages of the shared guest memory a diff snapshot consists of, and where their
-      content is. Pages in `memfd_authoritative_pages` are copied from the memfd into the memory
-      file at the same offset; pages in `zero_pages` must read as zero in the memory file; every
+      content is. Pages in `pages_to_copy` are copied from the memfd into the memory
+      file at the same offset; pages in `pages_to_zero` must read as zero in the memory file; every
       other page is unchanged and not part of the diff. The memory file is `total_size` bytes
       long. Both sets are Roaring bitmaps of page indices in the portable serialization format,
       base64-encoded: an idle guest, a released balloon and an unplugged virtio-mem region of any
@@ -1590,8 +1590,8 @@ definitions:
           - total_size
           - page_size
           - bitmap_encoding
-          - memfd_authoritative_pages
-          - zero_pages
+          - pages_to_copy
+          - pages_to_zero
         properties:
           total_size:
             type: integer
@@ -1612,7 +1612,7 @@ definitions:
               portable serialization format (https://github.com/RoaringBitmap/RoaringFormatSpec),
               as produced by every Roaring library. Reject any other value: the field exists so
               that a backend fails cleanly if a future Firecracker changes the binary format.
-          memfd_authoritative_pages:
+          pages_to_copy:
             type: string
             format: byte
             description: >-
@@ -1621,14 +1621,14 @@ definitions:
               page's content is in the memfd and must be copied. These are the pages written
               since the dirty tracking state was last consumed that are resident in Firecracker's
               mapping.
-          zero_pages:
+          pages_to_zero:
             type: string
             format: byte
             description: >-
               Same encoding. A member page must read as zero in the memory file: it was written
               or discarded since the dirty state was last consumed and is not resident any more
               (released by the balloon or free page reporting, or part of an unplugged virtio-mem
-              slot). Disjoint from `memfd_authoritative_pages`.
+              slot). Disjoint from `pages_to_copy`.
 
   Metrics:
     type: object

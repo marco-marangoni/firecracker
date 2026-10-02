@@ -225,20 +225,20 @@ memory part of the diff:
     "total_size": 1048576,
     "page_size": 4096,
     "bitmap_encoding": "roaring",
-    "memfd_authoritative_pages": "OzAAAAEAAB8ACAAAAAEACQADACgAAAA6AAkAZAAAAIIAAQCdAAAAqgAKAA==",
-    "zero_pages": "OzAAAAEAAD8AAQDAAD8A"
+    "pages_to_copy": "OzAAAAEAAB8ACAAAAAEACQADACgAAAA6AAkAZAAAAIIAAQCdAAAAqgAKAA==",
+    "pages_to_zero": "OzAAAAEAAD8AAQDAAD8A"
   }
 }
 ```
 
 Every page of the memory file is in exactly one of three classes:
 
-- **memfd authoritative**: its content is in the memfd; copy it from there into
-  the file at the same offset.
-- **zero**: it must read as zero in the file you produce. How you get there is
-  up to you: write zeros, punch a hole in a fresh full file, skip a range your
-  storage already knows to be zero.
-- **unchanged** (neither bit set): its content did not change since the dirty
+- **to copy** (`pages_to_copy`): its content is in the memfd; copy it from there
+  into the file at the same offset.
+- **to zero** (`pages_to_zero`): it must read as zero in the file you produce.
+  How you get there is up to you: write zeros, punch a hole in a fresh full
+  file, skip a range your storage already knows to be zero.
+- **unchanged** (in neither set): its content did not change since the dirty
   state was last consumed. It is not part of the diff; leave it out. Whatever
   the diff is applied to (the previous memory file, or a fresh zero-filled file
   for a microVM that was booted rather than restored) already holds it.
@@ -256,8 +256,8 @@ bytes at file offset `i * page_size`), in the same encoding:
   `roaring` today. Check it and refuse anything else: the field exists so that,
   should a future Firecracker change the binary format, an old backend fails
   cleanly on the name rather than decode garbage.
-- `memfd_authoritative_pages` and `zero_pages` are each the standard base64 (RFC
-  4648, with padding) of a [Roaring bitmap](https://roaringbitmap.org) in the
+- `pages_to_copy` and `pages_to_zero` are each the standard base64 (RFC 4648,
+  with padding) of a [Roaring bitmap](https://roaringbitmap.org) in the
   [portable serialization format](https://github.com/RoaringBitmap/RoaringFormatSpec),
   32-bit members, each member a page index. The two sets are disjoint and no
   member is at or past `total_size / page_size`.
@@ -265,8 +265,8 @@ bytes at file offset `i * page_size`), in the same encoding:
 Roaring libraries exist for every mainstream language (CRoaring, `roaring` for
 Rust and Go, RoaringBitmap for Java, `pyroaring`); deserialize the two strings
 and you have sets with constant-time membership and ordered iteration. In the
-example, `memfd_authoritative_pages` decodes to pages 0–1, 9–12, 40, 58–67, 100,
-130–131, 157 and 170–180, and `zero_pages` to pages 192–255, the unplugged slot.
+example, `pages_to_copy` decodes to pages 0–1, 9–12, 40, 58–67, 100, 130–131,
+157 and 170–180, and `pages_to_zero` to pages 192–255, the unplugged slot.
 
 **The classification relies on `mincore` being accurate, with or without dirty
 tracking.** A page that holds content but is not "in core" would be reported as
@@ -276,7 +276,7 @@ swaps memfd pages out, so swap must be disabled on the host, as the
 which is never swapped, `mincore` reports whether Firecracker has the huge page
 mapped, which it does for every page it or the backend has populated.
 
-Applying the layout (copying every authoritative page, zeroing every zero page,
+Applying the layout (copying every page to copy, zeroing every page to zero,
 leaving every other page alone) to the previous memory file yields a file
 identical to the `Full` Firecracker would have written; applied to a fresh
 zero-filled file it yields a diff file `rebase-snap` accepts, or, for a microVM
@@ -285,20 +285,11 @@ than punching holes when merging a diff, and when producing a diff file for
 `rebase-snap`: to those a hole means "not in the diff".
 
 A backend that stores memory in chunks (512 KiB, 2 MiB, ...) applies a response
-chunk by chunk. A chunk with no page in either set is left alone. For any other
-chunk, start from the previous version of the chunk, copy the authoritative
-pages in from the memfd, zero the zero pages, and store the result. Do not read
-the whole chunk from the memfd just because one of its pages is authoritative:
-the pages the response does not name may be holes the guest has never touched
-since restore, and those read as zeros from the memfd while the guest sees the
-base snapshot's content.
-
-Two configurations let the backend skip the previous version. For a microVM that
-was booted rather than restored, an untouched hole really is zero, so a chunk
-with an authoritative page can be read whole from the memfd. On 2M hugetlbfs,
-with chunks aligned to and no larger than 2 MiB, a chunk with a page in either
-set can be read whole from the memfd, and a chunk with a page in `zero_pages`
-can simply be zero-filled.
+chunk by chunk. When using 2M hugetlbfs, with chunks aligned to and no larger
+than 2 MiB, a chunk with a page in either set can be read whole from the memfd,
+and a chunk with a page in `pages_to_zero` can simply be zero-filled. For all
+other configurations, the changes need to be applied on top of the previous
+version of the chunk.
 
 Sizes: a set costs at most 43 KiB per GiB of guest memory, base64 included,
 whatever the dirty pattern, so a response is at most 86 KiB per GiB. That is the
@@ -323,8 +314,8 @@ The request has no parameters; the body may be empty or `{}`. The response is
     "total_size": 1048576,
     "page_size": 4096,
     "bitmap_encoding": "roaring",
-    "memfd_authoritative_pages": "OzAAAAEAAAoAAwAAAAEAQAAHAGQAAAA=",
-    "zero_pages": "OzAAAAEAAD8AAQDAAD8A"
+    "pages_to_copy": "OzAAAAEAAAoAAwAAAAEAQAAHAGQAAAA=",
+    "pages_to_zero": "OzAAAAEAAD8AAQDAAD8A"
   }
 }
 ```
@@ -343,35 +334,35 @@ returns. In that case, it's guaranteed they will be returned on the next call of
 In order to produce a consistent snapshot, the backend needs to adhere to some
 simple rules. These rules cannot be enforced by Firecracker.
 
-- The authoritative pages returned by the `/snapshot/dirty-pages` and
+- The `pages_to_copy` returned by the `/snapshot/dirty-pages` and
   `/snapshot/create` APIs must be eventually copied into the snapshot, and the
-  zero pages must read as zero in it. Responses must be applied in the order
-  they were received: a page zeroed by one response and copied by the next would
-  otherwise end up zero, with nothing left to correct it. Applying them late is
-  fine; the memfd may hold a newer value by then, and the write that made it
-  newer is in a later response
+  `pages_to_zero` must read as zero in it. Responses must be applied in the
+  order they were received: a page zeroed by one response and copied by the next
+  would otherwise end up zero, with nothing left to correct it. Applying them
+  late is fine; the memfd may hold a newer value by then, and the write that
+  made it newer is in a later response
 - If a response is lost (e.g. connection dropped before the body was read), that
   dirty information is gone and the next snapshot must be a `Full` snapshot,
   which Firecracker writes itself
 - After the final `/snapshot/create`, the VM must not be resumed until the
-  backend has copied every authoritative page out of the memfd.
+  backend has copied every page in `pages_to_copy` out of the memfd.
 
 As an example, without pre-copy, the snapshot process would be something like:
 
 1. Pause the VM
 1. Call `/snapshot/create`
-1. Copy the authoritative pages into a new file, zero the zero pages
+1. Copy `pages_to_copy` into a new file, zero `pages_to_zero`
 1. VM can be resumed here
 
 For a backend that implements pre-copy:
 
 1. Call `/snapshot/dirty-pages`
-1. Copy the authoritative pages into a file, zero the zero pages
+1. Copy `pages_to_copy` into a file, zero `pages_to_zero`
 1. Repeat from step 1 until the dirty set is small enough or after a timeout or
    iterations limit
 1. Pause the VM
 1. Call `/snapshot/create`
-1. Final copy of the authoritative pages, final zeroing of the zero pages
+1. Final copy of `pages_to_copy`, final zeroing of `pages_to_zero`
 1. VM can be resumed here
 
 Note: this algorithm doesn't make sense without dirty tracking. With mincore,

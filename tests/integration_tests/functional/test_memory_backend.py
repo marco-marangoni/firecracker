@@ -147,22 +147,22 @@ def pages(memory, field):
 
 def authoritative_bytes(memory):
     """Bytes the backend must copy from the memfd."""
-    return len(pages(memory, "memfd_authoritative_pages")) * memory["page_size"]
+    return len(pages(memory, "pages_to_copy")) * memory["page_size"]
 
 
 def zero_bytes(memory):
     """Bytes the backend must zero."""
-    return len(pages(memory, "zero_pages")) * memory["page_size"]
+    return len(pages(memory, "pages_to_zero")) * memory["page_size"]
 
 
 def is_authoritative(memory, offset):
     """Whether the page at `offset` is to be copied from the memfd."""
-    return offset // memory["page_size"] in pages(memory, "memfd_authoritative_pages")
+    return offset // memory["page_size"] in pages(memory, "pages_to_copy")
 
 
 def is_zero(memory, offset):
     """Whether the page at `offset` is to be zeroed."""
-    return offset // memory["page_size"] in pages(memory, "zero_pages")
+    return offset // memory["page_size"] in pages(memory, "pages_to_zero")
 
 
 def class_bytes_in(memory, offset, length):
@@ -170,8 +170,8 @@ def class_bytes_in(memory, offset, length):
     page_size = memory["page_size"]
     window = set(range(offset // page_size, (offset + length) // page_size))
     return (
-        len(pages(memory, "memfd_authoritative_pages") & window) * page_size,
-        len(pages(memory, "zero_pages") & window) * page_size,
+        len(pages(memory, "pages_to_copy") & window) * page_size,
+        len(pages(memory, "pages_to_zero") & window) * page_size,
     )
 
 
@@ -180,8 +180,8 @@ def check_layout(memory, total_size):
     assert memory["total_size"] == total_size
     assert memory["page_size"] == PAGE_SIZE
     assert memory["bitmap_encoding"] == "roaring"
-    authoritative = pages(memory, "memfd_authoritative_pages")
-    zero = pages(memory, "zero_pages")
+    authoritative = pages(memory, "pages_to_copy")
+    zero = pages(memory, "pages_to_zero")
     # Within the file, and disjoint.
     assert all(p < total_size // PAGE_SIZE for p in authoritative | zero)
     assert not authoritative & zero
@@ -371,10 +371,10 @@ def test_dirty_pages_are_consumed(uvm):
     assert zero_bytes(second) == 0
     # On the wire, a nearly empty set is a few hundred bytes (2 per page), not 32 KiB per GiB,
     # and an empty one is the 8-byte header.
-    assert wire_bytes(second, "memfd_authoritative_pages") < 1024
-    assert wire_bytes(second, "zero_pages") == 8
+    assert wire_bytes(second, "pages_to_copy") < 1024
+    assert wire_bytes(second, "pages_to_zero") == 8
     third = vm.dirty_pages()
-    assert second["memfd_authoritative_pages"] == third["memfd_authoritative_pages"]
+    assert second["pages_to_copy"] == third["pages_to_copy"]
     # Unknown fields in the body are rejected without consuming anything; `{}` is fine.
     with pytest.raises(RuntimeError, match="zero_chunk_size"):
         vm.api.snapshot_dirty_pages.put(zero_chunk_size=4096)
@@ -582,11 +582,8 @@ def test_virtio_mem_unplugged_slots(uvm, microvm_factory):
     snapshot = vm.snapshot_diff(mem_path="mem_unplugged")
     memory = vm.last_snapshot_memory
     check_layout(memory, total_size)
-    assert wire_bytes(memory, "zero_pages") == 25
-    assert (
-        wire_bytes(memory, "memfd_authoritative_pages")
-        < MEM_SIZE_MIB * 2**20 // PAGE_SIZE // 8
-    )
+    assert wire_bytes(memory, "pages_to_zero") == 25
+    assert wire_bytes(memory, "pages_to_copy") < MEM_SIZE_MIB * 2**20 // PAGE_SIZE // 8
     authoritative, zero = class_bytes_in(memory, MEM_SIZE_MIB * 2**20, 512 * 2**20)
     assert authoritative == 0
     assert zero == 512 * 2**20

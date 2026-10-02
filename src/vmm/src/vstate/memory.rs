@@ -3440,13 +3440,13 @@ mod tests {
         let pages = u32::try_from(layout.total_size / page_size).unwrap();
         assert!(
             layout
-                .memfd_authoritative_pages
+                .pages_to_copy
                 .max()
                 .is_none_or(|p| p < pages)
         );
-        assert!(layout.zero_pages.max().is_none_or(|p| p < pages));
+        assert!(layout.pages_to_zero.max().is_none_or(|p| p < pages));
         // The two classes are disjoint.
-        assert!((&layout.memfd_authoritative_pages & &layout.zero_pages).is_empty());
+        assert!((&layout.pages_to_copy & &layout.pages_to_zero).is_empty());
     }
 
     /// The test memory: 12 pages, DRAM pages 0..8 (two regions), hotplug pages 8..12 with slots
@@ -3585,7 +3585,7 @@ mod tests {
         // zero.
         let layout = guest_memory.snapshot_layout(&kvm_bitmap).unwrap();
         assert_layout_well_formed(&layout);
-        assert!(layout.memfd_authoritative_pages.is_empty());
+        assert!(layout.pages_to_copy.is_empty());
         assert_eq!(classes(&layout).1, TEST_UNPLUGGED_PAGES.to_vec());
 
         // Unplug the whole hotplug region: pages 8..12 are zero, the authoritative bitmap stays
@@ -3598,13 +3598,13 @@ mod tests {
         hotplug.bitmap().mark_dirty(0, 4 * page_size);
         let layout = guest_memory.snapshot_layout(&kvm_bitmap).unwrap();
         assert_layout_well_formed(&layout);
-        assert!(layout.memfd_authoritative_pages.is_empty());
+        assert!(layout.pages_to_copy.is_empty());
         assert_eq!(classes(&layout).1, vec![8, 9, 10, 11]);
         assert_eq!(layout.zero_bytes(), 4 * page_size as u64);
         assert!(!hotplug.bitmap().dirty_at(0));
         // On the wire that is one run container: a handful of bytes, and the same for an
         // unplugged region of any size (one container per 65536 pages).
-        assert!(layout.zero_pages.serialized_size() < 32);
+        assert!(layout.pages_to_zero.serialized_size() < 32);
 
         // Plug them back: the pages are plugged, dirty from the unplug, and not resident
         // (punched): zero again, now inside a plugged slot.

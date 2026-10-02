@@ -242,11 +242,11 @@ pub struct SnapshotMemoryLayout {
     /// The pages (file offset / `page_size`) to copy from the memfd into the file at the same
     /// offset. Serialised as standard, padded base64 of the Roaring portable format.
     #[serde(with = "roaring_base64")]
-    pub memfd_authoritative_pages: RoaringBitmap,
-    /// The pages that must read as zero in the file. Disjoint from the authoritative set.
+    pub pages_to_copy: RoaringBitmap,
+    /// The pages that must read as zero in the file. Disjoint from `pages_to_copy`.
     /// Serialised as standard, padded base64 of the Roaring portable format.
     #[serde(with = "roaring_base64")]
-    pub zero_pages: RoaringBitmap,
+    pub pages_to_zero: RoaringBitmap,
 }
 
 /// Wire encoding of the bitmaps of a [`SnapshotMemoryLayout`].
@@ -266,8 +266,8 @@ impl SnapshotMemoryLayout {
             total_size,
             page_size,
             bitmap_encoding: BitmapEncoding::Roaring,
-            memfd_authoritative_pages: RoaringBitmap::new(),
-            zero_pages: RoaringBitmap::new(),
+            pages_to_copy: RoaringBitmap::new(),
+            pages_to_zero: RoaringBitmap::new(),
         }
     }
 
@@ -278,24 +278,24 @@ impl SnapshotMemoryLayout {
 
     /// Whether the page at file offset `offset` is to be copied from the memfd.
     pub fn page_is_authoritative(&self, offset: u64) -> bool {
-        self.memfd_authoritative_pages.contains(self.page(offset))
+        self.pages_to_copy.contains(self.page(offset))
     }
 
     /// Whether the page at file offset `offset` is to be zeroed.
     pub fn page_is_zero(&self, offset: u64) -> bool {
-        self.zero_pages.contains(self.page(offset))
+        self.pages_to_zero.contains(self.page(offset))
     }
 
     /// Marks the page at file offset `offset` authoritative.
     pub fn set_authoritative(&mut self, offset: u64) {
         let page = self.page(offset);
-        self.memfd_authoritative_pages.insert(page);
+        self.pages_to_copy.insert(page);
     }
 
     /// Marks the page at file offset `offset` zero.
     pub fn set_zero(&mut self, offset: u64) {
         let page = self.page(offset);
-        self.zero_pages.insert(page);
+        self.pages_to_zero.insert(page);
     }
 
     /// Builds the layout from the sets of `dirty` and `resident` pages (page indices):
@@ -315,19 +315,19 @@ impl SnapshotMemoryLayout {
             total_size,
             page_size,
             bitmap_encoding: BitmapEncoding::Roaring,
-            memfd_authoritative_pages: authoritative,
-            zero_pages: zero,
+            pages_to_copy: authoritative,
+            pages_to_zero: zero,
         }
     }
 
     /// Number of pages to copy from the memfd.
     pub fn authoritative_pages(&self) -> u64 {
-        self.memfd_authoritative_pages.len()
+        self.pages_to_copy.len()
     }
 
     /// Bytes to zero.
     pub fn zero_bytes(&self) -> u64 {
-        self.zero_pages.len() * self.page_size
+        self.pages_to_zero.len() * self.page_size
     }
 }
 
@@ -381,8 +381,8 @@ mod tests {
     #[test]
     fn test_snapshot_memory_layout_bits() {
         let mut layout = SnapshotMemoryLayout::new(16 * 4096, 4096);
-        assert!(layout.memfd_authoritative_pages.is_empty());
-        assert!(layout.zero_pages.is_empty());
+        assert!(layout.pages_to_copy.is_empty());
+        assert!(layout.pages_to_zero.is_empty());
         assert_eq!(layout.authoritative_pages(), 0);
         assert_eq!(layout.zero_bytes(), 0);
         assert!(!layout.page_is_authoritative(0));
@@ -390,7 +390,7 @@ mod tests {
 
         layout.set_authoritative(0);
         layout.set_authoritative(12 * 4096);
-        assert_eq!(pages(&layout.memfd_authoritative_pages), vec![0, 12]);
+        assert_eq!(pages(&layout.pages_to_copy), vec![0, 12]);
         assert!(layout.page_is_authoritative(0));
         assert!(!layout.page_is_authoritative(4096));
         assert!(layout.page_is_authoritative(12 * 4096));
@@ -399,7 +399,7 @@ mod tests {
 
         layout.set_zero(8 * 4096);
         layout.set_zero(9 * 4096);
-        assert_eq!(pages(&layout.zero_pages), vec![8, 9]);
+        assert_eq!(pages(&layout.pages_to_zero), vec![8, 9]);
         assert!(layout.page_is_zero(8 * 4096));
         assert!(layout.page_is_zero(9 * 4096));
         assert!(!layout.page_is_zero(10 * 4096));
@@ -419,14 +419,14 @@ mod tests {
         resident.remove(3);
         resident.remove_range(8..16);
         let layout = SnapshotMemoryLayout::classify(20 * 4096, 4096, &dirty, &resident);
-        assert_eq!(pages(&layout.memfd_authoritative_pages), vec![0, 1]);
+        assert_eq!(pages(&layout.pages_to_copy), vec![0, 1]);
         assert_eq!(
-            pages(&layout.zero_pages),
+            pages(&layout.pages_to_zero),
             vec![3, 8, 9, 10, 11, 12, 13, 14, 15]
         );
         assert_eq!(layout.authoritative_pages(), 2);
         assert_eq!(layout.zero_bytes(), 9 * 4096);
-        assert!((&layout.memfd_authoritative_pages & &layout.zero_pages).is_empty());
+        assert!((&layout.pages_to_copy & &layout.pages_to_zero).is_empty());
         assert_eq!(layout, {
             let mut expected = SnapshotMemoryLayout::new(20 * 4096, 4096);
             expected.set_authoritative(0);
@@ -454,7 +454,7 @@ mod tests {
         let json = serde_json::to_string(&layout).unwrap();
         assert_eq!(
             json,
-            r#"{"total_size":65536,"page_size":4096,"bitmap_encoding":"roaring","memfd_authoritative_pages":"OjAAAAEAAAAAAAIAEAAAAAAAAQAMAA==","zero_pages":"OjAAAAEAAAAAAAMAEAAAAAgACQAKAAsA"}"#
+            r#"{"total_size":65536,"page_size":4096,"bitmap_encoding":"roaring","pages_to_copy":"OjAAAAEAAAAAAAIAEAAAAAAAAQAMAA==","pages_to_zero":"OjAAAAEAAAAAAAMAEAAAAAgACQAKAAsA"}"#
         );
         let back: SnapshotMemoryLayout = serde_json::from_str(&json).unwrap();
         assert_eq!(back, layout);
@@ -474,9 +474,9 @@ mod tests {
         let layout =
             SnapshotMemoryLayout::classify(1 << 30, 4096, &unplugged, &RoaringBitmap::new());
         assert!(
-            layout.zero_pages.serialized_size() < 64,
+            layout.pages_to_zero.serialized_size() < 64,
             "{}",
-            layout.zero_pages.serialized_size()
+            layout.pages_to_zero.serialized_size()
         );
 
         let response = SnapshotMemoryResponse {
@@ -493,15 +493,15 @@ mod tests {
         // Invalid base64 or Roaring is rejected, in either bitmap; an unknown encoding too;
         // the encoding field defaults.
         for bad in [
-            r#"{"total_size":4096,"page_size":4096,"bitmap_encoding":"roaring","memfd_authoritative_pages":"!!","zero_pages":"OjAAAAAAAAA="}"#,
-            r#"{"total_size":4096,"page_size":4096,"bitmap_encoding":"roaring","memfd_authoritative_pages":"OjAAAAAAAAA=","zero_pages":"!!"}"#,
-            r#"{"total_size":4096,"page_size":4096,"bitmap_encoding":"roaring","memfd_authoritative_pages":"AQ==","zero_pages":"OjAAAAAAAAA="}"#,
-            r#"{"total_size":4096,"page_size":4096,"bitmap_encoding":"packbits","memfd_authoritative_pages":"OjAAAAAAAAA=","zero_pages":"OjAAAAAAAAA="}"#,
+            r#"{"total_size":4096,"page_size":4096,"bitmap_encoding":"roaring","pages_to_copy":"!!","pages_to_zero":"OjAAAAAAAAA="}"#,
+            r#"{"total_size":4096,"page_size":4096,"bitmap_encoding":"roaring","pages_to_copy":"OjAAAAAAAAA=","pages_to_zero":"!!"}"#,
+            r#"{"total_size":4096,"page_size":4096,"bitmap_encoding":"roaring","pages_to_copy":"AQ==","pages_to_zero":"OjAAAAAAAAA="}"#,
+            r#"{"total_size":4096,"page_size":4096,"bitmap_encoding":"packbits","pages_to_copy":"OjAAAAAAAAA=","pages_to_zero":"OjAAAAAAAAA="}"#,
         ] {
             serde_json::from_str::<SnapshotMemoryLayout>(bad).unwrap_err();
         }
         let empty: SnapshotMemoryLayout = serde_json::from_str(
-            r#"{"total_size":4096,"page_size":4096,"memfd_authoritative_pages":"OjAAAAAAAAA=","zero_pages":"OjAAAAAAAAA="}"#,
+            r#"{"total_size":4096,"page_size":4096,"pages_to_copy":"OjAAAAAAAAA=","pages_to_zero":"OjAAAAAAAAA="}"#,
         )
         .unwrap();
         assert_eq!(empty, SnapshotMemoryLayout::new(4096, 4096));
