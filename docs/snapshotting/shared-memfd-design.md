@@ -370,8 +370,8 @@ Response: `200 OK` with
     "total_size": 65536,
     "page_size": 4096,
     "bitmap_encoding": "roaring",
-    "memfd_authoritative_pages": "OjAAAAEAAAAAAAIAEAAAAAAAAQAMAA==",
-    "zero_pages": "OjAAAAEAAAAAAAMAEAAAAAgACQAKAAsA"
+    "pages_to_copy": "OjAAAAEAAAAAAAIAEAAAAAAAAQAMAA==",
+    "pages_to_zero": "OjAAAAEAAAAAAAMAEAAAAAgACQAKAAsA"
   }
 }
 ```
@@ -384,9 +384,9 @@ other page is unchanged.)
 Every page of the memory file is in exactly one of three classes, and the two
 bitmaps name two of them:
 
-- **memfd authoritative** (`memfd_authoritative_pages`): the content is in the
-  memfd; the peer copies it.
-- **zero** (`zero_pages`): the page must read as zero in the file the peer
+- **memfd authoritative** (`pages_to_copy`): the content is in the memfd; the
+  peer copies it.
+- **zero** (`pages_to_zero`): the page must read as zero in the file the peer
   produces. How is the peer's business (write zeros, punch, or tell its storage
   the range is zero).
 - **unchanged** (neither): not touched since the dirty state was last consumed.
@@ -624,7 +624,7 @@ exactly.
 
 #### Decision: Roaring bitmaps, no chunking
 
-The first two-bitmap version reported `zero_pages` per caller-chosen chunk
+The first two-bitmap version reported `pages_to_zero` per caller-chosen chunk
 (`zero_chunk_size`, default 512 KiB; a chunk was zero only if all its pages
 were, and the zero pages of a mixed chunk were moved to the authoritative set,
 which is safe since a hole reads as zero) and trimmed trailing zero bytes from
@@ -863,11 +863,11 @@ still does write for a `Full`: the fault handler is how it gets those bytes).
 With the two-bitmap format and the "dirty ⇒ authoritative or zero" invariant
 (§7) the handler's rule for a diff is the bitmaps, nothing else:
 
-| Page                           | Read from            |
-| :----------------------------- | :------------------- |
-| in `memfd_authoritative_pages` | memfd                |
-| in `zero_pages`                | zero                 |
-| neither                        | not part of the diff |
+| Page               | Read from            |
+| :----------------- | :------------------- |
+| in `pages_to_copy` | memfd                |
+| in `pages_to_zero` | zero                 |
+| neither            | not part of the diff |
 
 `copy_pages` decodes both bitmaps (`DecodedLayout`), walks the file in page
 order producing runs of the same class (`PageClass::{Authoritative, Zero}`;
@@ -1149,8 +1149,8 @@ user can see.
   pause invariant of the `firecracker` binary is what makes this correct, and it
   is documented and tested as such.
 - Dirty information is exchanged over the HTTP API as two bitmaps that classify
-  every page of the memory file: `memfd_authoritative_pages` (dirty ∧ resident)
-  and `zero_pages` (dirty ∧ ¬resident), as Roaring bitmaps of host-page indices
+  every page of the memory file: `pages_to_copy` (dirty ∧ resident) and
+  `pages_to_zero` (dirty ∧ ¬resident), as Roaring bitmaps of host-page indices
   in the portable format, base64-encoded, in the `snapshot/create` response
   (final, consistent set) and from `PUT /snapshot/dirty-pages` (pre-copy,
   consuming, any state). A range list was the first choice and was replaced
@@ -1244,7 +1244,7 @@ document:
   nothing remembered the discard once the dirty mark was gone; and the measured
   formats (§7) showed the class bitmaps to be half the size and 2–4× cheaper on
   both sides.
-- The third version chunked `zero_pages` at a caller-chosen granularity and
+- The third version chunked `pages_to_zero` at a caller-chosen granularity and
   trimmed trailing zero bytes from both bitmaps, to keep the zero bitmap small
   and an unplugged tail free. A compressed representation of the full page sets
   achieves both without a parameter, a trim rule or any rounding, and handles

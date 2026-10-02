@@ -76,9 +76,9 @@ pub struct SnapshotMemoryLayout {
     pub bitmap_encoding: String,
     /// Standard base64 of a Roaring bitmap (portable serialization) of the page indices (file
     /// offset / `page_size`) to copy from the memfd.
-    pub memfd_authoritative_pages: String,
+    pub pages_to_copy: String,
     /// Same encoding: the page indices that must read as zero in the memory file.
-    pub zero_pages: String,
+    pub pages_to_zero: String,
 }
 
 fn default_bitmap_encoding() -> String {
@@ -176,8 +176,8 @@ impl SnapshotMemoryLayout {
             }
             Ok(set)
         };
-        let authoritative = decode("memfd_authoritative_pages", &self.memfd_authoritative_pages)?;
-        let zero = decode("zero_pages", &self.zero_pages)?;
+        let authoritative = decode("pages_to_copy", &self.pages_to_copy)?;
+        let zero = decode("pages_to_zero", &self.pages_to_zero)?;
         if !(&authoritative & &zero).is_empty() {
             return Err(invalid("a page is both authoritative and zero".into()));
         }
@@ -267,10 +267,10 @@ pub enum ControlResponse {
     Done {
         success: bool,
         message: String,
-        /// Bytes zeroed in the target without reading guest memory (`zero_pages`). Lets an
+        /// Bytes zeroed in the target without reading guest memory (`pages_to_zero`). Lets an
         /// orchestrator observe the saving.
         zeroed_bytes: u64,
-        /// Bytes copied from the memfd (`memfd_authoritative_pages`).
+        /// Bytes copied from the memfd (`pages_to_copy`).
         copied_bytes: u64,
     },
 }
@@ -1121,8 +1121,8 @@ mod tests {
             total_size: total_pages * 4096,
             page_size: 4096,
             bitmap_encoding: "roaring".to_string(),
-            memfd_authoritative_pages: roaring_b64(authoritative.iter().copied()),
-            zero_pages: roaring_b64(zero.iter().copied()),
+            pages_to_copy: roaring_b64(authoritative.iter().copied()),
+            pages_to_zero: roaring_b64(zero.iter().copied()),
         }
     }
 
@@ -1176,8 +1176,8 @@ mod tests {
             total_size: 65536,
             page_size: 4096,
             bitmap_encoding: "roaring".to_string(),
-            memfd_authoritative_pages: "OjAAAAEAAAAAAAIAEAAAAAAAAQAMAA==".to_string(),
-            zero_pages: "OjAAAAEAAAAAAAMAEAAAAAgACQAKAAsA".to_string(),
+            pages_to_copy: "OjAAAAEAAAAAAAIAEAAAAAAAAQAMAA==".to_string(),
+            pages_to_zero: "OjAAAAEAAAAAAAMAEAAAAAgACQAKAAsA".to_string(),
         };
         assert_eq!(
             runs(&doc),
@@ -1190,7 +1190,7 @@ mod tests {
         assert_eq!(decoded.class(15 * 4096), Unchanged);
         // The encoding field defaults when absent.
         let no_encoding: SnapshotMemoryLayout = serde_json::from_str(
-            r#"{"total_size":65536,"page_size":4096,"memfd_authoritative_pages":"OjAAAAEAAAAAAAIAEAAAAAAAAQAMAA==","zero_pages":"OjAAAAEAAAAAAAMAEAAAAAgACQAKAAsA"}"#,
+            r#"{"total_size":65536,"page_size":4096,"pages_to_copy":"OjAAAAEAAAAAAAIAEAAAAAAAAQAMAA==","pages_to_zero":"OjAAAAEAAAAAAAMAEAAAAAgACQAKAAsA"}"#,
         )
         .unwrap();
         assert_eq!(runs(&no_encoding), runs(&doc));
@@ -1224,19 +1224,19 @@ mod tests {
         // Rejected: pages past the end of the file, overlapping classes, an unknown encoding,
         // bad base64, bad Roaring.
         let mut bad = layout(1, &[0], &[]);
-        bad.memfd_authoritative_pages = roaring_b64([1]);
+        bad.pages_to_copy = roaring_b64([1]);
         bad.decode().unwrap_err();
         let mut bad = layout(4, &[0], &[]);
-        bad.zero_pages = roaring_b64([0]);
+        bad.pages_to_zero = roaring_b64([0]);
         bad.decode().unwrap_err();
         let mut bad = layout(4, &[0], &[]);
         bad.bitmap_encoding = "packbits".to_string();
         bad.decode().unwrap_err();
         let mut bad = layout(4, &[0], &[]);
-        bad.zero_pages = "!!".to_string();
+        bad.pages_to_zero = "!!".to_string();
         bad.decode().unwrap_err();
         let mut bad = layout(4, &[0], &[]);
-        bad.zero_pages = base64_encode(&[1, 2, 3]);
+        bad.pages_to_zero = base64_encode(&[1, 2, 3]);
         bad.decode().unwrap_err();
     }
 
