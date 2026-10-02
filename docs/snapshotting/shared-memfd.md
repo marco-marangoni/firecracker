@@ -344,6 +344,9 @@ simple rules. These rules cannot be enforced by Firecracker.
 - If a response is lost (e.g. connection dropped before the body was read), that
   dirty information is gone and the next snapshot must be a `Full` snapshot,
   which Firecracker writes itself
+- A `Full` ends the lineage of the responses received before it: the next `Diff`
+  is relative to the `Full`, and responses received before the `Full` must not
+  be applied to the `Full` or to anything derived from it
 - After the final `/snapshot/create`, the VM must not be resumed until the
   backend has copied every page in `pages_to_copy` out of the memfd.
 

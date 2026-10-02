@@ -3438,12 +3438,7 @@ mod tests {
         assert_eq!(layout.page_size, page_size);
         // Nothing past the end of the file.
         let pages = u32::try_from(layout.total_size / page_size).unwrap();
-        assert!(
-            layout
-                .pages_to_copy
-                .max()
-                .is_none_or(|p| p < pages)
-        );
+        assert!(layout.pages_to_copy.max().is_none_or(|p| p < pages));
         assert!(layout.pages_to_zero.max().is_none_or(|p| p < pages));
         // The two classes are disjoint.
         assert!((&layout.pages_to_copy & &layout.pages_to_zero).is_empty());

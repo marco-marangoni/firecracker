@@ -51,6 +51,13 @@
 //! `hugetlbfs_chunked_apply_preserves_invariant` proves correct for chunks no larger than a huge
 //! page and `chunked_apply_across_backing_pages_breaks` shows wrong otherwise.
 //!
+//! `Full` snapshots are not the backend's: `full_from_the_memfd_alone_is_impossible` and
+//! `firecracker_cannot_tell_base_holes_from_zero_holes` show why no response could make them so
+//! after a lazy restore, `firecracker_full_is_correct` that Firecracker's `dump` is right,
+//! `backend_full_is_correct` that a backend wanting a full file without populating the memfd has
+//! what it needs on its own, and `applying_a_response_from_before_a_full_breaks` that a `Full`
+//! ends the lineage of the responses before it.
+//!
 //! # The property
 //!
 //! After a snapshot of a paused guest, once the backend has applied every layout it was handed,
@@ -443,6 +450,56 @@ impl State {
         layout
     }
 
+    /// Everything Firecracker can know about page `p` when asked for a snapshot: the dirty state,
+    /// `mincore`, the device and virtio-mem bookkeeping. Not what a hole would read as: that is in
+    /// the backend's snapshot file and its fault handler's history, which Firecracker never sees.
+    pub fn observable(&self, p: usize) -> (bool, bool, bool, bool, bool, bool) {
+        let page = &self.pages[p];
+        (
+            page.kvm_marked,
+            page.fc_marked,
+            page.resident(),
+            page.unplugged,
+            page.armed,
+            page.ring,
+        )
+    }
+
+    /// Firecracker's `Full` with a backend attached, which is a `Full` without one: `dump` reads
+    /// every page through Firecracker's mapping, faulting in every hole (the handler serves the
+    /// base, the kernel serves zeros), and resets the dirty state. The file is Firecracker's,
+    /// not the backend's; the model writes it to `file` to ask what the backend may still do with
+    /// the responses it has not applied (`keep_pending`).
+    pub fn firecracker_full(&mut self, keep_pending: bool) {
+        for p in 0..PAGES {
+            if !self.pages[p].unplugged {
+                self.fault_in(p);
+            }
+            self.pages[p].file = self.memfd_read(p);
+        }
+        for page in &mut self.pages {
+            page.kvm_marked = false;
+            page.fc_marked = false;
+            page.armed = false;
+        }
+        self.arm_rings();
+        if !keep_pending {
+            self.pending = [None; MAX_PENDING];
+        }
+    }
+
+    /// The backend's own `Full` of a paused microVM, with nothing from Firecracker: `pread` the
+    /// memfd (holes read as zero, nothing is faulted in) and, for the pages it has never
+    /// populated through UFFD since the restore, the base's content. The handler knows which
+    /// those are: a base hole fills only through its `UFFDIO_COPY`, and `MADV_REMOVE` with the
+    /// remove-event feature blocks until it has read the event.
+    pub fn backend_full(&self) -> [u8; PAGES] {
+        std::array::from_fn(|p| match self.pages[p].memfd {
+            Memfd::Hole(HoleReads::Base) => self.pages[p].base,
+            _ => self.memfd_read(p),
+        })
+    }
+
     /// The backend applies one layout to its file: authoritative pages are copied from the memfd
     /// as it is *now*, zero pages are zeroed.
     pub fn apply_layout(&mut self, layout: Layout) {
@@ -742,7 +799,7 @@ mod verification {
     /// Applies one arbitrary operation.
     fn any_step(s: &mut State) {
         let p = any_index();
-        match kani::any::<u8>() % 10 {
+        match kani::any::<u8>() % 11 {
             0 => s.guest_write(p, kani::any()),
             1 => s.device_mark_ahead(p),
             2 => s.device_write_armed(p, kani::any()),
@@ -754,6 +811,7 @@ mod verification {
             8 => {
                 s.apply_oldest();
             }
+            9 => s.firecracker_full(false),
             _ => {
                 s.snapshot(any_race());
             }
@@ -841,6 +899,88 @@ mod verification {
     fn chunked_apply_across_backing_pages_breaks() {
         let mut s = any_state_with_backing(false);
         kani::assume(s.apply_oldest_chunked(true, false));
+        assert!(s.invariant());
+    }
+
+    /// Why Firecracker writes `Full` snapshots itself. First, a `Full` assembled from the memfd
+    /// alone is impossible after a lazy restore: whatever class any page is given (copy from the
+    /// memfd, or zero; "unchanged" has no meaning for a `Full`, there is no previous file), a page
+    /// the guest has never touched since the restore reads as the base through the fault handler
+    /// and as zero from the memfd. No response Firecracker could return changes that.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn full_from_the_memfd_alone_is_impossible() {
+        let s = any_state();
+        let p = any_index();
+        let page = &s.pages[p];
+        kani::assume(
+            page.memfd == Memfd::Hole(HoleReads::Base) && page.base != 0 && !page.unplugged,
+        );
+        let copy: bool = kani::any();
+        let full = if copy { s.memfd_read(p) } else { 0 };
+        assert_ne!(full, page.guest());
+    }
+
+    /// Second, Firecracker cannot even say which pages those are: once the diff that recorded a
+    /// discard is consumed, a base hole and a zero hole look the same to it. Two reachable
+    /// states, identical in everything Firecracker observes for every page and with nothing
+    /// pending, whose guests read differently.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn firecracker_cannot_tell_base_holes_from_zero_holes() {
+        let base: [u8; PAGES] = kani::any();
+        let ring: [bool; PAGES] = kani::any();
+        kani::assume(base[0] != 0 && !ring[0]);
+        let a = State::restored(base, ring, false);
+        let mut b = State::restored(base, ring, false);
+        b.guest_write(0, kani::any());
+        b.discard(0);
+        b.snapshot(Race::default());
+        b.apply_all();
+        assert!(a.invariant() && a.lemma() && b.invariant() && b.lemma());
+        for p in 0..PAGES {
+            assert_eq!(a.observable(p), b.observable(p));
+        }
+        assert_eq!(a.pending, b.pending);
+        assert_ne!(a.pages[0].guest(), b.pages[0].guest());
+    }
+
+    /// What does work: Firecracker's `dump`, which faults everything in.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn firecracker_full_is_correct() {
+        let mut s = any_state();
+        s.firecracker_full(false);
+        assert!(s.file_matches_guest());
+        assert!(s.invariant() && s.lemma());
+    }
+
+    /// And the backend's own `Full`, from the memfd plus what its fault handler knows, with
+    /// nothing from Firecracker and without populating the memfd. (In the model this is the
+    /// definition of what the guest reads; the content of the proof is the modelling assumption
+    /// that the handler sees every population and every removal, stated on
+    /// [`State::backend_full`].)
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn backend_full_is_correct() {
+        let s = any_state();
+        let full = s.backend_full();
+        for p in 0..PAGES {
+            assert_eq!(full[p], s.pages[p].guest());
+        }
+    }
+
+    /// A `Full` starts over: a response received before it must not be applied to the `Full`'s
+    /// lineage. A page zeroed by that response and written by the guest afterwards is in the
+    /// `Full`; the mark that recorded the write is consumed by the `Full`; applying the response
+    /// zeroes the page with nothing left to repair it.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    #[kani::should_panic]
+    fn applying_a_response_from_before_a_full_breaks() {
+        let mut s = any_state();
+        s.firecracker_full(true);
+        kani::assume(s.apply_oldest());
         assert!(s.invariant());
     }
 
