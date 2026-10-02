@@ -300,12 +300,11 @@ with chunks aligned to and no larger than 2 MiB, a chunk with a page in either
 set can be read whole from the memfd, and a chunk with a page in `zero_pages`
 can simply be zero-filled.
 
-Sizes: each set is never larger than a plain bitmap of the file, 32 KiB per GiB
-of guest memory plus 0.1%, whatever the dirty pattern; that is the cost of a
-guest rewriting its memory at random. Everything else is smaller: a run of
-consecutive pages, however long (a released balloon, an unplugged region, a
-freshly written buffer), costs 4 bytes, and an isolated page 2 bytes, so an idle
-guest's response is a few KiB.
+Sizes: a set costs at most 43 KiB per GiB of guest memory, base64 included,
+whatever the dirty pattern, so a response is at most 86 KiB per GiB. That is the
+cost of a guest rewriting its memory at random; runs of consecutive pages, such
+as a released balloon or a freshly written buffer, cost a few bytes each
+regardless of their length, and an idle guest's response is a few KiB.
 
 Like writing a memory file, this consumes the dirty tracking state: the pages
 returned are no longer considered dirty. The virtqueue pages of every activated
