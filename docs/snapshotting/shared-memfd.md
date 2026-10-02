@@ -284,6 +284,22 @@ that was booted rather than restored, a complete memory file. Write zeros rather
 than punching holes when merging a diff, and when producing a diff file for
 `rebase-snap`: to those a hole means "not in the diff".
 
+A backend that stores memory in chunks (512 KiB, 2 MiB, ...) applies a response
+chunk by chunk. A chunk with no page in either set is left alone. For any other
+chunk, start from the previous version of the chunk, copy the authoritative
+pages in from the memfd, zero the zero pages, and store the result. Do not read
+the whole chunk from the memfd just because one of its pages is authoritative:
+the pages the response does not name may be holes the guest has never touched
+since restore, and those read as zeros from the memfd while the guest sees the
+base snapshot's content.
+
+Two configurations let the backend skip the previous version. For a microVM that
+was booted rather than restored, an untouched hole really is zero, so a chunk
+with an authoritative page can be read whole from the memfd. On 2M hugetlbfs,
+with chunks aligned to and no larger than 2 MiB, a chunk with a page in either
+set can be read whole from the memfd, and a chunk with a page in `zero_pages`
+can simply be zero-filled.
+
 Sizes: each set is never larger than a plain bitmap of the file, 32 KiB per GiB
 of guest memory plus 0.1%, whatever the dirty pattern; that is the cost of a
 guest rewriting its memory at random. Everything else is smaller: a run of

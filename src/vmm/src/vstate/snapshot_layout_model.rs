@@ -40,6 +40,17 @@
 //! The backend applies a returned layout whenever it gets to it, not inside the API call: layouts
 //! queue up ([`State::pending`]) and are applied oldest first, while the guest keeps writing.
 //!
+//! Memory is backed by single pages or, with [`State::huge`], by huge pages of [`HUGE`] model
+//! pages. A fault populates a whole backing page, a discard frees a whole
+//! one or zero-writes the pages it cannot free, virtio-mem slots are whole backing pages, and
+//! `mincore` reports per backing page. The lemma `H` records that residency is uniform within a
+//! huge page and `Z` that a huge page with a zero page in a pending layout holds nothing but
+//! zeros, marks, and pages of later layouts. Together they let a chunked backend on hugetlbfs
+//! apply a layout with no copy of its own ([`State::apply_layout_chunked`]: read a chunk with a
+//! layout page whole from the memfd, or zero-fill one with a zero page), which
+//! `hugetlbfs_chunked_apply_preserves_invariant` proves correct for chunks no larger than a huge
+//! page and `chunked_apply_across_backing_pages_breaks` shows wrong otherwise.
+//!
 //! # The property
 //!
 //! After a snapshot of a paused guest, once the backend has applied every layout it was handed,
@@ -129,7 +140,14 @@ pub struct State {
     /// Layouts Firecracker has returned that the backend has not applied to its file yet, oldest
     /// first. The backend applies them in this order, whenever it gets to it.
     pub pending: [Option<Layout>; MAX_PENDING],
+    /// Whether memory is backed by huge pages of [`HUGE`] model pages rather than by single pages.
+    /// Residency is per backing page (a fault populates all of it, a discard frees all of it or
+    /// none), and so is what `mincore` reports.
+    pub huge: bool,
 }
+
+/// Model pages per huge page when [`State::huge`] is set. A power of two dividing [`PAGES`].
+pub const HUGE: usize = 2;
 
 /// How many returned layouts the backend may leave unapplied at once. Two is enough to express
 /// every ordering question (apply in order, out of order, drop one).
@@ -193,10 +211,32 @@ impl Page {
 }
 
 impl State {
+    /// Whether `p` and `q` are in the same backing page. (Loops over the backing page are written
+    /// as `for q in 0..PAGES` filtered by this, so that every loop has a constant trip count,
+    /// which Kani needs.)
+    fn same_backing_page(&self, p: usize, q: usize) -> bool {
+        if self.huge {
+            p & !(HUGE - 1) == q & !(HUGE - 1)
+        } else {
+            p == q
+        }
+    }
+
+    /// A read or write through Firecracker's mapping of page `p` when it is a hole: the whole
+    /// backing page becomes present (the handler's `UFFDIO_COPY` or the kernel's zero page is
+    /// backing-page sized).
+    fn fault_in(&mut self, p: usize) {
+        for q in 0..PAGES {
+            if self.same_backing_page(p, q) {
+                self.pages[q].fault_in();
+            }
+        }
+    }
+
     /// A microVM restored from a base snapshot through the backend: every page is a hole the
     /// handler serves from the base, and the backend's file is the base.
-    pub fn restored(base: [u8; PAGES], ring: [bool; PAGES]) -> Self {
-        let mut s = Self::booted(ring);
+    pub fn restored(base: [u8; PAGES], ring: [bool; PAGES], huge: bool) -> Self {
+        let mut s = Self::booted(ring, huge);
         for (p, page) in s.pages.iter_mut().enumerate() {
             page.memfd = Memfd::Hole(HoleReads::Base);
             page.base = base[p];
@@ -207,9 +247,10 @@ impl State {
     }
 
     /// A booted microVM: zero holes, no base, an empty (zero) file.
-    pub fn booted(ring: [bool; PAGES]) -> Self {
+    pub fn booted(ring: [bool; PAGES], huge: bool) -> Self {
         let mut s = Self {
             pending: [None; MAX_PENDING],
+            huge,
             pages: [Page {
                 memfd: Memfd::Hole(HoleReads::Zero),
                 base: 0,
@@ -231,11 +272,10 @@ impl State {
     /// `mark_virtio_queue_memory_dirty` (at activation and after every snapshot) and the RX
     /// buffer marking in `IoVecBufferMut`: mark ahead of writing.
     fn mark_ahead(&mut self, p: usize) {
-        let page = &mut self.pages[p];
-        page.fc_marked = true;
-        page.armed = true;
+        self.pages[p].fc_marked = true;
+        self.pages[p].armed = true;
         if FAULT_IN_ON_MARK {
-            page.fault_in();
+            self.fault_in(p);
         }
     }
 
@@ -249,13 +289,12 @@ impl State {
 
     /// The guest (a vCPU) writes `v` to page `p`. KVM logs it.
     pub fn guest_write(&mut self, p: usize, v: u8) {
-        let page = &mut self.pages[p];
-        if page.unplugged {
+        if self.pages[p].unplugged {
             return;
         }
-        page.fault_in();
-        page.memfd = Memfd::Present(v);
-        page.kvm_marked = true;
+        self.fault_in(p);
+        self.pages[p].memfd = Memfd::Present(v);
+        self.pages[p].kvm_marked = true;
     }
 
     /// A device marks page `p` dirty before it writes it (virtqueue ring, RX buffer).
@@ -268,63 +307,73 @@ impl State {
 
     /// A device writes `v` to the armed page `p` through a raw pointer: no mark.
     pub fn device_write_armed(&mut self, p: usize, v: u8) {
-        let page = &mut self.pages[p];
-        if !page.armed || page.unplugged {
+        if !self.pages[p].armed || self.pages[p].unplugged {
             return;
         }
-        page.fault_in();
-        page.memfd = Memfd::Present(v);
+        self.fault_in(p);
+        self.pages[p].memfd = Memfd::Present(v);
     }
 
     /// A device writes `v` to page `p` and marks it afterwards (block I/O completion).
     pub fn device_write_then_mark(&mut self, p: usize, v: u8) {
-        let page = &mut self.pages[p];
-        if page.unplugged {
+        if self.pages[p].unplugged {
             return;
         }
-        page.fault_in();
-        page.memfd = Memfd::Present(v);
-        page.fc_marked = true;
+        self.fault_in(p);
+        self.pages[p].memfd = Memfd::Present(v);
+        self.pages[p].fc_marked = true;
     }
 
-    /// The balloon or free page reporting releases page `p`: `MADV_REMOVE` punches it (the
-    /// handler gets a `remove` event and stops serving it), and it is marked.
+    /// The balloon or free page reporting releases the backing page containing `p`:
+    /// `MADV_REMOVE` punches it whole (the handler gets a `remove` event and stops serving it),
+    /// and it is marked. Only whole backing pages can be freed.
     pub fn discard(&mut self, p: usize) {
-        let page = &mut self.pages[p];
-        if page.unplugged {
+        if self.pages[p].unplugged {
             return;
         }
-        page.memfd = Memfd::Hole(HoleReads::Zero);
-        page.fc_marked = true;
+        for q in 0..PAGES {
+            if self.same_backing_page(p, q) {
+                self.pages[q].memfd = Memfd::Hole(HoleReads::Zero);
+                self.pages[q].fc_marked = true;
+            }
+        }
     }
 
     /// A discard of a page the kernel cannot free on its own (part of a hugetlbfs huge page the
     /// range does not cover entirely): `discard_range` writes zeros to it through the mapping
-    /// instead, which faults it in, and marks it. The guest reads zero either way.
+    /// instead, which faults the backing page in, and marks it. The guest reads zero either way.
     pub fn discard_edge(&mut self, p: usize) {
-        let page = &mut self.pages[p];
-        if page.unplugged {
+        if self.pages[p].unplugged {
             return;
         }
         if DISCARD_ZEROES_UNPUNCHABLE_EDGES {
-            page.fault_in();
-            page.memfd = Memfd::Present(0);
+            self.fault_in(p);
+            self.pages[p].memfd = Memfd::Present(0);
         }
-        page.fc_marked = true;
+        self.pages[p].fc_marked = true;
     }
 
-    /// virtio-mem unplugs page `p`: discarded, marked, inaccessible.
+    /// virtio-mem unplugs the slot containing `p` (slots are whole backing pages): discarded,
+    /// marked, inaccessible.
     pub fn unplug(&mut self, p: usize) {
-        let page = &mut self.pages[p];
-        page.memfd = Memfd::Hole(HoleReads::Zero);
-        page.fc_marked = true;
-        page.armed = false;
-        page.unplugged = true;
+        for q in 0..PAGES {
+            if self.same_backing_page(p, q) {
+                let page = &mut self.pages[q];
+                page.memfd = Memfd::Hole(HoleReads::Zero);
+                page.fc_marked = true;
+                page.armed = false;
+                page.unplugged = true;
+            }
+        }
     }
 
-    /// virtio-mem plugs page `p` back: accessible again, still a zero hole.
+    /// virtio-mem plugs the slot containing `p` back: accessible again, still a zero hole.
     pub fn plug(&mut self, p: usize) {
-        self.pages[p].unplugged = false;
+        for q in 0..PAGES {
+            if self.same_backing_page(p, q) {
+                self.pages[q].unplugged = false;
+            }
+        }
     }
 
     /// `snapshot_layout`: the dirty state, residency, classification and reset, with the backend
@@ -413,6 +462,56 @@ impl State {
         }
     }
 
+    /// What `pread` on the memfd, or the backend's own mapping of it, returns for page `p`: the
+    /// content if present, zero for a hole, whatever the hole would read as through
+    /// Firecracker's mapping.
+    pub fn memfd_read(&self, p: usize) -> u8 {
+        match self.pages[p].memfd {
+            Memfd::Present(v) => v,
+            Memfd::Hole(_) => 0,
+        }
+    }
+
+    /// A backend that works in chunks (of one page, or of [`HUGE`] pages with `huge_chunks`)
+    /// applies a layout chunk by chunk with no previous copy of its own: a chunk with a zero page
+    /// is zero-filled (`zero_fill`) or read whole from the memfd, a chunk with an authoritative
+    /// page is read whole from the memfd, any other chunk is left alone. Correct only when a chunk
+    /// never contains an unchanged page that is a base hole: on hugetlbfs with chunks no larger
+    /// than the huge page, or for a booted microVM.
+    pub fn apply_layout_chunked(&mut self, layout: Layout, huge_chunks: bool, zero_fill: bool) {
+        for p in 0..PAGES {
+            let in_chunk = |q: usize| {
+                if huge_chunks {
+                    p & !(HUGE - 1) == q & !(HUGE - 1)
+                } else {
+                    p == q
+                }
+            };
+            if zero_fill && (0..PAGES).any(|q| in_chunk(q) && layout.zero[q]) {
+                self.pages[p].file = 0;
+            } else if (0..PAGES).any(|q| in_chunk(q) && (layout.authoritative[q] || layout.zero[q]))
+            {
+                self.pages[p].file = self.memfd_read(p);
+            }
+        }
+    }
+
+    /// The backend applies the oldest pending layout, chunked.
+    pub fn apply_oldest_chunked(&mut self, huge_chunks: bool, zero_fill: bool) -> bool {
+        let Some(layout) = self.pending[0] else {
+            return false;
+        };
+        self.pending.rotate_left(1);
+        self.pending[MAX_PENDING - 1] = None;
+        self.apply_layout_chunked(layout, huge_chunks, zero_fill);
+        true
+    }
+
+    /// The backend catches up with everything it was handed, chunked.
+    pub fn apply_all_chunked(&mut self, huge_chunks: bool, zero_fill: bool) {
+        while self.apply_oldest_chunked(huge_chunks, zero_fill) {}
+    }
+
     /// The backend applies the oldest pending layout.
     pub fn apply_oldest(&mut self) -> bool {
         let Some(layout) = self.pending[0] else {
@@ -487,6 +586,51 @@ impl State {
                 && (!page.armed || page.fc_marked)
                 && (!page.unplugged || (page.memfd == Memfd::Hole(HoleReads::Zero) && !page.armed))
                 && (!self.pending_covers(p) || page.memfd != Memfd::Hole(HoleReads::Base))
+        }) && self.backing_pages_are_uniform()
+            && self.zero_pages_have_zero_huge_pages()
+    }
+
+    /// `Z` (huge backing only): if a pending layout classifies `p` zero, every page `q` of `p`'s
+    /// huge page either reads zero to the guest, or is marked, or is in a *later* pending layout.
+    /// (The huge page was a hole when `p` was classified, and every write to it since is
+    /// accounted for.) What lets a chunked backend zero-fill a chunk that has a zero page.
+    pub fn zero_pages_have_zero_huge_pages(&self) -> bool {
+        if !self.huge {
+            return true;
+        }
+        (0..MAX_PENDING).all(|k| {
+            let Some(layout) = self.pending[k] else {
+                return true;
+            };
+            (0..PAGES).all(|p| {
+                !layout.zero[p]
+                    || (0..PAGES).all(|q| {
+                        !self.same_backing_page(p, q)
+                            || self.pages[q].guest() == 0
+                            || self.pages[q].marked()
+                            || (k + 1..MAX_PENDING).any(|j| {
+                                self.pending[j].is_some_and(|l| l.authoritative[q] || l.zero[q])
+                            })
+                    })
+            })
+        })
+    }
+
+    /// `H`: residency and plug state are per backing page. Every page of a backing page is
+    /// present, or every page is a base hole, or every page is a zero hole; and all are plugged
+    /// or all unplugged. Trivial for 4 KiB backing.
+    pub fn backing_pages_are_uniform(&self) -> bool {
+        if !self.huge {
+            return true;
+        }
+        let kind = |page: &Page| match page.memfd {
+            Memfd::Present(_) => 0,
+            Memfd::Hole(HoleReads::Base) => 1,
+            Memfd::Hole(HoleReads::Zero) => 2,
+        };
+        (0..PAGES).all(|q| {
+            let first = &self.pages[q & !(HUGE - 1)];
+            kind(&self.pages[q]) == kind(first) && self.pages[q].unplugged == first.unplugged
         })
     }
 
@@ -556,11 +700,17 @@ mod verification {
         }
     }
 
-    /// Any state satisfying `I ∧ L`, with any (gap-free) queue of pending layouts.
+    /// Any state satisfying `I ∧ L`, with any (gap-free) queue of pending layouts, for either
+    /// backing page size.
     fn any_state() -> State {
+        any_state_with_backing(kani::any())
+    }
+
+    fn any_state_with_backing(huge: bool) -> State {
         let s = State {
             pages: std::array::from_fn(|_| any_page()),
             pending: std::array::from_fn(|_| any_layout()),
+            huge,
         };
         kani::assume(s.pending[1].is_none() || s.pending[0].is_some());
         kani::assume(s.invariant());
@@ -610,13 +760,14 @@ mod verification {
         }
     }
 
-    /// Base case: both initial states satisfy `I ∧ L`.
+    /// Base case: both initial states satisfy `I ∧ L`, for either backing page size.
     #[kani::proof]
     fn initial_states_satisfy_invariant() {
         let ring: [bool; PAGES] = kani::any();
-        let s = State::restored(kani::any(), ring);
+        let huge: bool = kani::any();
+        let s = State::restored(kani::any(), ring, huge);
         assert!(s.invariant() && s.lemma());
-        let s = State::booted(ring);
+        let s = State::booted(ring, huge);
         assert!(s.invariant() && s.lemma());
     }
 
@@ -656,6 +807,41 @@ mod verification {
         s.snapshot(Race::default());
         s.apply_all();
         assert!(s.file_matches_guest());
+    }
+
+    /// A chunked backend on hugetlbfs, with chunks no larger than a huge page, needs no previous
+    /// copy: reading every chunk that has a page in the layout whole from the memfd, or
+    /// zero-filling those that have a zero page, preserves `I ∧ L` from any state, however late
+    /// the layout is applied.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn hugetlbfs_chunked_apply_preserves_invariant() {
+        let mut s = any_state_with_backing(true);
+        s.apply_oldest_chunked(kani::any(), kani::any());
+        assert!(s.invariant());
+        assert!(s.lemma());
+    }
+
+    /// And the result of a paused snapshot applied that way is guest memory.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn hugetlbfs_chunked_paused_snapshot_is_correct() {
+        let mut s = any_state_with_backing(true);
+        s.snapshot(Race::default());
+        s.apply_all_chunked(kani::any(), kani::any());
+        assert!(s.file_matches_guest());
+    }
+
+    /// The same strategy with a chunk larger than the backing page (here: 4 KiB backing, 2-page
+    /// chunks) breaks: a never-faulted unchanged page next to an authoritative one is read from
+    /// the memfd as zero while the guest reads the base.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    #[kani::should_panic]
+    fn chunked_apply_across_backing_pages_breaks() {
+        let mut s = any_state_with_backing(false);
+        kani::assume(s.apply_oldest_chunked(true, false));
+        assert!(s.invariant());
     }
 
     /// Applying two responses in the wrong order breaks the invariant: a page zero in the older
@@ -781,10 +967,11 @@ mod tests {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
         for round in 0..2000 {
             let ring = rng.bools();
+            let huge = round % 4 >= 2;
             let mut s = if round % 2 == 0 {
-                State::restored(std::array::from_fn(|_| rng.byte()), ring)
+                State::restored(std::array::from_fn(|_| rng.byte()), ring, huge)
             } else {
-                State::booted(ring)
+                State::booted(ring, huge)
             };
             assert!(s.invariant() && s.lemma());
             for _ in 0..(rng.next() % 12) {
@@ -793,7 +980,11 @@ mod tests {
                 assert!(s.lemma(), "{s:?}");
             }
             s.snapshot(Race::default());
-            s.apply_all();
+            if huge && rng.next() & 1 == 1 {
+                s.apply_all_chunked(true, rng.next() & 2 == 2);
+            } else {
+                s.apply_all();
+            }
             assert!(s.file_matches_guest(), "{s:?}");
         }
     }
@@ -802,7 +993,7 @@ mod tests {
     #[test]
     fn test_known_bugs_are_caught_by_the_lemma() {
         // A restored virtqueue page: marked at activation, not written before the snapshot.
-        let mut s = State::restored([7; PAGES], [false; PAGES]);
+        let mut s = State::restored([7; PAGES], [false; PAGES], false);
         s.pages[0].fc_marked = true; // mark without the fault-in
         assert!(!s.lemma());
         // What the layout would have done: the page is a dirty hole, so "zero".
@@ -810,7 +1001,7 @@ mod tests {
         buggy.pages[0].file = 0;
         assert_ne!(buggy.pages[0].file, buggy.pages[0].guest());
         // With the fault-in, the mark is safe.
-        let mut s = State::restored([7; PAGES], [false; PAGES]);
+        let mut s = State::restored([7; PAGES], [false; PAGES], false);
         s.device_mark_ahead(0);
         assert!(s.lemma());
         s.snapshot(Race::default());
@@ -818,10 +1009,10 @@ mod tests {
         assert!(s.file_matches_guest());
 
         // A partial hugetlbfs discard on a never-populated restored page.
-        let mut s = State::restored([9; PAGES], [false; PAGES]);
+        let mut s = State::restored([9; PAGES], [false; PAGES], true);
         s.pages[1].fc_marked = true; // marked though neither punched nor zero-written
         assert!(!s.lemma());
-        let mut s = State::restored([9; PAGES], [false; PAGES]);
+        let mut s = State::restored([9; PAGES], [false; PAGES], true);
         s.discard_edge(1);
         assert!(s.lemma());
         assert_eq!(s.pages[1].guest(), 0);
