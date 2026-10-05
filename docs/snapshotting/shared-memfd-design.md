@@ -373,7 +373,7 @@ Response: `200 OK` with
     "page_size": 4096,
     "bitmap_encoding": "roaring",
     "pages_to_copy": "OjAAAAEAAAAAAAIAEAAAAAAAAQAMAA==",
-    "pages_to_zero": "OjAAAAEAAAAAAAMAEAAAAAgACQAKAAsA"
+    "pages_to_discard": "OjAAAAEAAAAAAAMAEAAAAAgACQAKAAsA"
   }
 }
 ```
@@ -388,7 +388,7 @@ bitmaps name two of them:
 
 - **memfd authoritative** (`pages_to_copy`): the content is in the memfd; the
   peer copies it.
-- **zero** (`pages_to_zero`): the page must read as zero in the file the peer
+- **zero** (`pages_to_discard`): the page must read as zero in the file the peer
   produces. How is the peer's business (write zeros, punch, or tell its storage
   the range is zero).
 - **unchanged** (neither): not touched since the dirty state was last consumed.
@@ -636,7 +636,7 @@ exactly.
 
 #### Decision: Roaring bitmaps, no chunking
 
-The first two-bitmap version reported `pages_to_zero` per caller-chosen chunk
+The first two-bitmap version reported `pages_to_discard` per caller-chosen chunk
 (`zero_chunk_size`, default 512 KiB; a chunk was zero only if all its pages
 were, and the zero pages of a mixed chunk were moved to the authoritative set,
 which is safe since a hole reads as zero) and trimmed trailing zero bytes from
@@ -875,11 +875,11 @@ still does write for a `Full`: the fault handler is how it gets those bytes).
 With the two-bitmap format and the "dirty ⇒ authoritative or zero" invariant
 (§7) the handler's rule for a diff is the bitmaps, nothing else:
 
-| Page               | Read from            |
-| :----------------- | :------------------- |
-| in `pages_to_copy` | memfd                |
-| in `pages_to_zero` | zero                 |
-| neither            | not part of the diff |
+| Page                  | Read from            |
+| :-------------------- | :------------------- |
+| in `pages_to_copy`    | memfd                |
+| in `pages_to_discard` | zero                 |
+| neither               | not part of the diff |
 
 `copy_pages` decodes both bitmaps (`DecodedLayout`), walks the file in page
 order producing runs of the same class (`PageClass::{Authoritative, Zero}`;
@@ -941,8 +941,8 @@ a `mincore`-only diff degrades to `dirty := resident`, whose zero set is empty,
 so a discarded page survives with stale content
 (`dirty_tracking_off_without_discard_bitmap_breaks_after_discard`). The discard
 bitmap fixes it — `dirty := resident ∨ discarded`, a discarded page lands in
-`pages_to_zero`, a changed page is caught by `mincore` since it stays resident
-(`dirty_tracking_off_with_discard_bitmap_is_correct`).
+`pages_to_discard`, a changed page is caught by `mincore` since it stays
+resident (`dirty_tracking_off_with_discard_bitmap_is_correct`).
 
 The coarse discard bit is a filter that triggers the per-host-page `mincore`,
 never a verdict that zeroes the whole 2 MiB — on tmpfs that distinction is
@@ -966,6 +966,33 @@ The cost noted in #6237 applies here unchanged: zero-writing an edge allocates a
 huge page the guest may never have touched, so with hugetlbfs the traditional
 balloon reclaims nothing and can increase host memory use; free page hinting and
 reporting work in whole huge pages.
+
+#### Discarded pages: zeroing is recommended, not required
+
+`pages_to_discard` tells the backend a page was discarded and now reads as zero.
+A backend that zeroes them produces a file byte-identical to guest memory, which
+§10 relies on. A backend may instead leave the page's previous content: the
+guest discarded these pages (balloon, free page reporting, unplug) and, with a
+well-behaved Linux guest, zero-initializes them before reading on the next
+allocation (`__GFP_ZERO`), so the stale bytes are never observed *by the guest*.
+The model proves the weaker guarantee this gives:
+`keeping_discarded_content_is_invisible_to_the_guest` — after a paused snapshot
+applied without zeroing the discarded pages, `file` matches guest memory on
+every page except those the guest discarded or unplugged
+(`file_matches_guest_reads`), over an arbitrary run of writes, discards, unplugs
+and re-plugs, with or without dirty tracking.
+
+Two caveats the model pins. First, it is only the *guest's* view that is
+preserved: `keeping_discarded_content_differs_from_guest_memory` exhibits a
+reachable state where a kept page holds non-zero bytes while the guest reads
+zero, so a consumer that reads the file directly — `rebase-snap`, a diff merge,
+a byte comparison — is not covered and must get zeroed pages. Second, the
+guarantee leans on freshly *plugged* virtio-mem memory also being
+zero-initialized by the guest before use (it is onlined and zeroed like
+reallocated memory): the model keeps a plugged-back page in the "guest will
+initialize before reading" set for this reason. If a guest read discarded or
+newly-plugged memory before writing it, keeping old content would be visible —
+which is why zeroing is the default and recommended behaviour.
 
 ### 10. Byte-for-byte identity: how it is demonstrated
 
@@ -1138,12 +1165,12 @@ user can see.
    of the three classes; the Roaring serde adapter; property-style identity
    tests against `dump_dirty` over random bitmaps and residency, including
    fold-back on error; the `roaring` dependency.
-1. *(no API)* The Kani model `vstate/snapshot_layout_model.rs`: twenty-one
+1. *(no API)* The Kani model `vstate/snapshot_layout_model.rs`: twenty-three
    harnesses (base case, inductive step, paused and racy-then-paused
    correctness, three rule checks, three backend-misuse checks, chunked
-   application on hugetlbfs, the five `Full` results above, and the four
-   dirty-tracking / two-bitmap results below), over 4 KiB and huge-page backing,
-   run by `test_kani.py`.
+   application on hugetlbfs, the five `Full` results above, the four
+   dirty-tracking / two-bitmap results, and the two discard-keep-old results),
+   over 4 KiB and huge-page backing, run by `test_kani.py`.
 1. Handshake and boot: `send_uffd_handshake(&[RawFd])`, `uffd_mappings`,
    `MachineConfig.mem_backend` (only `SharedMemfd`), handshake in
    `build_microvm_for_boot` after all regions are registered with KVM,
@@ -1205,13 +1232,13 @@ user can see.
   is documented and tested as such.
 - Dirty information is exchanged over the HTTP API as two bitmaps that classify
   every page of the memory file: `pages_to_copy` (dirty ∧ resident) and
-  `pages_to_zero` (dirty ∧ ¬resident), as Roaring bitmaps of host-page indices
-  in the portable format, base64-encoded, in the `snapshot/create` response
-  (final, consistent set) and from `PUT /snapshot/dirty-pages` (pre-copy,
-  consuming, any state). A range list was the first choice and was replaced
-  after measuring it (§7); a dirty bitmap plus `unplugged` list plus `populated`
-  bitmap was the second and was replaced by the two class bitmaps after
-  measuring those; chunked, trailing-trimmed class bitmaps were the third,
+  `pages_to_discard` (dirty ∧ ¬resident), as Roaring bitmaps of host-page
+  indices in the portable format, base64-encoded, in the `snapshot/create`
+  response (final, consistent set) and from `PUT /snapshot/dirty-pages`
+  (pre-copy, consuming, any state). A range list was the first choice and was
+  replaced after measuring it (§7); a dirty bitmap plus `unplugged` list plus
+  `populated` bitmap was the second and was replaced by the two class bitmaps
+  after measuring those; chunked, trailing-trimmed class bitmaps were the third,
   PackBits-compressed full-length ones the fourth, and Roaring replaced both
   after measuring (§7). The authoritative set is a superset of the modified
   resident pages, not promised to be exact.
@@ -1299,17 +1326,17 @@ document:
   nothing remembered the discard once the dirty mark was gone; and the measured
   formats (§7) showed the class bitmaps to be half the size and 2–4× cheaper on
   both sides.
-- The third version chunked `pages_to_zero` at a caller-chosen granularity and
-  trimmed trailing zero bytes from both bitmaps, to keep the zero bitmap small
-  and an unplugged tail free. A compressed representation of the full page sets
-  achieves both without a parameter, a trim rule or any rounding, and handles
-  unplugged slots anywhere in the file; `zero_chunk_size`, its validation and
-  `DirtyPagesParams` are gone, `dirty-pages` takes no body again, and
-  `bitmap_encoding` names the serialization. PackBits over full-length bitmaps
-  was implemented first (dependency-free, a dozen lines to decode); Roaring
-  replaced it for being a standard with libraries everywhere, for constant-time
-  membership on the decoded form, and for being smaller still in every scenario
-  measured (§7), at the cost of one dependency.
+- The third version chunked `pages_to_discard` at a caller-chosen granularity
+  and trimmed trailing zero bytes from both bitmaps, to keep the zero bitmap
+  small and an unplugged tail free. A compressed representation of the full page
+  sets achieves both without a parameter, a trim rule or any rounding, and
+  handles unplugged slots anywhere in the file; `zero_chunk_size`, its
+  validation and `DirtyPagesParams` are gone, `dirty-pages` takes no body again,
+  and `bitmap_encoding` names the serialization. PackBits over full-length
+  bitmaps was implemented first (dependency-free, a dozen lines to decode);
+  Roaring replaced it for being a standard with libraries everywhere, for
+  constant-time membership on the decoded form, and for being smaller still in
+  every scenario measured (§7), at the cost of one dependency.
 - "Dirty ⇒ memfd authoritative" did not hold for pages marked ahead of a write
   (virtqueue rings, RX buffers) after a UFFD restore. Faulting those ranges in
   when they are marked (`fault_in_marked_range`) made it hold, and made the

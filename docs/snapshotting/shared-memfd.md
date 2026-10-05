@@ -49,8 +49,8 @@ descriptor with it.
 The backend creates and listens on a `SOCK_STREAM` Unix domain socket which is
 then passed to Firecracker (via the config file, `PUT /machine-config`, or
 `PUT /snapshot/load`). Firecracker then connects to the path given in the
-request (relative to its chroot when jailed) and sends the handshake message.
-If nobody is listening, the API call fails.
+request (relative to its chroot when jailed) and sends the handshake message. If
+nobody is listening, the API call fails.
 
 After that, Firecracker never reads from or writes to the socket, and keeps it
 open until it exits. The backend can use the connection to learn Firecracker's
@@ -86,7 +86,7 @@ The array has one entry per guest memory region, in guest address order:
 ```
 
 | Field                 | Meaning                                                                                                               |
-|:----------------------|:----------------------------------------------------------------------------------------------------------------------|
+| :-------------------- | :-------------------------------------------------------------------------------------------------------------------- |
 | `base_host_virt_addr` | Address of the region in Firecracker's address space. Page fault events use it; the memfd and the API do not.         |
 | `size`                | Region size in bytes.                                                                                                 |
 | `offset`              | Offset of the region in the memfd. It is also its offset in a memory snapshot file and in the bitmap the API returns. |
@@ -103,7 +103,7 @@ The format of the handshake is the same as the `Uffd` backend.
 ### The file descriptors
 
 | How the microVM was started                      | fds received    |
-|:-------------------------------------------------|:----------------|
+| :----------------------------------------------- | :-------------- |
 | `snapshot/load` with `backend_type: Uffd`        | `[uffd]`        |
 | `snapshot/load` with `backend_type: SharedMemfd` | `[uffd, memfd]` |
 | At boot with `machine-config.mem_backend`        | `[memfd]`       |
@@ -226,7 +226,7 @@ memory part of the diff:
     "page_size": 4096,
     "bitmap_encoding": "roaring",
     "pages_to_copy": "OzAAAAEAAB8ACAAAAAEACQADACgAAAA6AAkAZAAAAIIAAQCdAAAAqgAKAA==",
-    "pages_to_zero": "OzAAAAEAAD8AAQDAAD8A"
+    "pages_to_discard": "OzAAAAEAAD8AAQDAAD8A"
   }
 }
 ```
@@ -235,9 +235,14 @@ Every page of the memory file is in exactly one of three classes:
 
 - **to copy** (`pages_to_copy`): its content is in the memfd; copy it from there
   into the file at the same offset.
-- **to zero** (`pages_to_zero`): it must read as zero in the file you produce.
-  How you get there is up to you: write zeros, punch a hole in a fresh full
-  file, skip a range your storage already knows to be zero.
+- **to discard** (`pages_to_discard`): the guest discarded it (balloon, free
+  page reporting, virtio-mem unplug) and now reads it as zero. The recommended
+  action is to make it read as zero in the file you produce — write zeros, punch
+  a hole in a fresh full file, or skip a range your storage already knows to be
+  zero — so the file matches guest memory exactly. You *may* instead leave
+  whatever the page previously held: a well-behaved Linux guest discarded these
+  pages and will zero-initialize them before reading on the next allocation, so
+  the stale content is never observed by the guest.
 - **unchanged** (in neither set): its content did not change since the dirty
   state was last consumed. It is not part of the diff; leave it out. Whatever
   the diff is applied to (the previous memory file, or a fresh zero-filled file
@@ -256,7 +261,7 @@ bytes at file offset `i * page_size`), in the same encoding:
   `roaring` today. Check it and refuse anything else: the field exists so that,
   should a future Firecracker change the binary format, an old backend fails
   cleanly on the name rather than decode garbage.
-- `pages_to_copy` and `pages_to_zero` are each the standard base64 (RFC 4648,
+- `pages_to_copy` and `pages_to_discard` are each the standard base64 (RFC 4648,
   with padding) of a [Roaring bitmap](https://roaringbitmap.org) in the
   [portable serialization format](https://github.com/RoaringBitmap/RoaringFormatSpec),
   32-bit members, each member a page index. The two sets are disjoint and no
@@ -266,7 +271,7 @@ Roaring libraries exist for every mainstream language (CRoaring, `roaring` for
 Rust and Go, RoaringBitmap for Java, `pyroaring`); deserialize the two strings
 and you have sets with constant-time membership and ordered iteration. In the
 example, `pages_to_copy` decodes to pages 0–1, 9–12, 40, 58–67, 100, 130–131,
-157 and 170–180, and `pages_to_zero` to pages 192–255, the unplugged slot.
+157 and 170–180, and `pages_to_discard` to pages 192–255, the unplugged slot.
 
 The classification relies on `mincore` being accurate, with or without dirty
 tracking; **swap must be disabled** for the API to return correct information.
@@ -282,7 +287,7 @@ than punching holes when merging a diff, and when producing a diff file for
 A backend that stores memory in chunks (512 KiB, 2 MiB, ...) applies a response
 chunk by chunk. When using 2M hugetlbfs, with chunks aligned to and no larger
 than 2 MiB, a chunk with a page in either set can be read whole from the memfd,
-and a chunk with a page in `pages_to_zero` can simply be zero-filled. For all
+and a chunk with a page in `pages_to_discard` can simply be zero-filled. For all
 other configurations, the changes need to be applied on top of the previous
 version of the chunk.
 
@@ -310,7 +315,7 @@ The request has no parameters; the body may be empty or `{}`. The response is
     "page_size": 4096,
     "bitmap_encoding": "roaring",
     "pages_to_copy": "OzAAAAEAAAoAAwAAAAEAQAAHAGQAAAA=",
-    "pages_to_zero": "OzAAAAEAAD8AAQDAAD8A"
+    "pages_to_discard": "OzAAAAEAAD8AAQDAAD8A"
   }
 }
 ```
@@ -331,11 +336,12 @@ simple rules. These rules cannot be enforced by Firecracker.
 
 - The `pages_to_copy` returned by the `/snapshot/dirty-pages` and
   `/snapshot/create` APIs must be eventually copied into the snapshot, and the
-  `pages_to_zero` must read as zero in it. Responses must be applied in the
-  order they were received: a page zeroed by one response and copied by the next
-  would otherwise end up zero, with nothing left to correct it. Applying them
-  late is fine; the memfd may hold a newer value by then, and the write that
-  made it newer is in a later response
+  `pages_to_discard` should read as zero in it (or keep their previous content,
+  if the file is only ever read back by the guest). Responses must be applied
+  in the order they were received: a page discarded by one response and copied
+  by the next would otherwise end up zeroed, with nothing left to correct it.
+  Applying them late is fine; the memfd may hold a newer value by then, and the
+  write that made it newer is in a later response
 - If a response is lost (e.g. connection dropped before the body was read), that
   dirty information is gone and the next snapshot must be a `Full` snapshot,
   which Firecracker writes itself
@@ -349,18 +355,18 @@ As an example, without pre-copy, the snapshot process would be something like:
 
 1. Pause the VM
 1. Call `/snapshot/create`
-1. Copy `pages_to_copy` into a new file, zero `pages_to_zero`
+1. Copy `pages_to_copy` into a new file, zero `pages_to_discard`
 1. VM can be resumed here
 
 For a backend that implements pre-copy:
 
 1. Call `/snapshot/dirty-pages`
-1. Copy `pages_to_copy` into a file, zero `pages_to_zero`
+1. Copy `pages_to_copy` into a file, zero `pages_to_discard`
 1. Repeat from step 1 until the dirty set is small enough or after a timeout or
    iterations limit
 1. Pause the VM
 1. Call `/snapshot/create`
-1. Final copy of `pages_to_copy`, final zeroing of `pages_to_zero`
+1. Final copy of `pages_to_copy`, final zeroing of `pages_to_discard`
 1. VM can be resumed here
 
 Note: the pre-copy algorithm only makes sense with dirty tracking enabled.

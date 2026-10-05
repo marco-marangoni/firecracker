@@ -78,7 +78,7 @@ pub struct SnapshotMemoryLayout {
     /// offset / `page_size`) to copy from the memfd.
     pub pages_to_copy: String,
     /// Same encoding: the page indices that must read as zero in the memory file.
-    pub pages_to_zero: String,
+    pub pages_to_discard: String,
 }
 
 fn default_bitmap_encoding() -> String {
@@ -177,7 +177,7 @@ impl SnapshotMemoryLayout {
             Ok(set)
         };
         let authoritative = decode("pages_to_copy", &self.pages_to_copy)?;
-        let zero = decode("pages_to_zero", &self.pages_to_zero)?;
+        let zero = decode("pages_to_discard", &self.pages_to_discard)?;
         if !(&authoritative & &zero).is_empty() {
             return Err(invalid("a page is both authoritative and zero".into()));
         }
@@ -267,7 +267,7 @@ pub enum ControlResponse {
     Done {
         success: bool,
         message: String,
-        /// Bytes zeroed in the target without reading guest memory (`pages_to_zero`). Lets an
+        /// Bytes zeroed in the target without reading guest memory (`pages_to_discard`). Lets an
         /// orchestrator observe the saving.
         zeroed_bytes: u64,
         /// Bytes copied from the memfd (`pages_to_copy`).
@@ -443,7 +443,7 @@ impl UffdHandler {
     /// Handles a uffd `remove` event for `[start, end)`: Firecracker has discarded the range
     /// (balloon, virtio-mem), so it now reads as zero. The range is unregistered, after which the
     /// kernel serves zero pages for it without us. Nothing else to record: the discard is in the
-    /// next snapshot response as `pages_to_zero`, and the registration itself is the record of
+    /// next snapshot response as `pages_to_discard`, and the registration itself is the record of
     /// which holes still read as the snapshot file (registered: never served) and which as zero
     /// (unregistered), should a backend ever need to tell them apart.
     ///
@@ -1123,7 +1123,7 @@ mod tests {
             page_size: 4096,
             bitmap_encoding: "roaring".to_string(),
             pages_to_copy: roaring_b64(authoritative.iter().copied()),
-            pages_to_zero: roaring_b64(zero.iter().copied()),
+            pages_to_discard: roaring_b64(zero.iter().copied()),
         }
     }
 
@@ -1178,7 +1178,7 @@ mod tests {
             page_size: 4096,
             bitmap_encoding: "roaring".to_string(),
             pages_to_copy: "OjAAAAEAAAAAAAIAEAAAAAAAAQAMAA==".to_string(),
-            pages_to_zero: "OjAAAAEAAAAAAAMAEAAAAAgACQAKAAsA".to_string(),
+            pages_to_discard: "OjAAAAEAAAAAAAMAEAAAAAgACQAKAAsA".to_string(),
         };
         assert_eq!(
             runs(&doc),
@@ -1191,7 +1191,7 @@ mod tests {
         assert_eq!(decoded.class(15 * 4096), Unchanged);
         // The encoding field defaults when absent.
         let no_encoding: SnapshotMemoryLayout = serde_json::from_str(
-            r#"{"total_size":65536,"page_size":4096,"pages_to_copy":"OjAAAAEAAAAAAAIAEAAAAAAAAQAMAA==","pages_to_zero":"OjAAAAEAAAAAAAMAEAAAAAgACQAKAAsA"}"#,
+            r#"{"total_size":65536,"page_size":4096,"pages_to_copy":"OjAAAAEAAAAAAAIAEAAAAAAAAQAMAA==","pages_to_discard":"OjAAAAEAAAAAAAMAEAAAAAgACQAKAAsA"}"#,
         )
         .unwrap();
         assert_eq!(runs(&no_encoding), runs(&doc));
@@ -1228,16 +1228,16 @@ mod tests {
         bad.pages_to_copy = roaring_b64([1]);
         bad.decode().unwrap_err();
         let mut bad = layout(4, &[0], &[]);
-        bad.pages_to_zero = roaring_b64([0]);
+        bad.pages_to_discard = roaring_b64([0]);
         bad.decode().unwrap_err();
         let mut bad = layout(4, &[0], &[]);
         bad.bitmap_encoding = "packbits".to_string();
         bad.decode().unwrap_err();
         let mut bad = layout(4, &[0], &[]);
-        bad.pages_to_zero = "!!".to_string();
+        bad.pages_to_discard = "!!".to_string();
         bad.decode().unwrap_err();
         let mut bad = layout(4, &[0], &[]);
-        bad.pages_to_zero = base64_encode(&[1, 2, 3]);
+        bad.pages_to_discard = base64_encode(&[1, 2, 3]);
         bad.decode().unwrap_err();
     }
 

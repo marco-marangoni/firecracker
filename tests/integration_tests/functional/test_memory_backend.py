@@ -150,9 +150,9 @@ def authoritative_bytes(memory):
     return len(pages(memory, "pages_to_copy")) * memory["page_size"]
 
 
-def zero_bytes(memory):
+def discard_bytes(memory):
     """Bytes the backend must zero."""
-    return len(pages(memory, "pages_to_zero")) * memory["page_size"]
+    return len(pages(memory, "pages_to_discard")) * memory["page_size"]
 
 
 def is_authoritative(memory, offset):
@@ -162,7 +162,7 @@ def is_authoritative(memory, offset):
 
 def is_zero(memory, offset):
     """Whether the page at `offset` is to be zeroed."""
-    return offset // memory["page_size"] in pages(memory, "pages_to_zero")
+    return offset // memory["page_size"] in pages(memory, "pages_to_discard")
 
 
 def class_bytes_in(memory, offset, length):
@@ -171,7 +171,7 @@ def class_bytes_in(memory, offset, length):
     window = set(range(offset // page_size, (offset + length) // page_size))
     return (
         len(pages(memory, "pages_to_copy") & window) * page_size,
-        len(pages(memory, "pages_to_zero") & window) * page_size,
+        len(pages(memory, "pages_to_discard") & window) * page_size,
     )
 
 
@@ -181,7 +181,7 @@ def check_layout(memory, total_size):
     assert memory["page_size"] == PAGE_SIZE
     assert memory["bitmap_encoding"] == "roaring"
     authoritative = pages(memory, "pages_to_copy")
-    zero = pages(memory, "pages_to_zero")
+    zero = pages(memory, "pages_to_discard")
     # Within the file, and disjoint.
     assert all(p < total_size // PAGE_SIZE for p in authoritative | zero)
     assert not authoritative & zero
@@ -239,7 +239,7 @@ def test_boot_diff_snapshot_restores(uvm, microvm_factory, huge_pages):
     # unchanged (zero since boot), and nothing was discarded, so nothing is zero.
     authoritative = authoritative_bytes(memory)
     assert 32 * 2**20 <= authoritative < MEM_SIZE_MIB * 2**20, authoritative
-    assert zero_bytes(memory) == 0
+    assert discard_bytes(memory) == 0
     assert copied_bytes(vm) == authoritative
     assert zeroed_bytes(vm) == 0
     # Firecracker's own Full of the same state, written through its mapping.
@@ -273,7 +273,7 @@ def test_diff_self_consistency(uvm, huge_pages):
     diff = vm.snapshot_diff(mem_path="mem_diff")
     diff_memory = vm.last_snapshot_memory
     check_layout(diff_memory, MEM_SIZE_MIB * 2**20)
-    dirty_bytes = authoritative_bytes(diff_memory) + zero_bytes(diff_memory)
+    dirty_bytes = authoritative_bytes(diff_memory) + discard_bytes(diff_memory)
     # The workload dirtied at least what it wrote, and not everything.
     assert 64 * 2**20 <= dirty_bytes < MEM_SIZE_MIB * 2**20
     assert diff.mem.stat().st_size == MEM_SIZE_MIB * 2**20
@@ -368,11 +368,11 @@ def test_dirty_pages_are_consumed(uvm):
     # Only the virtqueue pages, re-marked after every reset so that they are part of the next
     # set, remain. They are faulted in when marked, so they are authoritative, never zero.
     assert authoritative_bytes(second) < 2**20
-    assert zero_bytes(second) == 0
+    assert discard_bytes(second) == 0
     # On the wire, a nearly empty set is a few hundred bytes (2 per page), not 32 KiB per GiB,
     # and an empty one is the 8-byte header.
     assert wire_bytes(second, "pages_to_copy") < 1024
-    assert wire_bytes(second, "pages_to_zero") == 8
+    assert wire_bytes(second, "pages_to_discard") == 8
     third = vm.dirty_pages()
     assert second["pages_to_copy"] == third["pages_to_copy"]
     # Unknown fields in the body are rejected without consuming anything; `{}` is fine.
@@ -582,7 +582,7 @@ def test_virtio_mem_unplugged_slots(uvm, microvm_factory):
     snapshot = vm.snapshot_diff(mem_path="mem_unplugged")
     memory = vm.last_snapshot_memory
     check_layout(memory, total_size)
-    assert wire_bytes(memory, "pages_to_zero") == 25
+    assert wire_bytes(memory, "pages_to_discard") == 25
     assert wire_bytes(memory, "pages_to_copy") < MEM_SIZE_MIB * 2**20 // PAGE_SIZE // 8
     authoritative, zero = class_bytes_in(memory, MEM_SIZE_MIB * 2**20, 512 * 2**20)
     assert authoritative == 0
@@ -600,7 +600,7 @@ def test_virtio_mem_unplugged_slots(uvm, microvm_factory):
     memory = vm.dirty_pages(copy_to="mem_unplugged")
     check_layout(memory, total_size)
     assert authoritative_bytes(memory) < 16 * 2**20
-    assert zero_bytes(memory) == 512 * 2**20
+    assert discard_bytes(memory) == 512 * 2**20
 
     # Plug one slot's worth and make the guest use it: what the guest touched in that slot is
     # authoritative, the rest of it unchanged (zero since boot), the unplugged rest zero pages.
@@ -738,11 +738,12 @@ def check_diff_identity_across_inflate(vm, base, amount_mib, min_zeroed_mib):
     diff_memory = vm.last_snapshot_memory
     check_layout(diff_memory, MEM_SIZE_MIB * 2**20)
     assert (
-        authoritative_bytes(diff_memory) + zero_bytes(diff_memory) >= amount_mib * 2**20
+        authoritative_bytes(diff_memory) + discard_bytes(diff_memory)
+        >= amount_mib * 2**20
     )
     zeroed = zeroed_bytes(vm)
     assert zeroed >= min_zeroed_mib * 2**20, zeroed
-    assert zeroed == zero_bytes(diff_memory)
+    assert zeroed == discard_bytes(diff_memory)
     # The Full right after is Firecracker's own: released pages are unregistered from the uffd
     # and read as zero through its mapping, whatever the base has there.
     full = vm.snapshot_full(mem_path="mem_full", vmstate_path="vmstate_full")
@@ -889,7 +890,7 @@ def test_diff_mincore_self_consistency(uvm):
     check_layout(diff_memory, MEM_SIZE_MIB * 2**20)
     # With mincore as the dirty source, dirty ⇒ resident: nothing can be zero.
     assert authoritative_bytes(diff_memory) >= 64 * 2**20
-    assert zero_bytes(diff_memory) == 0
+    assert discard_bytes(diff_memory) == 0
 
     full = vm.snapshot_full(mem_path="mem_full", vmstate_path="vmstate_full")
     rebased = diff.rebase_snapshot(base)
@@ -916,7 +917,7 @@ def test_two_dram_regions(uvm, microvm_factory):
     # Both regions are plugged and adjacent in file space; the second region (past the 32-bit
     # gap, from 3 GiB of file offset on) has authoritative pages since the guest touched some
     # of it, and nothing was discarded so nothing is zero.
-    assert zero_bytes(memory) == 0
+    assert discard_bytes(memory) == 0
     authoritative, _ = class_bytes_in(memory, 3 * 2**30, (mem_size_mib - 3072) * 2**20)
     assert authoritative > 0
     assert snapshot.mem.stat().st_size == mem_size_mib * 2**20
@@ -957,11 +958,11 @@ def test_snapshot_right_after_restore(uvm, microvm_factory, snapshot_type):
     if snapshot_type == SnapshotType.DIFF:
         diff = vm.snapshot_diff(mem_path="mem_diff")
         memory = vm.last_snapshot_memory
-        dirty = authoritative_bytes(memory) + zero_bytes(memory)
+        dirty = authoritative_bytes(memory) + discard_bytes(memory)
         # A handful of pages, not nothing and not everything; all of them were written (by the
         # restore) so all are resident: authoritative.
         assert 0 < dirty <= 2**20, dirty
-        assert zero_bytes(memory) == 0
+        assert discard_bytes(memory) == 0
         full = vm.snapshot_full(mem_path="mem_full", vmstate_path="vmstate_full")
         assert filecmp.cmp(diff.rebase_snapshot(base).mem, full.mem, shallow=False)
     else:
