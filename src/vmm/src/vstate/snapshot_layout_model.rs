@@ -139,6 +139,14 @@ pub struct Page {
     /// host-page bitmap is carried. Set by a balloon release, a virtio-mem unplug, or a
     /// zero-written hugetlbfs edge.
     pub discarded_block: bool,
+    /// The guest kernel freed this page (balloon, free page reporting) or it is unplugged, and
+    /// has not written it since. A well-behaved Linux guest will zero-initialize such a page on
+    /// its next allocation before reading it (`__GFP_ZERO`), so its content before that write is
+    /// don't-care *to the guest*. Set by [`State::discard`]/`discard_edge`/`unplug`, cleared by
+    /// any guest or device write to the page and by `plug`. Only used to state the guarantee a
+    /// backend that keeps old content in discarded ranges still gives
+    /// ([`State::file_matches_guest_reads`]); not something Firecracker observes.
+    pub guest_discarded: bool,
     /// Marked ahead of a write by a device; an unmarked write may follow.
     pub armed: bool,
     /// A virtqueue page: re-marked (and faulted in) after every snapshot.
@@ -279,6 +287,7 @@ impl State {
                 kvm_marked: false,
                 fc_marked: false,
                 discarded_block: false,
+                guest_discarded: false,
                 armed: false,
                 ring: false,
                 unplugged: false,
@@ -317,6 +326,7 @@ impl State {
         self.fault_in(p);
         self.pages[p].memfd = Memfd::Present(v);
         self.pages[p].kvm_marked = true;
+        self.pages[p].guest_discarded = false;
     }
 
     /// A device marks page `p` dirty before it writes it (virtqueue ring, RX buffer).
@@ -334,6 +344,7 @@ impl State {
         }
         self.fault_in(p);
         self.pages[p].memfd = Memfd::Present(v);
+        self.pages[p].guest_discarded = false;
     }
 
     /// A device writes `v` to page `p` and marks it afterwards (block I/O completion).
@@ -344,6 +355,7 @@ impl State {
         self.fault_in(p);
         self.pages[p].memfd = Memfd::Present(v);
         self.pages[p].fc_marked = true;
+        self.pages[p].guest_discarded = false;
     }
 
     /// The balloon or free page reporting releases the backing page containing `p`:
@@ -357,6 +369,7 @@ impl State {
             if self.same_backing_page(p, q) {
                 self.pages[q].memfd = Memfd::Hole(HoleReads::Zero);
                 self.pages[q].discarded_block = true;
+                self.pages[q].guest_discarded = true;
             }
         }
     }
@@ -383,13 +396,17 @@ impl State {
                 let page = &mut self.pages[q];
                 page.memfd = Memfd::Hole(HoleReads::Zero);
                 page.discarded_block = true;
+                page.guest_discarded = true;
                 page.armed = false;
                 page.unplugged = true;
             }
         }
     }
 
-    /// virtio-mem plugs the slot containing `p` back: accessible again, still a zero hole.
+    /// virtio-mem plugs the slot containing `p` back: accessible again, still a zero hole. The
+    /// page stays "guest will initialize before reading": freshly plugged virtio-mem memory is
+    /// onlined and zeroed by the guest before use, exactly like reallocated discarded memory, so
+    /// its file content remains don't-care until a real write clears `guest_discarded`.
     pub fn plug(&mut self, p: usize) {
         for q in 0..PAGES {
             if self.same_backing_page(p, q) {
@@ -540,6 +557,7 @@ impl State {
             page.kvm_marked = false;
             page.fc_marked = false;
             page.discarded_block = false;
+            page.guest_discarded = false;
             page.armed = false;
         }
         self.arm_rings();
@@ -577,6 +595,35 @@ impl State {
                 self.pages[p].file = 0;
             }
         }
+    }
+
+    /// The backend applies one layout but, instead of zeroing the `zero` pages, leaves their
+    /// previous file content in place (a backend that treats `pages_to_discard` as "don't care"
+    /// rather than "must be zero"). Authoritative pages are still copied.
+    pub fn apply_layout_keep_discarded(&mut self, layout: Layout) {
+        for p in 0..PAGES {
+            if layout.authoritative[p] {
+                self.pages[p].file = match self.pages[p].memfd {
+                    Memfd::Present(v) => v,
+                    Memfd::Hole(_) => 0,
+                };
+            }
+            // `zero` pages: left as-is on purpose.
+        }
+    }
+
+    /// The guest cannot tell the difference: `file` matches guest memory on every page the guest
+    /// may read before writing. A page the guest discarded (balloon, free page reporting) or that
+    /// is unplugged is excluded — a well-behaved Linux guest zero-initializes it on its next
+    /// allocation before reading, so whatever stale content the file holds there is never
+    /// observed. This is the guarantee a backend keeps when it leaves old content in
+    /// `pages_to_discard` rather than zeroing. Note it is strictly weaker than
+    /// [`Self::file_matches_guest`]: the files are *not* byte-identical, so a consumer that reads
+    /// those bytes directly (`rebase-snap`, a diff merge) is not covered.
+    pub fn file_matches_guest_reads(&self) -> bool {
+        self.pages
+            .iter()
+            .all(|page| page.file == page.guest() || page.guest_discarded)
     }
 
     /// What `pread` on the memfd, or the backend's own mapping of it, returns for page `p`: the
@@ -665,6 +712,16 @@ impl State {
     /// The backend catches up with everything it was handed.
     pub fn apply_all(&mut self) {
         while self.apply_oldest() {}
+    }
+
+    /// Catch up with everything, but leave old content in the discarded (`zero`) pages instead of
+    /// zeroing them (a backend that treats `pages_to_discard` as don't-care).
+    pub fn apply_all_keep_discarded(&mut self) {
+        while let Some(layout) = self.pending[0] {
+            self.pending.rotate_left(1);
+            self.pending[MAX_PENDING - 1] = None;
+            self.apply_layout_keep_discarded(layout);
+        }
     }
 
     /// Whether some pending layout classifies page `p` (as authoritative or zero).
@@ -774,7 +831,7 @@ pub fn real_layout(dirty: &[bool; PAGES], resident: &[bool; PAGES]) -> Layout {
     );
     Layout {
         authoritative: std::array::from_fn(|p| layout.page_is_authoritative(p as u64 * 4096)),
-        zero: std::array::from_fn(|p| layout.page_is_zero(p as u64 * 4096)),
+        zero: std::array::from_fn(|p| layout.page_is_discarded(p as u64 * 4096)),
     }
 }
 
@@ -795,6 +852,7 @@ mod verification {
             kvm_marked: kani::any(),
             fc_marked: kani::any(),
             discarded_block: kani::any(),
+            guest_discarded: kani::any(),
             armed: kani::any(),
             ring: kani::any(),
             unplugged: kani::any(),
@@ -989,7 +1047,7 @@ mod verification {
     }
 
     /// Keeping a discard bitmap that does not need `track_dirty_pages` fixes it: with dirty
-    /// tracking off, `dirty := resident ∨ discarded`, so a discarded page lands in `pages_to_zero`
+    /// tracking off, `dirty := resident ∨ discarded`, so a discarded page lands in `pages_to_discard`
     /// and is corrected, while every changed page is resident and copied. From a restored state
     /// after an arbitrary run of guest writes, device writes, discards and unplugs, a paused
     /// snapshot applied by the backend yields guest memory. The write record still needs KVM (a
@@ -1081,6 +1139,60 @@ mod verification {
         s.snapshot_zeroing_whole_discarded_block();
         s.apply_all();
         assert!(s.file_matches_guest());
+    }
+
+    /// A backend that leaves old content in `pages_to_discard` instead of zeroing still gives the
+    /// guest a correct view: after a paused snapshot applied that way, `file` matches guest memory
+    /// on every page the guest may read before writing. The only pages that may differ are ones
+    /// the guest discarded (balloon, free page reporting) or unplugged — which a well-behaved
+    /// Linux guest zero-initializes before reading on its next allocation. Proven over an
+    /// arbitrary run of guest writes, device writes, discards, unplugs and re-plugs, with and
+    /// without dirty tracking.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn keeping_discarded_content_is_invisible_to_the_guest() {
+        let base: [u8; PAGES] = kani::any();
+        let mut s = State::restored(base, kani::any(), kani::any());
+        s.dirty_tracking = kani::any();
+        for p in 0..PAGES {
+            s.pages[p].file = s.pages[p].base;
+        }
+        for _ in 0..3 {
+            let p = any_index();
+            match kani::any::<u8>() % 6 {
+                0 => s.guest_write(p, kani::any()),
+                1 => s.device_mark_ahead(p),
+                2 => s.device_write_armed(p, kani::any()),
+                3 => s.discard(p),
+                4 => s.unplug(p),
+                _ => s.plug(p),
+            }
+        }
+        s.snapshot(Race::default());
+        s.apply_all_keep_discarded();
+        assert!(s.file_matches_guest_reads());
+    }
+
+    /// The honest companion: leaving old content does *not* make the file byte-identical to guest
+    /// memory. There is a reachable state where a discarded page the guest reads as zero holds
+    /// non-zero content in a keep-discarded file — so this is safe only for a guest that
+    /// re-initializes, never for `rebase-snap` or a diff merge that reads the bytes.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    #[kani::should_panic]
+    fn keeping_discarded_content_differs_from_guest_memory() {
+        let base: [u8; PAGES] = kani::any();
+        let mut s = State::restored(base, [false; PAGES], false);
+        for p in 0..PAGES {
+            s.pages[p].file = s.pages[p].base;
+        }
+        s.guest_write(0, 7); // page 0 now holds 7, in the file after the first diff
+        s.snapshot(Race::default());
+        s.apply_all();
+        s.discard(0); // the guest frees page 0: reads zero, but the file still holds 7
+        s.snapshot(Race::default());
+        s.apply_all_keep_discarded();
+        assert!(s.file_matches_guest()); // fails: file[0] == 7, guest reads 0
     }
 
     /// Why Firecracker writes `Full` snapshots itself. First, a `Full` assembled from the memfd

@@ -1569,12 +1569,14 @@ definitions:
     description: >-
       Which pages of the shared guest memory a diff snapshot consists of, and where their
       content is. Pages in `pages_to_copy` are copied from the memfd into the memory
-      file at the same offset; pages in `pages_to_zero` must read as zero in the memory file; every
-      other page is unchanged and not part of the diff. The memory file is `total_size` bytes
-      long. Both sets are Roaring bitmaps of page indices in the portable serialization format,
-      base64-encoded: an idle guest, a released balloon and an unplugged virtio-mem region of any
-      size cost a few bytes each, a dense dirty set at most 8 KiB per 65536 pages, and membership
-      of any page can be tested in constant time.
+      file at the same offset; pages in `pages_to_discard` were discarded by the guest and now
+      read as zero (the backend should zero them in the memory file, but may leave their previous
+      content — see the field description); every other page is unchanged and not part of the
+      diff. The memory file is `total_size` bytes long. Both sets are Roaring bitmaps of page
+      indices in the portable serialization format, base64-encoded: an idle guest, a released
+      balloon and an unplugged virtio-mem region of any size cost a few bytes each, a dense dirty
+      set at most 8 KiB per 65536 pages, and membership of any page can be tested in constant
+      time.
     required:
       - memory
     properties:
@@ -1591,7 +1593,7 @@ definitions:
           - page_size
           - bitmap_encoding
           - pages_to_copy
-          - pages_to_zero
+          - pages_to_discard
         properties:
           total_size:
             type: integer
@@ -1621,14 +1623,20 @@ definitions:
               page's content is in the memfd and must be copied. These are the pages written
               since the dirty tracking state was last consumed that are resident in Firecracker's
               mapping.
-          pages_to_zero:
+          pages_to_discard:
             type: string
             format: byte
             description: >-
-              Same encoding. A member page must read as zero in the memory file: it was written
-              or discarded since the dirty state was last consumed and is not resident any more
-              (released by the balloon or free page reporting, or part of an unplugged virtio-mem
-              slot). Disjoint from `pages_to_copy`.
+              Same encoding. A member page was discarded by the guest since the dirty state was
+              last consumed and is not resident any more (released by the balloon or free page
+              reporting, or part of an unplugged virtio-mem slot). It now reads as zero to the
+              guest. The backend is recommended to zero these pages in the memory file so the file
+              matches guest memory exactly; it may instead leave their previous content, which is
+              safe with a well-behaved Linux guest because the guest discarded the pages and will
+              re-initialize (zero) them before reading on the next allocation. Do not leave old
+              content if the memory file is consumed by anything that reads these bytes directly
+              (`rebase-snap`, a diff merge, a byte-for-byte comparison). Disjoint from
+              `pages_to_copy`.
 
   Metrics:
     type: object

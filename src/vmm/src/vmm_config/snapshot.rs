@@ -246,7 +246,7 @@ pub struct SnapshotMemoryLayout {
     /// The pages that must read as zero in the file. Disjoint from `pages_to_copy`.
     /// Serialised as standard, padded base64 of the Roaring portable format.
     #[serde(with = "roaring_base64")]
-    pub pages_to_zero: RoaringBitmap,
+    pub pages_to_discard: RoaringBitmap,
 }
 
 /// Wire encoding of the bitmaps of a [`SnapshotMemoryLayout`].
@@ -267,7 +267,7 @@ impl SnapshotMemoryLayout {
             page_size,
             bitmap_encoding: BitmapEncoding::Roaring,
             pages_to_copy: RoaringBitmap::new(),
-            pages_to_zero: RoaringBitmap::new(),
+            pages_to_discard: RoaringBitmap::new(),
         }
     }
 
@@ -282,8 +282,8 @@ impl SnapshotMemoryLayout {
     }
 
     /// Whether the page at file offset `offset` is to be zeroed.
-    pub fn page_is_zero(&self, offset: u64) -> bool {
-        self.pages_to_zero.contains(self.page(offset))
+    pub fn page_is_discarded(&self, offset: u64) -> bool {
+        self.pages_to_discard.contains(self.page(offset))
     }
 
     /// Marks the page at file offset `offset` authoritative.
@@ -293,9 +293,9 @@ impl SnapshotMemoryLayout {
     }
 
     /// Marks the page at file offset `offset` zero.
-    pub fn set_zero(&mut self, offset: u64) {
+    pub fn set_discarded(&mut self, offset: u64) {
         let page = self.page(offset);
-        self.pages_to_zero.insert(page);
+        self.pages_to_discard.insert(page);
     }
 
     /// Builds the layout from the sets of `dirty` and `resident` pages (page indices):
@@ -316,7 +316,7 @@ impl SnapshotMemoryLayout {
             page_size,
             bitmap_encoding: BitmapEncoding::Roaring,
             pages_to_copy: authoritative,
-            pages_to_zero: zero,
+            pages_to_discard: zero,
         }
     }
 
@@ -326,8 +326,8 @@ impl SnapshotMemoryLayout {
     }
 
     /// Bytes to zero.
-    pub fn zero_bytes(&self) -> u64 {
-        self.pages_to_zero.len() * self.page_size
+    pub fn discard_bytes(&self) -> u64 {
+        self.pages_to_discard.len() * self.page_size
     }
 }
 
@@ -382,11 +382,11 @@ mod tests {
     fn test_snapshot_memory_layout_bits() {
         let mut layout = SnapshotMemoryLayout::new(16 * 4096, 4096);
         assert!(layout.pages_to_copy.is_empty());
-        assert!(layout.pages_to_zero.is_empty());
+        assert!(layout.pages_to_discard.is_empty());
         assert_eq!(layout.authoritative_pages(), 0);
-        assert_eq!(layout.zero_bytes(), 0);
+        assert_eq!(layout.discard_bytes(), 0);
         assert!(!layout.page_is_authoritative(0));
-        assert!(!layout.page_is_zero(0));
+        assert!(!layout.page_is_discarded(0));
 
         layout.set_authoritative(0);
         layout.set_authoritative(12 * 4096);
@@ -397,13 +397,13 @@ mod tests {
         assert!(!layout.page_is_authoritative(1 << 40));
         assert_eq!(layout.authoritative_pages(), 2);
 
-        layout.set_zero(8 * 4096);
-        layout.set_zero(9 * 4096);
-        assert_eq!(pages(&layout.pages_to_zero), vec![8, 9]);
-        assert!(layout.page_is_zero(8 * 4096));
-        assert!(layout.page_is_zero(9 * 4096));
-        assert!(!layout.page_is_zero(10 * 4096));
-        assert_eq!(layout.zero_bytes(), 2 * 4096);
+        layout.set_discarded(8 * 4096);
+        layout.set_discarded(9 * 4096);
+        assert_eq!(pages(&layout.pages_to_discard), vec![8, 9]);
+        assert!(layout.page_is_discarded(8 * 4096));
+        assert!(layout.page_is_discarded(9 * 4096));
+        assert!(!layout.page_is_discarded(10 * 4096));
+        assert_eq!(layout.discard_bytes(), 2 * 4096);
     }
 
     #[test]
@@ -421,19 +421,19 @@ mod tests {
         let layout = SnapshotMemoryLayout::classify(20 * 4096, 4096, &dirty, &resident);
         assert_eq!(pages(&layout.pages_to_copy), vec![0, 1]);
         assert_eq!(
-            pages(&layout.pages_to_zero),
+            pages(&layout.pages_to_discard),
             vec![3, 8, 9, 10, 11, 12, 13, 14, 15]
         );
         assert_eq!(layout.authoritative_pages(), 2);
-        assert_eq!(layout.zero_bytes(), 9 * 4096);
-        assert!((&layout.pages_to_copy & &layout.pages_to_zero).is_empty());
+        assert_eq!(layout.discard_bytes(), 9 * 4096);
+        assert!((&layout.pages_to_copy & &layout.pages_to_discard).is_empty());
         assert_eq!(layout, {
             let mut expected = SnapshotMemoryLayout::new(20 * 4096, 4096);
             expected.set_authoritative(0);
             expected.set_authoritative(4096);
-            expected.set_zero(3 * 4096);
+            expected.set_discarded(3 * 4096);
             for p in 8..16 {
-                expected.set_zero(p * 4096);
+                expected.set_discarded(p * 4096);
             }
             expected
         });
@@ -449,12 +449,12 @@ mod tests {
         layout.set_authoritative(4096);
         layout.set_authoritative(12 * 4096);
         for page in 8..12 {
-            layout.set_zero(page * 4096);
+            layout.set_discarded(page * 4096);
         }
         let json = serde_json::to_string(&layout).unwrap();
         assert_eq!(
             json,
-            r#"{"total_size":65536,"page_size":4096,"bitmap_encoding":"roaring","pages_to_copy":"OjAAAAEAAAAAAAIAEAAAAAAAAQAMAA==","pages_to_zero":"OjAAAAEAAAAAAAMAEAAAAAgACQAKAAsA"}"#
+            r#"{"total_size":65536,"page_size":4096,"bitmap_encoding":"roaring","pages_to_copy":"OjAAAAEAAAAAAAIAEAAAAAAAAQAMAA==","pages_to_discard":"OjAAAAEAAAAAAAMAEAAAAAgACQAKAAsA"}"#
         );
         let back: SnapshotMemoryLayout = serde_json::from_str(&json).unwrap();
         assert_eq!(back, layout);
@@ -474,9 +474,9 @@ mod tests {
         let layout =
             SnapshotMemoryLayout::classify(1 << 30, 4096, &unplugged, &RoaringBitmap::new());
         assert!(
-            layout.pages_to_zero.serialized_size() < 64,
+            layout.pages_to_discard.serialized_size() < 64,
             "{}",
-            layout.pages_to_zero.serialized_size()
+            layout.pages_to_discard.serialized_size()
         );
 
         let response = SnapshotMemoryResponse {
@@ -493,15 +493,15 @@ mod tests {
         // Invalid base64 or Roaring is rejected, in either bitmap; an unknown encoding too;
         // the encoding field defaults.
         for bad in [
-            r#"{"total_size":4096,"page_size":4096,"bitmap_encoding":"roaring","pages_to_copy":"!!","pages_to_zero":"OjAAAAAAAAA="}"#,
-            r#"{"total_size":4096,"page_size":4096,"bitmap_encoding":"roaring","pages_to_copy":"OjAAAAAAAAA=","pages_to_zero":"!!"}"#,
-            r#"{"total_size":4096,"page_size":4096,"bitmap_encoding":"roaring","pages_to_copy":"AQ==","pages_to_zero":"OjAAAAAAAAA="}"#,
-            r#"{"total_size":4096,"page_size":4096,"bitmap_encoding":"packbits","pages_to_copy":"OjAAAAAAAAA=","pages_to_zero":"OjAAAAAAAAA="}"#,
+            r#"{"total_size":4096,"page_size":4096,"bitmap_encoding":"roaring","pages_to_copy":"!!","pages_to_discard":"OjAAAAAAAAA="}"#,
+            r#"{"total_size":4096,"page_size":4096,"bitmap_encoding":"roaring","pages_to_copy":"OjAAAAAAAAA=","pages_to_discard":"!!"}"#,
+            r#"{"total_size":4096,"page_size":4096,"bitmap_encoding":"roaring","pages_to_copy":"AQ==","pages_to_discard":"OjAAAAAAAAA="}"#,
+            r#"{"total_size":4096,"page_size":4096,"bitmap_encoding":"packbits","pages_to_copy":"OjAAAAAAAAA=","pages_to_discard":"OjAAAAAAAAA="}"#,
         ] {
             serde_json::from_str::<SnapshotMemoryLayout>(bad).unwrap_err();
         }
         let empty: SnapshotMemoryLayout = serde_json::from_str(
-            r#"{"total_size":4096,"page_size":4096,"pages_to_copy":"OjAAAAAAAAA=","pages_to_zero":"OjAAAAAAAAA="}"#,
+            r#"{"total_size":4096,"page_size":4096,"pages_to_copy":"OjAAAAAAAAA=","pages_to_discard":"OjAAAAAAAAA="}"#,
         )
         .unwrap();
         assert_eq!(empty, SnapshotMemoryLayout::new(4096, 4096));

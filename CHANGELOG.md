@@ -22,13 +22,15 @@ and this project adheres to
   additional file descriptor). A `Diff` `PUT /snapshot/create` then takes no
   `mem_file_path` and answers `200 OK` with two sets of pages classifying every
   page of the memory file, as base64-encoded Roaring bitmaps: `pages_to_copy`
-  (copy from the memfd) and `pages_to_zero` (make it read as zero), every other
-  page being unchanged; `Full` snapshots are written by Firecracker as without a
-  backend. The new `PUT /snapshot/dirty-pages` endpoint returns (and resets) the
-  same bitmaps for pre-copy while the guest runs. Firecracker guarantees that a
-  page it reports dirty is either in the memfd or zero (pages it marks dirty
-  ahead of writing are faulted in), so a backend needs no record of its own to
-  produce a diff. See [memory backend](docs/snapshotting/shared-memfd.md).
+  (copy from the memfd) and `pages_to_discard` (discarded by the guest, read as
+  zero; the backend should zero them but may leave their previous content with a
+  well-behaved Linux guest), every other page being unchanged; `Full` snapshots
+  are written by Firecracker as without a backend. The new
+  `PUT /snapshot/dirty-pages` endpoint returns (and resets) the same bitmaps for
+  pre-copy while the guest runs. Firecracker guarantees that a page it reports
+  dirty is either in the memfd or zero (pages it marks dirty ahead of writing
+  are faulted in), so a backend needs no record of its own to produce a diff.
+  See [memory backend](docs/snapshotting/shared-memfd.md).
 
 ### Changed
 

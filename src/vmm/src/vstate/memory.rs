@@ -3500,7 +3500,7 @@ mod tests {
         target.resize(u64_to_usize(layout.total_size), 0);
         for page in 0..target.len() / page_size {
             let offset = page * page_size;
-            if layout.page_is_zero(offset as u64) {
+            if layout.page_is_discarded(offset as u64) {
                 target[offset..offset + page_size].fill(0);
             } else if layout.page_is_authoritative(offset as u64) {
                 memfd
@@ -3526,7 +3526,7 @@ mod tests {
             .filter(|&p| layout.page_is_authoritative(p as u64 * layout.page_size))
             .collect();
         let zero = (0..pages)
-            .filter(|&p| layout.page_is_zero(p as u64 * layout.page_size))
+            .filter(|&p| layout.page_is_discarded(p as u64 * layout.page_size))
             .collect();
         (authoritative, zero)
     }
@@ -3537,9 +3537,9 @@ mod tests {
         // Nothing past the end of the file.
         let pages = u32::try_from(layout.total_size / page_size).unwrap();
         assert!(layout.pages_to_copy.max().is_none_or(|p| p < pages));
-        assert!(layout.pages_to_zero.max().is_none_or(|p| p < pages));
+        assert!(layout.pages_to_discard.max().is_none_or(|p| p < pages));
         // The two classes are disjoint.
-        assert!((&layout.pages_to_copy & &layout.pages_to_zero).is_empty());
+        assert!((&layout.pages_to_copy & &layout.pages_to_discard).is_empty());
     }
 
     /// The test memory: 12 pages, DRAM pages 0..8 (two regions), hotplug pages 8..12 with slots
@@ -3693,11 +3693,11 @@ mod tests {
         assert_layout_well_formed(&layout);
         assert!(layout.pages_to_copy.is_empty());
         assert_eq!(classes(&layout).1, vec![8, 9, 10, 11]);
-        assert_eq!(layout.zero_bytes(), 4 * page_size as u64);
+        assert_eq!(layout.discard_bytes(), 4 * page_size as u64);
         assert!(!hotplug.bitmap().dirty_at(0));
         // On the wire that is one run container: a handful of bytes, and the same for an
         // unplugged region of any size (one container per 65536 pages).
-        assert!(layout.pages_to_zero.serialized_size() < 32);
+        assert!(layout.pages_to_discard.serialized_size() < 32);
 
         // Plug them back: the pages are plugged, dirty from the unplug, and not resident
         // (punched): zero again, now inside a plugged slot.
