@@ -129,8 +129,16 @@ pub struct Page {
     pub file: u8,
     /// KVM's dirty log.
     pub kvm_marked: bool,
-    /// Firecracker's own dirty bitmap.
+    /// Firecracker's own dirty bitmap (device writes; gated by `track_dirty_pages`).
     pub fc_marked: bool,
+    /// The discard record. Modelled per host page, but written and read at *block* granularity
+    /// (`discard_block`): every host page of a block is set or cleared together. This is the
+    /// `dirty_huge_pages` bitmap on hugetlbfs (one bit per 2 MiB), where it is a separate,
+    /// always-on bitmap independent of `track_dirty_pages`; on tmpfs the block is one host page
+    /// and the discard record is simply folded into `dirty_host_pages` (`fc_marked`), so no second
+    /// host-page bitmap is carried. Set by a balloon release, a virtio-mem unplug, or a
+    /// zero-written hugetlbfs edge.
+    pub discarded_block: bool,
     /// Marked ahead of a write by a device; an unmarked write may follow.
     pub armed: bool,
     /// A virtqueue page: re-marked (and faulted in) after every snapshot.
@@ -151,6 +159,11 @@ pub struct State {
     /// Residency is per backing page (a fault populates all of it, a discard frees all of it or
     /// none), and so is what `mincore` reports.
     pub huge: bool,
+    /// Whether KVM's dirty log and Firecracker's bitmap are consulted. When off, the only signal
+    /// is `mincore`, and a diff degrades to `dirty := resident` (see [`Self::read_dirty`]): the
+    /// zero set is then always empty, which is why this mode is unsound once anything is
+    /// discarded (`dirty_tracking_off_breaks_after_discard`).
+    pub dirty_tracking: bool,
 }
 
 /// Model pages per huge page when [`State::huge`] is set. A power of two dividing [`PAGES`].
@@ -200,9 +213,9 @@ impl Page {
         matches!(self.memfd, Memfd::Present(_))
     }
 
-    /// Whether the page is dirty in KVM's log or Firecracker's bitmap.
+    /// Whether the page is dirty in KVM's log, Firecracker's bitmap, or the discard bitmap.
     pub fn marked(&self) -> bool {
-        self.kvm_marked || self.fc_marked
+        self.kvm_marked || self.fc_marked || self.discarded_block
     }
 
     /// A read or write through Firecracker's mapping of a hole: the page becomes present with
@@ -258,12 +271,14 @@ impl State {
         let mut s = Self {
             pending: [None; MAX_PENDING],
             huge,
+            dirty_tracking: true,
             pages: [Page {
                 memfd: Memfd::Hole(HoleReads::Zero),
                 base: 0,
                 file: 0,
                 kvm_marked: false,
                 fc_marked: false,
+                discarded_block: false,
                 armed: false,
                 ring: false,
                 unplugged: false,
@@ -341,7 +356,7 @@ impl State {
         for q in 0..PAGES {
             if self.same_backing_page(p, q) {
                 self.pages[q].memfd = Memfd::Hole(HoleReads::Zero);
-                self.pages[q].fc_marked = true;
+                self.pages[q].discarded_block = true;
             }
         }
     }
@@ -357,7 +372,7 @@ impl State {
             self.fault_in(p);
             self.pages[p].memfd = Memfd::Present(0);
         }
-        self.pages[p].fc_marked = true;
+        self.pages[p].discarded_block = true;
     }
 
     /// virtio-mem unplugs the slot containing `p` (slots are whole backing pages): discarded,
@@ -367,7 +382,7 @@ impl State {
             if self.same_backing_page(p, q) {
                 let page = &mut self.pages[q];
                 page.memfd = Memfd::Hole(HoleReads::Zero);
-                page.fc_marked = true;
+                page.discarded_block = true;
                 page.armed = false;
                 page.unplugged = true;
             }
@@ -391,11 +406,25 @@ impl State {
     }
 
     fn read_dirty(&mut self) -> [bool; PAGES] {
-        // KVM's log (which resets it) ORed with Firecracker's bitmap; unplugged pages are dirty.
+        if !self.dirty_tracking {
+            // No KVM log and no device bitmap, but the discard bitmap is kept regardless (it does
+            // not need `track_dirty_pages`). So a changed page shows up only via `mincore`
+            // (resident), and a discarded page via the discard bitmap even though it is not
+            // resident. The discard bitmap is consumed like the others; nothing else resets.
+            let mut dirty = [false; PAGES];
+            for (page, dirty) in self.pages.iter_mut().zip(&mut dirty) {
+                *dirty = page.resident() || page.discarded_block || page.unplugged;
+                page.discarded_block = false;
+            }
+            return dirty;
+        }
+        // KVM's log (which resets it) ORed with Firecracker's bitmap and the discard bitmap;
+        // unplugged pages are dirty.
         let mut dirty = [false; PAGES];
         for (page, dirty) in self.pages.iter_mut().zip(&mut dirty) {
             *dirty = page.marked() || page.unplugged;
             page.kvm_marked = false;
+            page.discarded_block = false;
         }
         dirty
     }
@@ -403,6 +432,34 @@ impl State {
     fn read_resident(&self) -> [bool; PAGES] {
         // `mincore` is not run on unplugged slots: they are reported not resident.
         std::array::from_fn(|p| !self.pages[p].unplugged && self.pages[p].resident())
+    }
+
+    /// The misuse the two-bitmap design must avoid: treating a set bit in the huge-page discard
+    /// bitmap as "zero the whole 2 MiB", skipping the per-host-page `mincore`. A page re-faulted
+    /// after the discard (resident, real content) is then wrongly zeroed. `apply_misclassified`
+    /// drives this directly against the backend's file.
+    pub fn snapshot_zeroing_whole_discarded_block(&mut self) -> Layout {
+        let resident = self.read_resident();
+        let dirty = self.read_dirty();
+        let zero = std::array::from_fn(|p| {
+            // Any page of the block discarded -> zero the whole block, mincore ignored.
+            (0..PAGES).any(|q| self.same_backing_page(p, q) && dirty[q] && !resident[q])
+        });
+        let layout = Layout {
+            authoritative: std::array::from_fn(|p| dirty[p] && resident[p] && !zero[p]),
+            zero,
+        };
+        for page in &mut self.pages {
+            page.fc_marked = false;
+            page.armed = false;
+        }
+        self.arm_rings();
+        if self.pending[MAX_PENDING - 1].is_some() {
+            self.apply_oldest();
+        }
+        let slot = self.pending.iter().position(Option::is_none).unwrap();
+        self.pending[slot] = Some(layout);
+        layout
     }
 
     /// [`Self::snapshot`] with the order of the two reads as a parameter, to show that the order
@@ -437,6 +494,7 @@ impl State {
             page.fc_marked = false;
             page.armed = false;
         }
+        // (`discard_marked` is reset inside `read_dirty`, which runs before this.)
         // 4. Virtqueue pages are marked again so that they are part of the next diff.
         self.arm_rings();
         // 5. The layout is handed to the backend, which applies it later (`apply_oldest`). If it
@@ -453,11 +511,12 @@ impl State {
     /// Everything Firecracker can know about page `p` when asked for a snapshot: the dirty state,
     /// `mincore`, the device and virtio-mem bookkeeping. Not what a hole would read as: that is in
     /// the backend's snapshot file and its fault handler's history, which Firecracker never sees.
-    pub fn observable(&self, p: usize) -> (bool, bool, bool, bool, bool, bool) {
+    pub fn observable(&self, p: usize) -> (bool, bool, bool, bool, bool, bool, bool) {
         let page = &self.pages[p];
         (
             page.kvm_marked,
             page.fc_marked,
+            page.discarded_block,
             page.resident(),
             page.unplugged,
             page.armed,
@@ -480,6 +539,7 @@ impl State {
         for page in &mut self.pages {
             page.kvm_marked = false;
             page.fc_marked = false;
+            page.discarded_block = false;
             page.armed = false;
         }
         self.arm_rings();
@@ -734,6 +794,7 @@ mod verification {
             file: kani::any(),
             kvm_marked: kani::any(),
             fc_marked: kani::any(),
+            discarded_block: kani::any(),
             armed: kani::any(),
             ring: kani::any(),
             unplugged: kani::any(),
@@ -768,6 +829,7 @@ mod verification {
             pages: std::array::from_fn(|_| any_page()),
             pending: std::array::from_fn(|_| any_layout()),
             huge,
+            dirty_tracking: true,
         };
         kani::assume(s.pending[1].is_none() || s.pending[0].is_some());
         kani::assume(s.invariant());
@@ -900,6 +962,125 @@ mod verification {
         let mut s = any_state_with_backing(false);
         kani::assume(s.apply_oldest_chunked(true, false));
         assert!(s.invariant());
+    }
+
+    /// Without the discard bitmap, dirty tracking off is unsound after a discard: a diff
+    /// degrades to `dirty := resident`, whose zero set is empty, so a discarded page (non-resident,
+    /// stale content in the file) is in neither set and never corrected. `without_discard_bitmap`
+    /// turns the always-on discard bitmap off to model the earlier design, and the proof fails as
+    /// it must. (Here: a restored page the guest wrote and the balloon then released.)
+    #[kani::proof]
+    #[kani::unwind(5)]
+    #[kani::should_panic]
+    fn dirty_tracking_off_without_discard_bitmap_breaks_after_discard() {
+        let base: [u8; PAGES] = kani::any();
+        kani::assume(base[0] != 0);
+        let mut s = State::restored(base, [false; PAGES], false);
+        s.dirty_tracking = false;
+        for p in 0..PAGES {
+            s.pages[p].file = s.pages[p].base;
+        }
+        s.guest_write(0, kani::any());
+        s.discard(0);
+        s.pages[0].discarded_block = false; // the old design had no discard record
+        s.snapshot(Race::default());
+        s.apply_all();
+        assert!(s.file_matches_guest());
+    }
+
+    /// Keeping a discard bitmap that does not need `track_dirty_pages` fixes it: with dirty
+    /// tracking off, `dirty := resident ∨ discarded`, so a discarded page lands in `pages_to_zero`
+    /// and is corrected, while every changed page is resident and copied. From a restored state
+    /// after an arbitrary run of guest writes, device writes, discards and unplugs, a paused
+    /// snapshot applied by the backend yields guest memory. The write record still needs KVM (a
+    /// guest write to a page that stays resident is caught by `mincore`; the model has no silent
+    /// non-resident write), but the discard record does not.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn dirty_tracking_off_with_discard_bitmap_is_correct() {
+        let base: [u8; PAGES] = kani::any();
+        let mut s = State::restored(base, kani::any(), kani::any());
+        s.dirty_tracking = false;
+        for p in 0..PAGES {
+            s.pages[p].file = s.pages[p].base;
+        }
+        for _ in 0..3 {
+            let p = any_index();
+            match kani::any::<u8>() % 5 {
+                0 => s.guest_write(p, kani::any()),
+                1 => s.device_mark_ahead(p),
+                2 => s.device_write_armed(p, kani::any()),
+                3 => s.discard(p),
+                _ => s.unplug(p),
+            }
+        }
+        s.snapshot(Race::default());
+        s.apply_all();
+        assert!(s.file_matches_guest());
+    }
+
+    /// The two-bitmap split on hugetlbfs: writes in a host-page bitmap, discards in a *huge-page*
+    /// bitmap (one bit per 2 MiB). Correct for the same reason the chunked backend is: residency
+    /// is uniform per huge page, so a discarded block whose bit is set is either still a hole
+    /// throughout (all pages `zero`) or has been re-faulted throughout (all pages resident, all
+    /// `copy`) — the per-page `mincore` the classification runs resolves which, and the coarse
+    /// bit never over-zeroes. Proven over writes, discards, unplugs and re-plugs, with and without
+    /// dirty tracking.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn hugetlbfs_two_bitmaps_classification_is_correct() {
+        let base: [u8; PAGES] = kani::any();
+        let mut s = State::restored(base, kani::any(), true);
+        s.dirty_tracking = kani::any();
+        for p in 0..PAGES {
+            s.pages[p].file = s.pages[p].base;
+        }
+        for _ in 0..3 {
+            let p = any_index();
+            match kani::any::<u8>() % 6 {
+                0 => s.guest_write(p, kani::any()),
+                1 => s.device_mark_ahead(p),
+                2 => s.device_write_armed(p, kani::any()),
+                3 => s.discard(p),
+                4 => s.unplug(p),
+                _ => s.plug(p),
+            }
+        }
+        s.snapshot(Race::default());
+        s.apply_all();
+        assert!(s.file_matches_guest());
+    }
+
+    /// Zeroing a whole discarded 2 MiB block *without* consulting per-host-page `mincore` is in
+    /// fact also correct on hugetlbfs — not because it is a good idea, but because residency is
+    /// uniform per huge page (`H`): a block cannot hold a resident, re-written page next to a
+    /// non-resident one, so the case where coarse zeroing would lose data is unreachable. The
+    /// harness proves this (no `should_panic`): the hazard that makes coarse zeroing wrong exists
+    /// only if residency can be finer than the discard block, which hugetlbfs does not allow.
+    /// A real implementation should still expand through `mincore` so the same code is correct on
+    /// tmpfs, where residency *is* per host page.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn hugetlbfs_zeroing_whole_discarded_block_is_also_correct() {
+        let base: [u8; PAGES] = kani::any();
+        let mut s = State::restored(base, kani::any(), true);
+        s.dirty_tracking = kani::any();
+        for p in 0..PAGES {
+            s.pages[p].file = s.pages[p].base;
+        }
+        for _ in 0..3 {
+            let p = any_index();
+            match kani::any::<u8>() % 5 {
+                0 => s.guest_write(p, kani::any()),
+                1 => s.device_write_armed(p, kani::any()),
+                2 => s.discard(p),
+                3 => s.unplug(p),
+                _ => s.plug(p),
+            }
+        }
+        s.snapshot_zeroing_whole_discarded_block();
+        s.apply_all();
+        assert!(s.file_matches_guest());
     }
 
     /// Why Firecracker writes `Full` snapshots itself. First, a `Full` assembled from the memfd

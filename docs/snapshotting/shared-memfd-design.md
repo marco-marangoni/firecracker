@@ -111,8 +111,10 @@ whose layout equals the snapshot file layout.
   `MADV_REMOVE` rather than a direct `fallocate` so that a registered uffd still
   receives the `remove` event, which is how a backend learns that a range it has
   not populated now reads as zero instead of the snapshot file's content. Every
-  discarded range is also marked dirty in Firecracker's bitmap, so that the next
-  diff records the zeroed pages (this benefits Firecracker-written diffs too).
+  discarded range is also recorded so that the next diff records the zeroed
+  pages (this benefits Firecracker-written diffs too): on hugetlbfs, or when
+  dirty tracking is off, in a separate per-region discard bitmap at backing-page
+  granularity; otherwise folded into the host-page dirty bitmap. See §9.
 - Shared mappings have costlier page faults than anonymous memory, and THP on
   shmem depends on the host's `shmem_enabled`. This is the price of sharing, as
   for vhost-user today.
@@ -908,17 +910,57 @@ as resident zeros. `MADV_REMOVE` rather than `fallocate(PUNCH_HOLE)` on the fd
 because it goes through `userfaultfd_remove()`, so a registered handler receives
 the `remove` event and stops serving the range from its snapshot file.
 
-This design adds one line: `discard_range` marks the whole range dirty in
-Firecracker's bitmap, after the discard, so that the next `Diff`
-(Firecracker-written or backend-copied) records the zeroed pages instead of
-leaving the pre-release bytes in a merged file. With the zeroing of edges, the
-mark is exact at 4 KiB on hugetlbfs too: a freed huge page is dirty and not
-resident (reported zero), a zero-written edge is dirty and resident (reported
-authoritative, content zero), and nothing in the range keeps its old content. An
-earlier revision of this branch rounded the mark inward to the huge page
+This design records every discard so the next `Diff` (Firecracker-written or
+backend-copied) reports the zeroed pages instead of leaving the pre-release
+bytes in a merged file. Where the record goes avoids ever carrying two host-page
+bitmaps:
+
+- `dirty_host_pages` — the existing host-page dirty bitmap (`AtomicBitmap`),
+  present only when `track_dirty_pages` is on. Holds writes.
+- a per-region discard bitmap (`GuestRegionMmapExt::discarded_blocks`,
+  `Option<Mutex<BitVec>>`) — one bit per backing page. Allocated only when it
+  would *not* be a second host-page bitmap: on hugetlbfs (one bit per 2 MiB,
+  coarser than the dirty bitmap) or when there is no dirty bitmap
+  (`track_dirty_pages` off). `discard_range` sets every block the range touches.
+
+On tmpfs with dirty tracking on, `discarded_blocks` is `None` and
+`discard_range` folds the discard into the host-page dirty bitmap via
+`mark_dirty`, so that one bitmap is all that is carried. On hugetlbfs with dirty
+tracking on, both exist deliberately: the dirty bitmap for writes, the discard
+bitmap so a discard flips one bit per 2 MiB instead of marking 512 host pages —
+not a duplicate, since the granularities differ. With dirty tracking off, the
+discard bitmap is the only bitmap.
+
+A page is dirty if it is in the dirty bitmap or the discard bitmap, each at its
+own granularity: `snapshot_layout` ORs the host-page dirty set with the discard
+bitmap (where one exists), expanding each set block to its host pages, then
+`classify` splits the result by per-host-page `mincore` exactly as before.
+
+Two consequences the model pins. With dirty tracking off and no discard record,
+a `mincore`-only diff degrades to `dirty := resident`, whose zero set is empty,
+so a discarded page survives with stale content
+(`dirty_tracking_off_without_discard_bitmap_breaks_after_discard`). The discard
+bitmap fixes it — `dirty := resident ∨ discarded`, a discarded page lands in
+`pages_to_zero`, a changed page is caught by `mincore` since it stays resident
+(`dirty_tracking_off_with_discard_bitmap_is_correct`).
+
+The coarse discard bit is a filter that triggers the per-host-page `mincore`,
+never a verdict that zeroes the whole 2 MiB — on tmpfs that distinction is
+load-bearing, because residency there is per host page. On hugetlbfs it happens
+not to matter: `hugetlbfs_two_bitmaps_classification_is_correct` proves the
+split correct, and `hugetlbfs_zeroing_whole_discarded_block_is_also_correct`
+proves that even the whole-block shortcut is sound there, because residency is
+uniform per huge page (`H`) so a block never mixes a resident re-written page
+with a non-resident one. The implementation expands through `mincore` anyway, so
+the same code is correct on both backings. `track_dirty_pages` thus governs only
+the KVM write log; discards are tracked without it, at their own granularity.
+
+With the zeroing of edges the discard record is exact on hugetlbfs too: a freed
+huge page is dirty and not resident (reported zero), a zero-written edge is
+dirty and resident (reported authoritative, content zero), and nothing in the
+range keeps its old content. An earlier revision rounded inward to the huge page
 instead, because `MADV_REMOVE` alone left the edges with their old content; the
-zero-write supersedes that. Marking needs `track_dirty_pages`: a `mincore`-based
-diff only sees resident pages and cannot express "this page became zero".
+zero-write supersedes that.
 
 The cost noted in #6237 applies here unchanged: zero-writing an edge allocates a
 huge page the guest may never have touched, so with hugetlbfs the traditional
@@ -1096,11 +1138,12 @@ user can see.
    of the three classes; the Roaring serde adapter; property-style identity
    tests against `dump_dirty` over random bitmaps and residency, including
    fold-back on error; the `roaring` dependency.
-1. *(no API)* The Kani model `vstate/snapshot_layout_model.rs`: seventeen
+1. *(no API)* The Kani model `vstate/snapshot_layout_model.rs`: twenty-one
    harnesses (base case, inductive step, paused and racy-then-paused
    correctness, three rule checks, three backend-misuse checks, chunked
-   application on hugetlbfs, and the five `Full` results above), over 4 KiB and
-   huge-page backing, run by `test_kani.py`.
+   application on hugetlbfs, the five `Full` results above, and the four
+   dirty-tracking / two-bitmap results below), over 4 KiB and huge-page backing,
+   run by `test_kani.py`.
 1. Handshake and boot: `send_uffd_handshake(&[RawFd])`, `uffd_mappings`,
    `MachineConfig.mem_backend` (only `SharedMemfd`), handshake in
    `build_microvm_for_boot` after all regions are registered with KVM,
