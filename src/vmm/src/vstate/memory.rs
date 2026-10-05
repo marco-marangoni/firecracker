@@ -553,6 +553,17 @@ pub struct GuestRegionMmapExt {
     pub slot_size: usize,
     /// a bitvec indicating whether slot `i` is plugged into KVM (1) or not (0)
     pub plugged: Mutex<BitVec>,
+    /// Discard record at *backing-page* granularity: bit `i` set means the backing page `i`
+    /// (host page on tmpfs, 2 MiB huge page on hugetlbfs) was discarded since the last diff and
+    /// now reads as zero.
+    ///
+    /// `Some` only when it would not duplicate the dirty bitmap, i.e. when it is at a coarser
+    /// granularity (hugetlbfs) or there is no dirty bitmap (`track_dirty_pages` off). When `None`
+    /// (tmpfs with dirty tracking on), discards are folded into the host-page dirty bitmap via
+    /// `mark_dirty`, so no second host-page bitmap is carried. On hugetlbfs with dirty tracking on
+    /// both exist deliberately: the dirty bitmap for writes, this one so a discard flips one bit
+    /// per 2 MiB instead of marking 512 host pages.
+    pub discarded_blocks: Option<Mutex<BitVec>>,
 }
 
 /// A guest memory slot, which is a slice of a guest memory region
@@ -708,12 +719,14 @@ impl GuestRegionMmapExt {
     /// Adds a DRAM region which only contains a single plugged slot
     pub(crate) fn dram_from_mmap_region(region: GuestRegionMmap, slot: u32) -> Self {
         let slot_size = u64_to_usize(region.len());
+        let discarded_blocks = Self::new_discard_bitmap(&region);
         GuestRegionMmapExt {
             inner: region,
             region_type: GuestRegionType::Dram,
             slot_from: slot,
             slot_size,
             plugged: Mutex::new(BitVec::repeat(true, 1)),
+            discarded_blocks,
         }
     }
 
@@ -724,6 +737,7 @@ impl GuestRegionMmapExt {
         slot_size: usize,
     ) -> Self {
         let slot_cnt = (u64_to_usize(region.len())) / slot_size;
+        let discarded_blocks = Self::new_discard_bitmap(&region);
 
         GuestRegionMmapExt {
             inner: region,
@@ -731,6 +745,7 @@ impl GuestRegionMmapExt {
             slot_from,
             slot_size,
             plugged: Mutex::new(BitVec::repeat(false, slot_cnt)),
+            discarded_blocks,
         }
     }
 
@@ -750,6 +765,7 @@ impl GuestRegionMmapExt {
                 slot_count: slot_cnt,
             });
         }
+        let discarded_blocks = Self::new_discard_bitmap(&region);
 
         Ok(GuestRegionMmapExt {
             inner: region,
@@ -757,7 +773,39 @@ impl GuestRegionMmapExt {
             region_type: state.region_type,
             slot_from,
             plugged: Mutex::new(BitVec::from_iter(state.plugged.iter())),
+            discarded_blocks,
         })
+    }
+
+    /// The backing page size (host page size, or 2 MiB on hugetlbfs): the granularity of discards
+    /// and of the [`Self::discarded_blocks`] bitmap.
+    pub(crate) fn backing_page_size(&self) -> usize {
+        RawGuestRegionMmap::page_size(self.inner.flags())
+    }
+
+    /// Whether the backing page containing the host-page offset `offset` is marked discarded.
+    /// `false` when there is no discard bitmap (discards fold into the dirty bitmap instead).
+    #[cfg(test)]
+    pub(crate) fn discarded_at(&self, offset: usize) -> bool {
+        let block = offset / self.backing_page_size();
+        self.discarded_blocks
+            .as_ref()
+            .and_then(|b| b.lock().expect("poisoned lock").get(block).map(|b| *b))
+            .unwrap_or(false)
+    }
+
+    /// An all-clear discard bitmap for `region`, or `None` when discards should instead fold into
+    /// the host-page dirty bitmap. Allocated iff it would not be a second host-page bitmap: on
+    /// hugetlbfs (coarser granularity, one bit per huge page), or when there is no dirty bitmap
+    /// (`track_dirty_pages` off, detected by `region.bitmap().is_none()`).
+    fn new_discard_bitmap(region: &GuestRegionMmap) -> Option<Mutex<BitVec>> {
+        let backing_page_size = RawGuestRegionMmap::page_size(region.flags());
+        let is_hugetlbfs = backing_page_size != host_page_size();
+        if !is_hugetlbfs && region.bitmap().is_some() {
+            return None;
+        }
+        let blocks = u64_to_usize(region.len()).div_ceil(backing_page_size);
+        Some(Mutex::new(BitVec::repeat(false, blocks)))
     }
 
     /// Check whether the given guest address range falls within plugged slots.
@@ -896,8 +944,9 @@ impl GuestRegionMmapExt {
     /// Discards `[caddr, caddr + len)`: the pages are released to the host and read as zero
     /// afterwards.
     ///
-    /// The range is marked dirty in Firecracker's bitmap, so that a following diff snapshot
-    /// records the zeroed pages instead of leaving the pre-discard bytes in place.
+    /// The discarded backing pages are recorded in the region's always-on discard bitmap, so that
+    /// a following diff snapshot records the zeroed pages instead of leaving the pre-discard bytes
+    /// in place — independently of `track_dirty_pages`.
     pub(crate) fn discard_range(
         &self,
         caddr: MemoryRegionAddress,
@@ -959,8 +1008,26 @@ impl GuestRegionMmapExt {
             }
         }
         // The whole range now reads as zero (freed whole pages, zero-written edges), so a
-        // following diff must record it; the mark covers it all. Marked after the discard.
-        self.inner.bitmap().mark_dirty(u64_to_usize(start), len);
+        // following diff must record it. Where the record goes depends on the region's bitmaps
+        // (see `discarded_blocks`): if a separate discard bitmap exists it is set at backing-page
+        // granularity — on hugetlbfs one bit per 2 MiB, so marking a discard is cheap, and it
+        // works even with `track_dirty_pages` off; otherwise (tmpfs with dirty tracking on) the
+        // discard folds into the host-page dirty bitmap, so no second host-page bitmap is carried.
+        // A following diff expands each marked block through per-host-page `mincore`, so a block
+        // the guest re-faults before the diff keeps its re-written pages authoritative rather than
+        // being blindly zeroed.
+        match &self.discarded_blocks {
+            Some(discarded) => {
+                let backing_page_size = u64_to_usize(backing_page_size);
+                let mut discarded = discarded.lock().expect("poisoned lock");
+                let first_block = u64_to_usize(start) / backing_page_size;
+                let last_block = u64_to_usize(end - 1) / backing_page_size;
+                for block in first_block..=last_block {
+                    discarded.set(block, true);
+                }
+            }
+            None => self.inner.bitmap().mark_dirty(u64_to_usize(start), len),
+        }
         Ok(())
     }
 
@@ -1508,6 +1575,29 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         }
         result?;
 
+        // 1b. Discarded blocks, from the per-region discard bitmap where one exists (balloon,
+        //     virtio-mem, free page reporting). Each marked block is expanded to its host pages
+        //     and added to `dirty`; residency (step 2) then splits them, so a block the guest
+        //     re-faulted since the discard stays authoritative for its resident pages. Where
+        //     there is no discard bitmap (tmpfs with dirty tracking on) the discards are already
+        //     in the dirty set gathered above. Read-only here; the bitmap is cleared on success
+        //     below, next to `reset_dirty`.
+        let mut region_offset = 0u64;
+        for region in self.iter() {
+            if let Some(discarded) = region.discarded_blocks.as_ref() {
+                let backing_page_size = region.backing_page_size() as u64;
+                let pages_per_block = page_index(backing_page_size);
+                let region_first_page = page_index(region_offset);
+                let discarded = discarded.lock().expect("poisoned lock");
+                for block in discarded.iter_ones() {
+                    let block = u32::try_from(block).expect("more than 16 TiB of guest memory");
+                    let first = region_first_page + block * pages_per_block;
+                    dirty.insert_range(first..first + pages_per_block);
+                }
+            }
+            region_offset += region.len();
+        }
+
         // 2. Residency, taken after the dirty state: a page written in between is dirty (it
         //    will show up in the next set) and resident, hence authoritative, never zero.
         let mut resident = RoaringBitmap::new();
@@ -1548,6 +1638,12 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         let layout =
             SnapshotMemoryLayout::classify(total_size, page_size as u64, &dirty, &resident);
 
+        // Consume the discard record together with the dirty bitmap: the diff has reported it.
+        for region in self.iter() {
+            if let Some(discarded) = region.discarded_blocks.as_ref() {
+                discarded.lock().expect("poisoned lock").fill(false);
+            }
+        }
         self.reset_dirty();
         Ok(layout)
     }
@@ -2478,7 +2574,8 @@ mod tests {
             .unwrap();
         assert_eq!(vec![1u8; page_size], actual_page);
 
-        // The discarded page is marked dirty, the other one is not.
+        // The discarded page is recorded (folded into the dirty bitmap on tmpfs), the other is
+        // not.
         let region = mem.iter().next().unwrap();
         assert!(region.bitmap().dirty_at(0));
         assert!(!region.bitmap().dirty_at(page_size));
@@ -2488,9 +2585,9 @@ mod tests {
     fn test_discard_range_on_hugetlbfs_memfd_zeroes_edges() {
         // On a shared hugetlbfs mapping only whole huge pages can be freed; the partial ones at
         // either end of a range are written with zeros instead. Either way every page of the
-        // range reads as zero afterwards and is marked dirty, so a diff reports the freed pages
-        // as zero (dirty, not resident) and the zero-written edges as authoritative (dirty,
-        // resident, content zero): both correct.
+        // range reads as zero afterwards, and the discard is recorded at huge-page granularity,
+        // so a diff reports the freed pages as zero (dirty, not resident) and the zero-written
+        // edges as authoritative (dirty, resident, content zero): both correct.
         if free_hugepages_2m() < 2 {
             return;
         }
@@ -2509,8 +2606,9 @@ mod tests {
         mem.write(&vec![1u8; 2 * huge], GuestAddress(0)).unwrap();
         mem.reset_dirty();
 
-        // A 4 KiB piece in the middle of the first huge page: zero-written, still resident,
-        // marked; the rest of the huge page keeps its content and is not marked.
+        // A 4 KiB piece in the middle of the first huge page: zero-written, still resident. The
+        // discard is recorded for the whole first huge page (block granularity); the second huge
+        // page is untouched.
         mem.discard_range(GuestAddress(page_size as u64), page_size)
             .unwrap();
         let mut buf = vec![0u8; page_size];
@@ -2521,15 +2619,15 @@ mod tests {
             .read_exact_at(&mut buf, page_size as u64)
             .unwrap();
         assert_eq!(buf, vec![0u8; page_size]);
-        assert!(!region.bitmap().dirty_at(0));
-        assert!(region.bitmap().dirty_at(page_size));
-        assert!(!region.bitmap().dirty_at(2 * page_size));
+        assert!(region.discarded_at(0));
+        assert!(region.discarded_at(page_size));
+        assert!(!region.discarded_at(huge));
         let host = region.get_host_address(MemoryRegionAddress(0)).unwrap();
         let resident = mincore_resident(host, huge).unwrap();
         assert!(resident.iter().all(|&r| r & 1 != 0));
 
         // The whole second huge page, with a 4 KiB edge on the left: the second page is freed
-        // (a hole), the edge is zero-written, both marked.
+        // (a hole), the edge is zero-written; the second huge page's block is now recorded too.
         mem.discard_range(GuestAddress((huge - page_size) as u64), huge + page_size)
             .unwrap();
         backing.file.read_exact_at(&mut buf, huge as u64).unwrap();
@@ -2539,9 +2637,9 @@ mod tests {
             .read_exact_at(&mut buf, (huge - page_size) as u64)
             .unwrap();
         assert_eq!(buf, vec![0u8; page_size]);
-        assert!(region.bitmap().dirty_at(huge - page_size));
-        assert!(region.bitmap().dirty_at(huge));
-        assert!(region.bitmap().dirty_at(2 * huge - page_size));
+        assert!(region.discarded_at(huge - page_size));
+        assert!(region.discarded_at(huge));
+        assert!(region.discarded_at(2 * huge - page_size));
         let resident = mincore_resident(host, 2 * huge).unwrap();
         assert!(resident[..huge / page_size].iter().all(|&r| r & 1 != 0));
         assert!(resident[huge / page_size..].iter().all(|&r| r & 1 == 0));

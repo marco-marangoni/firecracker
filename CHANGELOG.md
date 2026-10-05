@@ -53,9 +53,13 @@ and this project adheres to
   hinting instead of the traditional balloon with hugetlbfs.
 - [#XXXX](https://github.com/firecracker-microvm/firecracker/pull/XXXX): Memory
   released by the balloon device (inflation, free page reporting) or by
-  virtio-mem unplug is now marked dirty, so that a subsequent diff snapshot
-  records the zeroed pages instead of leaving their previous content in a merged
-  memory file.
+  virtio-mem unplug is now recorded so that a subsequent diff snapshot records
+  the zeroed pages instead of leaving their previous content in a merged memory
+  file. On hugetlbfs, or when `track_dirty_pages` is off, the record is a
+  separate per-region discard bitmap (huge-page granular on hugetlbfs, so a
+  discard is cheap and discards are reported even without dirty tracking);
+  otherwise it folds into the host-page dirty-tracking bitmap, so no second
+  host-page bitmap is carried.
 - [#XXXX](https://github.com/firecracker-microvm/firecracker/pull/XXXX): The
   example UFFD handlers in `src/firecracker/examples/uffd/` read all file
   descriptors attached to the handshake message and can be started as memory

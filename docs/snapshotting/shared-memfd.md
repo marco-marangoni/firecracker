@@ -14,8 +14,8 @@ It is similar to the `Uffd` backend with two important distinctions:
   backend via Unix domain socket as part of the handshake
 - it can also be used at boot, in which case there's no UFFD
 
-When `SharedMemfd` is used, it is the responsibility of the backend to save the
-guest memory during VM snapshot.
+When `SharedMemfd` is used, the backend can read the guest memory during
+snapshot, without any disk I/O.
 
 When used on VM restore, the `SharedMemfd` backend is a
 [UFFD page fault handler](handling-page-faults-on-snapshot-resume.md) with extra
@@ -46,11 +46,11 @@ descriptor with it.
 
 ### The socket
 
-The backend creates a `SOCK_STREAM` Unix domain socket and listens on it before
-making the API call that attaches it (`PUT /machine-config` with `mem_backend`,
-or `PUT /snapshot/load` with `backend_type: SharedMemfd`). Firecracker connects
-to the path given in the request (relative to its chroot when jailed) and sends
-the message. If nobody is listening, the API call fails.
+The backend creates and listens on a `SOCK_STREAM` Unix domain socket which is
+then passed to Firecracker (via the config file, `PUT /machine-config`, or
+`PUT /snapshot/load`). Firecracker then connects to the path given in the
+request (relative to its chroot when jailed) and sends the handshake message.
+If nobody is listening, the API call fails.
 
 After that, Firecracker never reads from or writes to the socket, and keeps it
 open until it exits. The backend can use the connection to learn Firecracker's
@@ -86,7 +86,7 @@ The array has one entry per guest memory region, in guest address order:
 ```
 
 | Field                 | Meaning                                                                                                               |
-| :-------------------- | :-------------------------------------------------------------------------------------------------------------------- |
+|:----------------------|:----------------------------------------------------------------------------------------------------------------------|
 | `base_host_virt_addr` | Address of the region in Firecracker's address space. Page fault events use it; the memfd and the API do not.         |
 | `size`                | Region size in bytes.                                                                                                 |
 | `offset`              | Offset of the region in the memfd. It is also its offset in a memory snapshot file and in the bitmap the API returns. |
@@ -103,7 +103,7 @@ The format of the handshake is the same as the `Uffd` backend.
 ### The file descriptors
 
 | How the microVM was started                      | fds received    |
-| :----------------------------------------------- | :-------------- |
+|:-------------------------------------------------|:----------------|
 | `snapshot/load` with `backend_type: Uffd`        | `[uffd]`        |
 | `snapshot/load` with `backend_type: SharedMemfd` | `[uffd, memfd]` |
 | At boot with `machine-config.mem_backend`        | `[memfd]`       |
@@ -268,13 +268,8 @@ and you have sets with constant-time membership and ordered iteration. In the
 example, `pages_to_copy` decodes to pages 0–1, 9–12, 40, 58–67, 100, 130–131,
 157 and 170–180, and `pages_to_zero` to pages 192–255, the unplugged slot.
 
-**The classification relies on `mincore` being accurate, with or without dirty
-tracking.** A page that holds content but is not "in core" would be reported as
-zero and lost from the snapshot. On tmpfs-backed memory that happens if the host
-swaps memfd pages out, so swap must be disabled on the host, as the
-[production host setup](../prod-host-setup.md) already requires; on hugetlbfs,
-which is never swapped, `mincore` reports whether Firecracker has the huge page
-mapped, which it does for every page it or the backend has populated.
+The classification relies on `mincore` being accurate, with or without dirty
+tracking; **swap must be disabled** for the API to return correct information.
 
 Applying the layout (copying every page to copy, zeroing every page to zero,
 leaving every other page alone) to the previous memory file yields a file
@@ -368,8 +363,8 @@ For a backend that implements pre-copy:
 1. Final copy of `pages_to_copy`, final zeroing of `pages_to_zero`
 1. VM can be resumed here
 
-Note: this algorithm doesn't make sense without dirty tracking. With mincore,
-the dirty set doesn't decrease between API calls.
+Note: the pre-copy algorithm only makes sense with dirty tracking enabled.
+Otherwise, with just mincore, the dirty set won't decrease between API calls.
 
 ## Example handler
 
