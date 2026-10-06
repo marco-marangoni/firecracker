@@ -139,11 +139,11 @@ with `snapshot_type: Backend`, and `PUT /snapshot/dirty-pages`, return two
 bitmaps, which pages of the memfd the backend should copy and the pages it
 should discard. There is no other protocol between Firecracker and the backend.
 
-Sharing memory this way has a cost: guest memory is a `MAP_SHARED` mapping of
-shmem or hugetlbfs, page faults on it are somewhat slower than on anonymous
-memory, and transparent huge pages depend on the host's `shmem_enabled` setting.
-vhost-user devices have the same requirement; if both are configured they share
-one memfd.
+Sharing memory this way has a cost: guest memory is a `MAP_SHARED` mapping; page
+faults on it are somewhat slower than on anonymous memory.
+Hugetlbfs mitigates the performance loss very effectively.
+Transparent huge pages depend on the host's `shmem_enabled` setting, and only
+partially mitigate the performance loss.
 
 ## API
 
@@ -366,3 +366,6 @@ APIs, and tell the backend which pages to copy.
   same requirement.)
 - Firecracker does not monitor the backend. Killing it leaves the microVM
   running, and, in case of a restore, with nobody to serve page faults.
+- Firecracker cannot know nor control what the vhost-user server writes to guest
+  memory. When using vhost-user, it's the backend's responsibility to coordinate
+  with it and to exchange information about which pages it modified.
