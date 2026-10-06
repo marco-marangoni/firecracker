@@ -664,6 +664,15 @@ impl KvmVm {
                 self.reset_dirty_bitmap();
                 self.guest_memory().reset_dirty();
             }
+            // `Backend` never writes a memory file: `create_snapshot` routes it to
+            // `snapshot_memory_layout` instead. Reaching here would be a bug.
+            SnapshotType::Backend => {
+                return Err(CreateSnapshotError::MicrovmState(
+                    crate::persist::MicrovmStateError::NotAllowed(
+                        "a Backend snapshot does not write a memory file".into(),
+                    ),
+                ));
+            }
         };
 
         file.flush()

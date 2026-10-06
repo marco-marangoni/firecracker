@@ -314,9 +314,8 @@ pub struct Vmm {
     // Device manager
     device_manager: DeviceManager,
     /// Whether guest memory was handed to a memory backend (as a memfd) at boot or restore.
-    /// When set, `PUT /snapshot/create` never writes guest memory and instead reports the
-    /// pages of the memfd that make up the snapshot, and `PUT /snapshot/dirty-pages` is
-    /// allowed.
+    /// When set, a `Backend` `PUT /snapshot/create` reports the memfd pages that make up the
+    /// snapshot instead of writing a memory file, and `PUT /snapshot/dirty-pages` is allowed.
     pub mem_backend_attached: bool,
 }
 

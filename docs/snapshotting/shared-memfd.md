@@ -110,10 +110,7 @@ The format of the handshake is the same as the `Uffd` backend.
 
 The userfaultfd comes first and the memfd last. The order of the fds is part of
 the API contract. A properly architected backend should be aware of
-Firecracker's lifecycle and can always assert the exact FDs it expects. It's
-also possible (but not recommended) to tell the fds apart using `fstat`: the
-memfd is a regular file, the userfaultfd is an anonymous inode with no file
-type.
+Firecracker's lifecycle and can always assert the exact FDs it expects.
 
 The memfd is all the guest memory, laid out like a full memory snapshot file:
 region *n* starts at its `offset`. Firecracker maps it `MAP_SHARED`, so reading
@@ -138,10 +135,9 @@ it. On a restore, the backend serves page faults from the snapshot file, and the
 memfd fills with what it populates and what the guest writes.
 
 From here on, Firecracker's only involvement is the API. `PUT /snapshot/create`
-and `PUT /snapshot/dirty-pages` return two bitmaps, the pages of the memfd to
-copy and the pages to zero, and whoever made the call passes them to the backend
-however it likes; the example handler uses a second Unix socket. There is no
-other protocol between Firecracker and the backend.
+with `snapshot_type: Backend`, and `PUT /snapshot/dirty-pages`, return two
+bitmaps, which pages of the memfd the backend should copy and the pages it
+should discard. There is no other protocol between Firecracker and the backend.
 
 Sharing memory this way has a cost: guest memory is a `MAP_SHARED` mapping of
 shmem or hugetlbfs, page faults on it are somewhat slower than on anonymous
@@ -191,36 +187,52 @@ backend serves page faults exactly as a UFFD handler does.
 The choice is per instance and is **not** recorded in the snapshot: a snapshot
 made with a memory backend restores fine with `File` or `Uffd`, and vice versa.
 
-### `PUT /snapshot/create` with a backend attached
+### `PUT /snapshot/create`
+
+The microVM must be `Paused`, as for any snapshot. `PUT /snapshot/create` takes
+a `snapshot_type`: `Full`, `Diff`, or `Backend`.
+
+`Full` and `Diff` behave exactly as without a memory backend: `mem_file_path` is
+mandatory and Firecracker writes the whole of guest memory to it through its own
+mapping, answering `204 No Content`.
+
+`Backend` is the mode where the backend produces guest memory instead of
+Firecracker: `mem_file_path` must be **absent** (400 otherwise), no guest memory
+is written, and the response is `200 OK` with a `memory` object (see "The memory
+layout" below) telling the backend which pages of the memfd make up the
+snapshot. Firecracker still writes the microVM state to `snapshot_path`. It is
+rejected with 400 when no memory backend is attached. After the call the microVM
+must not be resumed until the backend has copied every `pages_to_copy` page out
+of the memfd.
+
+When following the rules explained in the "Consistency" section below, this API
+is enough for a backend to produce snapshots identical to what Firecracker would
+have done, with the benefit of no disk I/O for the guest memory.
+
+### `PUT /snapshot/dirty-pages`: optional pre-copy
+
+Pre-copy is optional and only useful if you want to shorten the pause of a
+`/snapshot/create Backend`. While the guest runs, `dirty-pages` returns the
+pages that changed since the last snapshot or the last call (the `memory` object
+described in the next section) and consumes the tracking state, so the backend
+can copy them in the background. Repeating it tracks an ever-smaller working
+set; a final `/snapshot/create Backend` (while paused) then copies only what
+changed since the last pass. The request has no parameters (empty body or `{}`),
+returns `200 OK` with the `memory` object, and leaves the microVM running. It is
+rejected with 400 when no memory backend is attached, because then nobody but
+Firecracker could turn the consumed sets into bytes.
+
+In case of a running guest, the returned pages might be modified after the call
+returns. In that case, it is guaranteed they will be returned on the next call
+(a later `dirty-pages`, or the final `/snapshot/create Backend`).
+
+### The memory layout
+
+`PUT /snapshot/dirty-pages` and `PUT /snapshot/create` with `Backend` return a
+`memory` object classifying every page of guest memory. For example:
 
 ```json
 {
-  "snapshot_type": "Diff",
-  "snapshot_path": "/path/vmstate"
-}
-```
-
-The microVM must be `Paused`, as always. The rule is: **Firecracker writes
-`Full` snapshots, the backend produces `Diff` snapshots.**
-
-A `Full` snapshot behaves exactly as without a backend: `mem_file_path` is
-mandatory, Firecracker writes the whole of guest memory to it through its own
-mapping and answers `204 No Content`. Reading through the mapping faults in
-every page the backend has not populated yet (the backend serves them from its
-snapshot file, as for any other fault), so a `Full` after a lazy restore is
-complete and self-contained but costs a full population of the memfd. Take it
-when you need a file that does not depend on anything else, notably after losing
-a `Diff` response (see below); otherwise prefer a `Diff` merged into the
-previous file, which the backend produces without reading unchanged memory.
-
-For a `Diff` snapshot with a backend attached, `mem_file_path` must be
-**absent** (400 otherwise): Firecracker does not write guest memory, it tells
-the backend what changed. The response is `200 OK` with a body describing the
-memory part of the diff:
-
-```json
-{
-  "snapshot_type": "Diff",
   "memory": {
     "total_size": 1048576,
     "page_size": 4096,
@@ -248,8 +260,8 @@ Every page of the memory file is in exactly one of three classes:
   the diff is applied to (the previous memory file, or a fresh zero-filled file
   for a microVM that was booted rather than restored) already holds it.
 
-Both classes are given as sets of page indices (page `i` is the `page_size`
-bytes at file offset `i * page_size`), in the same encoding:
+The two sets are given as page indices (page `i` is the `page_size` bytes at
+file offset `i * page_size`); the full object is:
 
 - `total_size` is the size of a full memory file (the sum of all region sizes,
   including the hotplug region, plugged or not). Create the target file at this
@@ -276,14 +288,6 @@ example, `pages_to_copy` decodes to pages 0–1, 9–12, 40, 58–67, 100, 130�
 The classification relies on `mincore` being accurate, with or without dirty
 tracking; **swap must be disabled** for the API to return correct information.
 
-Applying the layout (copying every page to copy, zeroing every page to zero,
-leaving every other page alone) to the previous memory file yields a file
-identical to the `Full` Firecracker would have written; applied to a fresh
-zero-filled file it yields a diff file `rebase-snap` accepts, or, for a microVM
-that was booted rather than restored, a complete memory file. Write zeros rather
-than punching holes when merging a diff, and when producing a diff file for
-`rebase-snap`: to those a hole means "not in the diff".
-
 A backend that stores memory in chunks (512 KiB, 2 MiB, ...) applies a response
 chunk by chunk. When using 2M hugetlbfs, with chunks aligned to and no larger
 than 2 MiB, a chunk with a page in either set can be read whole from the memfd,
@@ -297,80 +301,52 @@ cost of a guest rewriting its memory at random; runs of consecutive pages, such
 as a released balloon or a freshly written buffer, cost a few bytes each
 regardless of their length, and an idle guest's response is a few KiB.
 
-Like writing a memory file, this consumes the dirty tracking state: the pages
-returned are no longer considered dirty. The virtqueue pages of every activated
-device are marked dirty again afterwards, as today, so that they are part of the
-next diff.
-
-### `PUT /snapshot/dirty-pages`: pre-copy
-
-The request has no parameters; the body may be empty or `{}`. The response is
-`200 OK` with the same `memory` object as `/snapshot/create`, without
-`snapshot_type`:
-
-```json
-{
-  "memory": {
-    "total_size": 1048576,
-    "page_size": 4096,
-    "bitmap_encoding": "roaring",
-    "pages_to_copy": "OzAAAAEAAAoAAwAAAAEAQAAHAGQAAAA=",
-    "pages_to_discard": "OzAAAAEAAD8AAQDAAD8A"
-  }
-}
-```
-
-It returns the pages dirtied since the last snapshot or the last call, and
-resets the tracking. It can be issued while the microVM is `Running` or
-`Paused`, and is rejected with 400 when no memory backend is attached, because
-then nobody but Firecracker could turn the consumed dirty set into bytes.
-
-In case of a running guest, the returned pages might be modified after this API
-returns. In that case, it's guaranteed they will be returned on the next call of
-`/snapshot/dirty-pages` or `/snapshot/create`.
+Each `/snapshot/dirty-pages` or `/snapshot/create` call consumes the dirty
+tracking state: the pages returned are no longer considered dirty.
 
 ## Consistency
 
 In order to produce a consistent snapshot, the backend needs to adhere to some
 simple rules. These rules cannot be enforced by Firecracker.
 
-- The `pages_to_copy` returned by the `/snapshot/dirty-pages` and
-  `/snapshot/create` APIs must be eventually copied into the snapshot, and the
+- The `pages_to_copy` returned by `/snapshot/dirty-pages` and by a `Backend`
+  `/snapshot/create` must be eventually copied into the snapshot, and the
   `pages_to_discard` should read as zero in it (or keep their previous content,
-  if the file is only ever read back by the guest). Responses must be applied
-  in the order they were received: a page discarded by one response and copied
-  by the next would otherwise end up zeroed, with nothing left to correct it.
+  if the file is only ever read back by the guest). Responses must be applied in
+  the order they were received: a page discarded by one response and copied by
+  the next would otherwise end up zeroed, with nothing left to correct it.
   Applying them late is fine; the memfd may hold a newer value by then, and the
   write that made it newer is in a later response
 - If a response is lost (e.g. connection dropped before the body was read), that
-  dirty information is gone and the next snapshot must be a `Full` snapshot,
-  which Firecracker writes itself
-- A `Full` ends the lineage of the responses received before it: the next `Diff`
-  is relative to the `Full`, and responses received before the `Full` must not
-  be applied to the `Full` or to anything derived from it
-- After the final `/snapshot/create`, the VM must not be resumed until the
+  tracking information is gone and the next snapshot must be a `Full` through
+  `/snapshot/create`, which Firecracker writes itself
+- Starting a new lineage (a `Full`, or a fresh pre-copy chain) invalidates the
+  responses received before it: responses from before must not be applied to it
+  or to anything derived from it
+- After the final `/snapshot/create`, the microVM must not be resumed until the
   backend has copied every page in `pages_to_copy` out of the memfd.
 
-As an example, without pre-copy, the snapshot process would be something like:
+To produce a snapshot, with no pre-copy, the workflow is as follows:
 
-1. Pause the VM
-1. Call `/snapshot/create`
-1. Copy `pages_to_copy` into a new file, zero `pages_to_discard`
-1. VM can be resumed here
+1. Pause the microVM
+1. Call `/snapshot/create` with `snapshot_type: Backend`
+1. Copy `pages_to_copy` into a file, zero `pages_to_discard`
+1. The microVM can be resumed here
 
-For a backend that implements pre-copy:
+A backend that wants to shorten the pause can add pre-copy around that final
+call:
 
 1. Call `/snapshot/dirty-pages`
 1. Copy `pages_to_copy` into a file, zero `pages_to_discard`
-1. Repeat from step 1 until the dirty set is small enough or after a timeout or
-   iterations limit
-1. Pause the VM
-1. Call `/snapshot/create`
+1. Repeat from step 1 until the changed set is small enough, or after a timeout
+   or iteration limit
+1. Pause the microVM
+1. Call `/snapshot/create` with `snapshot_type: Backend`
 1. Final copy of `pages_to_copy`, final zeroing of `pages_to_discard`
-1. VM can be resumed here
+1. The microVM can be resumed here
 
-Note: the pre-copy algorithm only makes sense with dirty tracking enabled.
-Otherwise, with just mincore, the dirty set won't decrease between API calls.
+Note: the pre-copy loop only makes progress with dirty tracking enabled. Without
+it, with just `mincore`, the changed set does not shrink between calls.
 
 ## Example handler
 
@@ -387,13 +363,6 @@ APIs, and tell the backend which pages to copy.
 - The host must not swap: the classification uses `mincore` to tell a punched
   page from one with content, with or without dirty tracking, and a swapped-out
   page looks like a punched one. (Firecracker's own `mincore` diffs have the
-  same requirement.) Diff snapshots taken without `track_dirty_pages` also miss
-  pages released by the balloon or virtio-mem, so merging them onto a base keeps
-  the pre-release bytes there; that is not specific to memory backends.
+  same requirement.)
 - Firecracker does not monitor the backend. Killing it leaves the microVM
-  running with nobody to produce snapshots (and, after a restore, nobody to
-  serve page faults; a `Full` snapshot then blocks on the first fault).
-- A `Full` snapshot with a backend is not cheaper than without one: it reads all
-  of guest memory through Firecracker's mapping, which after a lazy restore
-  populates the memfd entirely. Producing full memory files by merging diffs
-  into the previous file is the backend's job.
+  running, and, in case of a restore, with nobody to serve page faults.

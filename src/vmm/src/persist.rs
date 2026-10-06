@@ -162,10 +162,12 @@ pub enum CreateSnapshotError {
     SerializeMicrovmState(#[from] crate::snapshot::SnapshotError),
     /// Cannot perform {0} on the snapshot backing file: {1}
     SnapshotBackingFile(&'static str, io::Error),
-    /// `mem_file_path` must not be given for a Diff snapshot when a memory backend is attached: the backend produces the diff
-    MemFilePathWithMemBackend,
     /// `mem_file_path` is required
     MissingMemFilePath,
+    /// a `Backend` snapshot requires a memory backend to be attached
+    BackendWithoutMemBackend,
+    /// `mem_file_path` must be absent for a `Backend` snapshot: the backend produces guest memory
+    MemFilePathWithBackendType,
 }
 
 /// Snapshot version
@@ -173,22 +175,29 @@ pub const SNAPSHOT_VERSION: Version = Version::new(12, 0, 0);
 
 /// Creates a Microvm snapshot.
 ///
-/// Guest memory is written to `params.mem_file_path` and `None` is returned, except for a `Diff`
-/// snapshot of a microVM with a memory backend attached: then no memory is written and the
-/// returned [`SnapshotMemoryLayout`] tells the backend which pages of the shared memfd make up
-/// the diff. A `Full` snapshot always goes through Firecracker's own mapping, which with a
-/// backend faults every page in (the backend serves the ones it has not populated yet) and so
-/// produces a complete file whatever dirty state has been consumed before. Either way the dirty
-/// tracking state is consumed.
+/// For `Full` and `Diff`, guest memory is written to `params.mem_file_path` through Firecracker's
+/// own mapping (with a backend, reading through the mapping faults in every page the backend has
+/// not populated yet) and `None` is returned — exactly as without a memory backend.
+///
+/// For `Backend` (only valid with a memory backend attached), Firecracker writes no guest memory;
+/// it returns the layout of the pages that changed since the last snapshot or `dirty-pages` call,
+/// which the backend turns into memory itself. `mem_file_path` must be absent. This finalizes the
+/// incremental workflow: it is the last step of the lineage, after which the microVM must not be
+/// resumed until the backend has copied every `pages_to_copy` page out of the memfd.
+///
+/// Either way the dirty tracking state is consumed.
 pub fn create_snapshot(
     vmm: &mut Vmm,
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<Option<SnapshotMemoryLayout>, CreateSnapshotError> {
-    let backend_diff = vmm.mem_backend_attached && params.snapshot_type == SnapshotType::Diff;
     // Validate before saving anything, so a rejected request has no side effects.
-    let mem_file_path = match (backend_diff, &params.mem_file_path) {
-        (true, Some(_)) => return Err(CreateSnapshotError::MemFilePathWithMemBackend),
+    let backend = params.snapshot_type == SnapshotType::Backend;
+    let mem_file_path = match (backend, &params.mem_file_path) {
+        (true, _) if !vmm.mem_backend_attached => {
+            return Err(CreateSnapshotError::BackendWithoutMemBackend);
+        }
+        (true, Some(_)) => return Err(CreateSnapshotError::MemFilePathWithBackendType),
         (false, None) => return Err(CreateSnapshotError::MissingMemFilePath),
         (true, None) => None,
         (false, Some(path)) => Some(path),
@@ -840,30 +849,39 @@ mod tests {
         };
         let mem = Some(PathBuf::from("/proc/nonexistent/mem"));
 
-        // Without a backend: `mem_file_path` required.
+        // `Full` and `Diff` require `mem_file_path`, backend attached or not: unchanged from main.
         let mut vmm = default_vmm();
         assert!(!vmm.mem_backend_attached);
-        for snapshot_type in [SnapshotType::Full, SnapshotType::Diff] {
-            assert!(matches!(
-                create_snapshot(&mut vmm, &vm_info, &params(snapshot_type, None)),
-                Err(CreateSnapshotError::MissingMemFilePath)
-            ));
+        for backend in [false, true] {
+            vmm.mem_backend_attached = backend;
+            for snapshot_type in [SnapshotType::Full, SnapshotType::Diff] {
+                assert!(matches!(
+                    create_snapshot(&mut vmm, &vm_info, &params(snapshot_type, None)),
+                    Err(CreateSnapshotError::MissingMemFilePath)
+                ));
+                // A request with a path gets past validation and fails on the unwritable path.
+                assert!(matches!(
+                    create_snapshot(&mut vmm, &vm_info, &params(snapshot_type, mem.clone())),
+                    Err(CreateSnapshotError::SnapshotBackingFile(..))
+                ));
+            }
         }
 
-        // With a backend: a Full is written by Firecracker exactly as without one; only a Diff
-        // is described to the backend, and then `mem_file_path` must be absent.
+        // `Backend` requires a memory backend; without one it is rejected.
+        vmm.mem_backend_attached = false;
+        assert!(matches!(
+            create_snapshot(&mut vmm, &vm_info, &params(SnapshotType::Backend, None)),
+            Err(CreateSnapshotError::BackendWithoutMemBackend)
+        ));
+        // With a backend, `mem_file_path` must be absent...
         vmm.mem_backend_attached = true;
         assert!(matches!(
-            create_snapshot(&mut vmm, &vm_info, &params(SnapshotType::Full, None)),
-            Err(CreateSnapshotError::MissingMemFilePath)
+            create_snapshot(&mut vmm, &vm_info, &params(SnapshotType::Backend, mem)),
+            Err(CreateSnapshotError::MemFilePathWithBackendType)
         ));
+        // ...and a valid request gets past validation, failing on the unwritable vmstate path.
         assert!(matches!(
-            create_snapshot(&mut vmm, &vm_info, &params(SnapshotType::Diff, mem)),
-            Err(CreateSnapshotError::MemFilePathWithMemBackend)
-        ));
-        // A valid Diff request gets past validation and fails on the unwritable vmstate path.
-        assert!(matches!(
-            create_snapshot(&mut vmm, &vm_info, &params(SnapshotType::Diff, None)),
+            create_snapshot(&mut vmm, &vm_info, &params(SnapshotType::Backend, None)),
             Err(CreateSnapshotError::SnapshotBackingFile(..))
         ));
     }

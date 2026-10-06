@@ -227,7 +227,7 @@ class Microvm:
         self.initrd_file = None
         self.boot_args = None
         self.uffd_handler = None
-        # The `memory` object of the last `PUT /snapshot/create` /
+        # The `memory` object of the last `PUT /snapshot/create` (Backend) /
         # `PUT /snapshot/dirty-pages` response, when a memory backend is attached,
         # and the backend's `Done` reply to the copy the framework asked for.
         self.last_snapshot_memory = None
@@ -1061,7 +1061,7 @@ class Microvm:
         if self.mem_backend is None or snapshot_type == SnapshotType.FULL:
             # Full snapshots are always written by Firecracker itself, memory backend
             # or not (with one, through its mapping: the backend serves whatever it
-            # has not populated yet).
+            # has not populated yet). `snapshot/create` behaves exactly as upstream.
             self.api.snapshot_create.put(
                 mem_file_path=str(mem_path),
                 snapshot_path=str(vmstate_path),
@@ -1069,20 +1069,20 @@ class Microvm:
                 sync_snapshot_files=sync_snapshot_files,
             )
         else:
-            # A diff with a memory backend attached: Firecracker does not write guest
-            # memory; it tells us which pages of the shared memfd make up the diff,
-            # and we (the orchestrator) have the backend copy them. The VM stays
-            # paused, so the copy can happen at any time before the resume.
+            # A diff with a memory backend attached: `snapshot/create` with the `Backend`
+            # type. Firecracker does not write guest memory; it writes the microVM state and
+            # tells us which pages of the shared memfd make up the snapshot, and we (the
+            # orchestrator) have the backend copy them to the memory file. The VM stays paused,
+            # so the copy can happen at any time before the resume.
             response = self.api.snapshot_create.put(
                 snapshot_path=str(vmstate_path),
-                snapshot_type=snapshot_type.api_type,
+                snapshot_type="Backend",
                 sync_snapshot_files=sync_snapshot_files,
             )
-            body = response.json()
-            assert body["snapshot_type"] == snapshot_type.api_type
-            self.last_snapshot_memory = body["memory"]
+            memory = response.json()["memory"]
+            self.last_snapshot_memory = memory
             self.last_backend_copy = self.mem_backend.copy(
-                body["memory"], str(Path("/") / mem_path)
+                memory, str(Path("/") / mem_path)
             )
         root = Path(self.chroot())
         return Snapshot(

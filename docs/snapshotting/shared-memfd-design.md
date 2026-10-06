@@ -243,15 +243,15 @@ The writers, and why each is quiescent after `snapshot/create` returns:
 
 Two ordering rules follow, and the doc for the feature must state them:
 
-1. The dirty set that accompanies a snapshot is the one returned by
-   `snapshot/create` (§7). It is computed after `prepare_save`, so it includes
-   the pages written by drained block I/O and excludes nothing that vmstate
-   already reflects.
-1. The standalone dirty-pages request (§8) is for pre-copy passes. It can be
-   issued in any state and never loses pages (anything it misses because a
-   completion has not been processed yet is marked later and shows up in a
-   subsequent set), but it is not a substitute for the set returned by
-   `snapshot/create`.
+1. The dirty set that accompanies a snapshot is the one returned by the finalize
+   step, `snapshot/create` with `snapshot_type: Backend` (§7). It is computed
+   after `prepare_save`, so it includes the pages written by drained block I/O
+   and excludes nothing that vmstate already reflects.
+1. The standalone pre-copy request, `PUT /snapshot/dirty-pages` (§8), is for
+   pre-copy passes. It can be issued in any state and never loses pages
+   (anything it misses because a completion has not been processed yet is marked
+   later and shows up in a subsequent set), but it is not a substitute for the
+   set returned by the finalizing `snapshot/create Backend`.
 
 If the invariant is ever weakened (a future change that services device fds
 while paused), snapshot consistency with a memory backend breaks silently. The
@@ -328,46 +328,52 @@ is a memfd that is shared with the peer), in the style of `File` and `Uffd`,
 rather than after the peer's role; an earlier draft called it `MemoryBackend`,
 which read awkwardly inside `mem_backend`.
 
-### 7. `PUT /snapshot/create` with a memory backend
+### 7. `PUT /snapshot/dirty-pages` and `snapshot/create` with `Backend`
 
-*(Revised three times. The response format changed from a dirty bitmap plus an
-`unplugged` range list plus a `populated` bitmap to two bitmaps that classify
-every page; the backend path was then restricted to `Diff` snapshots, a `Full`
-being written by Firecracker itself whether or not a backend is attached; and
-the two bitmaps, first chunked and trailing-trimmed, then run-length compressed,
-became Roaring bitmaps. The history is in the decisions below and in §14.)*
+*(Revised. The response format changed from a dirty bitmap plus an `unplugged`
+range list plus a `populated` bitmap to two bitmaps that classify every page;
+the bitmaps, first chunked and trailing-trimmed, then run-length compressed,
+became Roaring bitmaps; and the whole backend workflow, first bolted onto
+`snapshot/create`, then moved to a dedicated incremental endpoint, was finally
+split across two existing-style endpoints — the pre-copy step
+`PUT /snapshot/dirty-pages` and a new `snapshot_type: Backend` on
+`snapshot/create` for the finalize step — so that `Full`/`Diff`
+`snapshot/create` stays byte-for-byte the upstream API. The history is in the
+decisions below and in §14.)*
 
-The rule: **Firecracker writes `Full` snapshots; the backend produces `Diff`
-snapshots.** A `Full` with a backend attached is exactly a `Full` without one:
-`mem_file_path` required, `dump` through Firecracker's mapping, 204. Reading
-through the mapping faults in every page the backend has not populated (the
-backend serves it from its snapshot file, as for any other fault), so the result
-is complete and depends on nothing else, at the cost of populating the whole
-memfd after a lazy restore. That cost is accepted: a `Full` is the recovery path
-(lost `Diff` response) and the bootstrap, not the steady state, and it is the
-same cost a `Full` after a UFFD restore has today.
+`PUT /snapshot/create` with `Full` or `Diff` is **unchanged** from upstream:
+`mem_file_path` is required for both, Firecracker writes the whole of guest
+memory to it through its own mapping, and the response is 204 — memory backend
+attached or not. With a backend, `dump` through the mapping faults in every page
+the backend has not populated (the backend serves it from its snapshot file, as
+for any other fault), so the file is complete and depends on nothing else, at
+the cost of populating the whole memfd after a lazy restore. This is the
+bootstrap and the recovery path (a lost pre-copy response), the same cost a
+`Full` after a UFFD restore has today.
 
-Request, for a `Diff`:
+The backend workflow is split across two steps. The pre-copy step is
+`PUT /snapshot/dirty-pages`: it returns the memory layout of the pages that
+changed since the last snapshot or call, consuming the tracking state, so a
+backend copies them from the shared memfd itself instead of Firecracker writing
+a file, and it leaves the microVM running. The finalize step is
+`PUT /snapshot/create` with the new `snapshot_type: Backend`: it writes the
+microVM state to `snapshot_path`, writes no guest memory, returns the same
+layout, and ends the lineage. Both are rejected without a memory backend (400),
+since then nobody but Firecracker could turn the layout into bytes. Neither has
+a `mem_backend` field: whether a backend is connected is a property of the
+instance, fixed at boot or restore.
+
+Request, a pre-copy step:
 
 ```json
-{
-  "snapshot_type": "Diff",
-  "snapshot_path": "/path/vmstate"
-}
+PUT /snapshot/dirty-pages
+{}
 ```
-
-`mem_file_path` becomes optional in `CreateSnapshotParams`. For a `Diff` with a
-memory backend connected it must be absent (400 otherwise: Firecracker does not
-write guest memory in this mode); in every other case it must be present, as
-today. The request carries no `mem_backend` field: whether a backend is
-connected is a property of the instance, fixed at boot or restore, and repeating
-it here would only add a way to get a 400. There are no other parameters.
 
 Response: `200 OK` with
 
 ```json
 {
-  "snapshot_type": "Diff",
   "memory": {
     "total_size": 65536,
     "page_size": 4096,
@@ -380,8 +386,9 @@ Response: `200 OK` with
 
 (A 64 KiB guest, for the sake of a readable example: each set is one Roaring
 array container, 16 and 20 bytes. Pages 0, 1 and 12 are to be copied from the
-memfd; pages 8 to 11, an unplugged virtio-mem slot, are to be zeroed; every
-other page is unchanged.)
+memfd; pages 8 to 11, an unplugged virtio-mem slot, are to be discarded; every
+other page is unchanged. The finalize step, `snapshot/create` with
+`"snapshot_type": "Backend"`, returns the same `memory` object.)
 
 Every page of the memory file is in exactly one of three classes, and the two
 bitmaps name two of them:
@@ -413,18 +420,25 @@ slots are dirty and never resident, so they are zero pages; Roaring stores them
 as one run per 65536-page container, a few bytes whatever the size of the
 hotplug region.
 
-Procedure, on the VMM thread, inside the paused API loop:
+Procedure, on the VMM thread, inside the API loop (for the pre-copy step
+`dirty-pages` the microVM may be running; for the finalize step
+`snapshot/create Backend` it is paused):
 
-1. require `Paused`, as today;
-1. validate `mem_file_path`, before anything is written;
-1. `save_state` and write vmstate to `snapshot_path`, as today (this runs
-   `prepare_save`: block drain, net RX buffer reset);
+1. require a memory backend (400 otherwise); for the finalize step require
+   `snapshot_type: Backend` with `mem_file_path` absent (400 otherwise), and the
+   `snapshot_path` is the create params' own path;
+1. for the finalize step, `save_state` and write vmstate to `snapshot_path`
+   (this runs `prepare_save`: block drain, net RX buffer reset) — first, so a
+   failure consumes no tracking state;
+1. `prepare_dirty_tracking_reset` (return device-marked, unwritten RX buffers
+   before the dirty state is read), for the running-guest case;
 1. read the dirty state: `KVM_GET_DIRTY_LOG` (or `mincore`, when tracking is
-   off) ORed with Firecracker's bitmap per plugged slot;
+   off) ORed with Firecracker's bitmap per plugged slot, plus the discard
+   bitmap;
 1. `mincore` over every plugged slot;
 1. classify (`SnapshotMemoryLayout::classify`: `dirty & resident`,
    `dirty - resident`, then `optimize()` to pick run containers; one function
-   shared with the benchmark), reset Firecracker's dirty bitmap;
+   shared with the benchmark), reset Firecracker's dirty and discard bitmaps;
 1. `mark_virtio_queue_memory_dirty`, as today, so queue pages are in the next
    diff;
 1. serialise: Roaring portable format then base64 per set, and return the body.
@@ -774,21 +788,24 @@ dirty information, and it is a handful of huge extents. A binary response
 `MediaType`) can be added later for peers that measure the base64 cost; it does
 not change the JSON contract.
 
-### 8. `PUT /snapshot/dirty-pages`: pre-copy passes
+### 8. `PUT /snapshot/dirty-pages`: the pre-copy workflow
 
 ```json
 PUT /snapshot/dirty-pages
 {}
 ```
 
-Response: `200 OK` with the same `memory` object as §7, or an error. There are
-no parameters; an empty body and `{}` are both accepted, and unknown fields are
-rejected, so that parameters can be added later.
+Response: `200 OK` with the same `memory` object as §7, or an error. The body is
+empty or `{}` and takes no parameters: it is always a pre-copy step that leaves
+the microVM running. The finalize step — writing the microVM state and ending
+the lineage — is `PUT /snapshot/create` with `snapshot_type: Backend` (§7), not
+a flag on this endpoint. Unknown fields are rejected, so that parameters can be
+added later.
 
 Semantics:
 
 - Callable in `Running` or `Paused`. Consuming: the same computation as steps
-  4–6 of §7 for `Diff`, followed by `mark_virtio_queue_memory_dirty`.
+  4–6 of §7, followed by `mark_virtio_queue_memory_dirty`.
 - Before resetting, Firecracker calls a new
   `VirtioDevice::prepare_dirty_tracking_reset` hook on every activated device.
   virtio-net marks RX buffers dirty when it *parses* them
@@ -802,8 +819,8 @@ Semantics:
 - Gives no atomicity with respect to concurrent guest or device writes: a page
   can be modified after the set was computed and before the peer copies it. It
   is then dirty again and will be in the next set. This is the intended use:
-  iterative pre-copy, with `PATCH /vm Paused` + `snapshot/create` as the final
-  pass.
+  iterative pre-copy, with `PATCH /vm Paused` + a finalizing `snapshot/create`
+  with `snapshot_type: Backend` as the final pass.
 - **Rejected with 400 when no memory backend is connected.** See the decision
   below.
 
@@ -1020,8 +1037,9 @@ implementations are driven from identical inputs:
   zero-writes the partial ones, and marks the whole range; the freed pages are
   holes and the edges resident zeros
   (`test_discard_range_on_hugetlbfs_memfd_zeroes_edges`).
-- Request validation: `mem_file_path` is required or forbidden per snapshot type
-  and backend presence, checked before anything is written
+- Request validation: `mem_file_path` is required for both `Full` and `Diff`,
+  backend attached or not (`snapshot/create` is unchanged), checked before
+  anything is written
   (`persist::tests::test_create_snapshot_params_validation`).
 - The invariant: marking a range through `GuestMemorySlice::new` faults it in
   (`test_fault_in_marked_range`).
@@ -1034,31 +1052,33 @@ control socket and `copy()`), `Microvm.mem_backend`,
 `Microvm.spawn_mem_backend`, `Microvm.dirty_pages`, `make_snapshot` branching on
 an attached backend, `restore_from_snapshot(mem_backend=True)`,
 `basic_config(mem_backend=<handler>)`, and `http_api.request` accepting `200`
-for `PUT`). The framework plays the orchestrator: it calls `snapshot/create`,
-forwards the body to the backend's control socket. Definitions: `M_full(t)` is
-the backend's copy of all plugged pages; `M_diff(t0,t1)` is the backend's sparse
-file of the pages returned by a `Diff` `snapshot/create` at `t1`; `rebase` is
-the existing `rebase-snap` tool / `Snapshot.rebase_snapshot`.
+for `PUT`). The framework plays the orchestrator: it calls
+`snapshot/dirty-pages` (pre-copy) and `snapshot/create` with
+`snapshot_type: Backend` (finalize), forwarding the body to the backend's
+control socket. Definitions: `M_full(t)` is the backend's copy of all plugged
+pages; `M_diff(t0,t1)` is the backend's sparse file of the pages returned by a
+finalizing `snapshot/create Backend` at `t1`; `rebase` is the existing
+`rebase-snap` tool / `Snapshot.rebase_snapshot`.
 
-1. First diff of a booted microVM: boot with a backend, run a workload, pause,
-   `snapshot/create Diff` into a fresh file → `M(t0)`, a complete memory file
-   since unchanged pages are zero after a boot. Assert size `total_size`, that
-   it equals Firecracker's own `Full` of the same state, and that Firecracker
-   restores from it (`File` backend) with a healthy guest.
+1. First diff of a booted microVM: boot with a backend, run a workload, pause, a
+   finalizing `snapshot/create Backend` into a fresh file → `M(t0)`, a complete
+   memory file since unchanged pages are zero after a boot. Assert size
+   `total_size`, that it equals Firecracker's own `Full` of the same state, and
+   that Firecracker restores from it (`File` backend) with a healthy guest.
    (`test_boot_diff_snapshot_restores`)
 1. Diff self-consistency (the backend-side analogue of
    `test_snapshot_basic.py::test_cmp_full_and_first_diff_mem`): resume, run a
-   workload, pause, `snapshot/create Diff` → `M_diff(t0,t1)`; still paused,
-   `snapshot/create Full` → `M_full(t1)`. Assert
+   workload, pause, a finalizing `snapshot/create Backend` → `M_diff(t0,t1)`;
+   still paused, `snapshot/create Full` → `M_full(t1)`. Assert
    `rebase(M_full(t0), M_diff) == M_full(t1)`. Any dirty page missed by the
    bitmap computation shows up as a mismatch. (`test_diff_self_consistency`)
 1. Chains: several diffs rebased onto the base equal a final full copy, and the
    rebased result restores with a healthy guest. (`test_diff_chain_restores`)
-1. Pre-copy: while running a workload, issue several `dirty-pages` requests and
-   copy each set; pause; `snapshot/create Diff`; copy. The result must equal a
-   `Full` taken right after. Exercises the `prepare_dirty_tracking_reset` hook
-   under ssh traffic. (`test_precopy_dirty_pages`,
-   `test_dirty_pages_are_consumed`)
+1. Pre-copy: while running a workload, issue several `snapshot/dirty-pages`
+   requests and copy each set; pause; a finalizing `snapshot/create Backend`;
+   copy. The result must equal a `Full` taken right after. Exercises the
+   `prepare_dirty_tracking_reset` hook under ssh traffic.
+   (`test_precopy_dirty_pages`, `test_dirty_pages_are_consumed`)
 1. Pause invariant: pause a VM with a backend, take `M_full`, inject tap traffic
    (ssh connection attempts) for a few seconds, take another `M_full` while
    still paused. Assert the two copies are identical and the net device's RX
@@ -1067,21 +1087,21 @@ the existing `rebase-snap` tool / `Snapshot.rebase_snapshot`.
    stronger.)
 1. Cross-check against a Firecracker-made snapshot: restore one VM with a
    backend and one without from the same base snapshot, keep both paused, take a
-   backend `Diff` rebased onto the base, a `Full` written by Firecracker through
-   the backend (every never-populated page faulted in), and a classic `Full`,
-   compare. Correction: the two are *not* byte-identical, because KVM writes the
-   kvmclock pages (wall clock, per-vCPU time info) with the current time when
-   their MSRs are set at restore. The test computes the pages at which the
-   classic copy differs from the base (a handful) and requires every difference
-   of the backend copy, to the base and to the classic copy, to be within that
-   set. (`test_cross_check_with_firecracker_snapshot`)
+   backend `Backend` diff rebased onto the base, a `Full` written by Firecracker
+   through the backend (every never-populated page faulted in), and a classic
+   `Full`, compare. Correction: the two are *not* byte-identical, because KVM
+   writes the kvmclock pages (wall clock, per-vCPU time info) with the current
+   time when their MSRs are set at restore. The test computes the pages at which
+   the classic copy differs from the base (a handful) and requires every
+   difference of the backend copy, to the base and to the classic copy, to be
+   within that set. (`test_cross_check_with_firecracker_snapshot`)
 1. Balloon: (a) boot with a backend, `M_full(t0)`, inflate while running,
-   `Diff`, `Full`, `rebase == Full`, which needs the discarded ranges both
-   punched (zeros in `Full`) and marked dirty (present in `Diff`); (b) same
-   after a restore with a backend, where the handler receives `remove` events
-   for a mix of populated and never-populated pages, then deflate, reuse the
-   memory and restore from the result (with 2M pages, only whole huge pages the
-   guest released in one range are freed and marked, so the test only checks
+   `Backend`, `Full`, `rebase == Full`, which needs the discarded ranges both
+   punched (zeros in `Full`) and marked dirty (present in the `Backend` diff);
+   (b) same after a restore with a backend, where the handler receives `remove`
+   events for a mix of populated and never-populated pages, then deflate, reuse
+   the memory and restore from the result (with 2M pages, only whole huge pages
+   the guest released in one range are freed and marked, so the test only checks
    identity there); (c) Firecracker's RSS drops on inflate with memfd-backed
    memory. (`test_balloon_inflate_at_boot`,
    `test_balloon_inflate_after_restore`, `test_balloon_inflate_reclaims_memory`;
@@ -1112,13 +1132,16 @@ Compatibility tests (all in the same file unless noted):
   `Uffd` and with `File`; restore with `Uffd`/`SharedMemfd` → snapshot → restore
   with `SharedMemfd`; in each case the resulting VM snapshots correctly in its
   new mode.
-- Negative: `snapshot/create Diff` with `mem_file_path` and a backend → 400;
-  `Full` without `mem_file_path`, backend or not → 400; `dirty-pages` without a
-  backend → 400; unknown fields on either endpoint → 400 without consuming or
-  writing anything; `machine-config.mem_backend` with `File`/`Uffd` → 400;
-  unreachable backend fails `InstanceStart`; backend process killed → VM keeps
-  running, `snapshot/create Diff` still returns the layout, the orchestrator's
-  copy fails.
+- Negative: `snapshot/create` without `mem_file_path` for `Full` or `Diff`,
+  backend or not → 400; `snapshot/create` with `snapshot_type: Backend` and no
+  backend attached → 400 (`BackendWithoutMemBackend`); `snapshot/create` with
+  `snapshot_type: Backend` and a `mem_file_path` present → 400
+  (`MemFilePathWithBackendType`); `snapshot/dirty-pages` without a backend →
+  400; unknown fields on either endpoint → 400 without consuming or writing
+  anything; `machine-config.mem_backend` with `File`/`Uffd` → 400; unreachable
+  backend fails `InstanceStart`; backend process killed → VM keeps running, a
+  finalizing `snapshot/create Backend` still returns the layout, the
+  orchestrator's copy fails.
 
 ### 11. Security and operational notes
 
@@ -1177,13 +1200,17 @@ user can see.
    `Vmm.mem_backend_attached`; swagger.
 1. `snapshot/load` with `backend_type: SharedMemfd`: memfd-backed memory, uffd
    registered on the shmem mapping, handshake with `[uffd, memfd]`; swagger.
-1. `PUT /snapshot/create Diff` with a backend: `mem_file_path: Option`, the two
-   rejections, `KvmVm::snapshot_memory_layout`, `VmmData::SnapshotMemory`, 200
-   body; `Full` unchanged; swagger.
-1. `PUT /snapshot/dirty-pages`: `VmmAction::GetDirtyPages`, `Vmm::dirty_pages`,
-   `VirtioDevice::prepare_dirty_tracking_reset` with the virtio-net
-   implementation; swagger. (The hook goes away with mark-after-write, next
-   list.)
+1. API wiring for the backend workflow: `PUT /snapshot/dirty-pages`
+   (`VmmAction::GetDirtyPages`, `Vmm::dirty_pages`, requires a backend, leaves
+   the microVM running) for the pre-copy step; `SnapshotType::Backend` added
+   alongside `Full` and `Diff`, handled in `persist::create_snapshot` (which now
+   returns `Option<SnapshotMemoryLayout>`: `Some` for `Backend`, `None` for
+   `Full`/`Diff`) for the finalize step, writing vmstate and no guest memory;
+   `KvmVm::snapshot_memory_layout`, `VmmData::SnapshotMemory`, 200 body;
+   `Full`/`Diff` `snapshot/create` unchanged from upstream; swagger.
+1. `VirtioDevice::prepare_dirty_tracking_reset` with the virtio-net
+   implementation, driven by `Vmm::dirty_pages`; swagger. (The hook goes away
+   with mark-after-write, next list.)
 1. Example handlers: `Handshake` with all fds, `fstat`-based fd classification,
    optional memory file, `copy_pages` from the two Roaring sets, control socket,
    unit tests.
@@ -1233,25 +1260,31 @@ user can see.
 - Dirty information is exchanged over the HTTP API as two bitmaps that classify
   every page of the memory file: `pages_to_copy` (dirty ∧ resident) and
   `pages_to_discard` (dirty ∧ ¬resident), as Roaring bitmaps of host-page
-  indices in the portable format, base64-encoded, in the `snapshot/create`
-  response (final, consistent set) and from `PUT /snapshot/dirty-pages`
-  (pre-copy, consuming, any state). A range list was the first choice and was
-  replaced after measuring it (§7); a dirty bitmap plus `unplugged` list plus
-  `populated` bitmap was the second and was replaced by the two class bitmaps
-  after measuring those; chunked, trailing-trimmed class bitmaps were the third,
-  PackBits-compressed full-length ones the fourth, and Roaring replaced both
-  after measuring (§7). The authoritative set is a superset of the modified
-  resident pages, not promised to be exact.
+  indices in the portable format, base64-encoded, from the finalizing
+  `snapshot/create` with `snapshot_type: Backend` (final, consistent set) and
+  from `PUT /snapshot/dirty-pages` (pre-copy, consuming, any state). A range
+  list was the first choice and was replaced after measuring it (§7); a dirty
+  bitmap plus `unplugged` list plus `populated` bitmap was the second and was
+  replaced by the two class bitmaps after measuring those; chunked,
+  trailing-trimmed class bitmaps were the third, PackBits-compressed full-length
+  ones the fourth, and Roaring replaced both after measuring (§7). The
+  authoritative set is a superset of the modified resident pages, not promised
+  to be exact.
 - Firecracker upholds "dirty ⇒ memfd authoritative or zero" by faulting in every
   range it marks dirty ahead of writing it (`fault_in_marked_range`), and takes
   `mincore` after reading the dirty state. `discard_range` leaves every page of
   a discarded range reading as zero (freed, or zero-written where a huge page
   cannot be freed) before marking it.
-- Firecracker writes `Full` snapshots, backend or not; only a `Diff` with a
-  backend goes to the backend: `PUT /snapshot/create Diff` then never writes
-  memory, takes no `mem_file_path`, and answers 200 instead of 204.
-- `PUT /snapshot/dirty-pages` is rejected without a memory backend. A
-  non-consuming variant is possible later if a use case appears.
+- `snapshot/create` is unchanged from upstream, backend or not; the backend
+- `Full`/`Diff` `snapshot/create` is unchanged from upstream, backend or not;
+  the backend workflow uses two existing-style endpoints:
+  `PUT /snapshot/dirty-pages` returns the layout (200) for pre-copy, consuming
+  the tracking state, and `snapshot/create` with `snapshot_type: Backend`
+  returns the layout and writes the microVM state for the finalize step. Neither
+  writes guest memory.
+- Both `PUT /snapshot/dirty-pages` and `snapshot/create Backend` are rejected
+  without a memory backend. A non-consuming variant is possible later if a use
+  case appears.
 - A lost `Diff` response is the orchestrator's problem; it falls back to `Full`.
 - Restore with a backend always uses a uffd for population; file population with
   sharing is deferred.

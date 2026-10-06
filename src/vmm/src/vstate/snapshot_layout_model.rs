@@ -34,7 +34,7 @@
 //! instead, which faults it in; whether the write happens is one of the two bugs below), unplug
 //! and plug of a virtio-mem page, and the snapshot itself: read the
 //! marks, read residency (a guest write may race between the two and between the second and the
-//! reset, modelling `dirty-pages` on a running guest), classify, reset, re-arm the virtqueue
+//! reset, modelling `incremental` on a running guest), classify, reset, re-arm the virtqueue
 //! pages, and have the backend apply the layout.
 //!
 //! The backend applies a returned layout whenever it gets to it, not inside the API call: layouts
@@ -77,7 +77,7 @@
 //! zeros to the partial huge pages it cannot free, so every page it marks is a zero hole or
 //! resident zeros), without which a partially covered huge page would be a marked base hole too.
 //! The order of the two reads
-//! ([`RESIDENCY_AFTER_DIRTY`]) is what makes a racy `dirty-pages` pass preserve `I`. The
+//! ([`RESIDENCY_AFTER_DIRTY`]) is what makes a racy `incremental` pass preserve `I`. The
 //! `should_panic` harnesses show that dropping any of the three breaks the proof.
 
 #![allow(dead_code)]
@@ -191,7 +191,7 @@ pub struct Layout {
     pub zero: [bool; PAGES],
 }
 
-/// Guest writes that may race with a `dirty-pages` request on a running guest: one between
+/// Guest writes that may race with an `incremental` request on a running guest: one between
 /// reading the dirty state and reading residency, one between residency and the reset of
 /// Firecracker's bitmap. Device writes cannot race: they run on the thread that computes the
 /// layout. `None` is a paused guest.
@@ -975,7 +975,7 @@ mod verification {
         }
     }
 
-    /// A paused snapshot is also correct after a racy `dirty-pages` pass whose layout the backend
+    /// A paused snapshot is also correct after a racy `incremental` pass whose layout the backend
     /// applies only later: what the running guest wrote in between is in the next set.
     #[kani::proof]
     #[kani::unwind(5)]

@@ -19,18 +19,24 @@ and this project adheres to
   `snapshot/load.mem_backend.backend_type: SharedMemfd` has its guest memory
   backed by a single memfd laid out like a memory snapshot file, which is handed
   to the page fault handler process through the existing UFFD handshake (as an
-  additional file descriptor). A `Diff` `PUT /snapshot/create` then takes no
-  `mem_file_path` and answers `200 OK` with two sets of pages classifying every
-  page of the memory file, as base64-encoded Roaring bitmaps: `pages_to_copy`
-  (copy from the memfd) and `pages_to_discard` (discarded by the guest, read as
-  zero; the backend should zero them but may leave their previous content with a
-  well-behaved Linux guest), every other page being unchanged; `Full` snapshots
-  are written by Firecracker as without a backend. The new
-  `PUT /snapshot/dirty-pages` endpoint returns (and resets) the same bitmaps for
-  pre-copy while the guest runs. Firecracker guarantees that a page it reports
-  dirty is either in the memfd or zero (pages it marks dirty ahead of writing
-  are faulted in), so a backend needs no record of its own to produce a diff.
-  See [memory backend](docs/snapshotting/shared-memfd.md).
+  additional file descriptor). The backend workflow is split across two
+  endpoints. `PUT /snapshot/dirty-pages` (empty body or `{}`) is the pre-copy
+  step: it answers `200 OK` with two sets of pages classifying every page of the
+  memory file, as base64-encoded Roaring bitmaps: `pages_to_copy` (copy from the
+  memfd) and `pages_to_discard` (discarded by the guest, read as zero; the
+  backend should zero them but may leave their previous content with a
+  well-behaved Linux guest), every other page being unchanged. It consumes the
+  dirty/discard tracking state, the microVM keeps running, and it is rejected
+  with `400` if no memory backend is attached. `PUT /snapshot/create` with the
+  new `snapshot_type: Backend` is the finalize step: `mem_file_path` must be
+  absent, Firecracker writes the microVM state to `snapshot_path` and no guest
+  memory, and answers `200 OK` with the same `memory` object, ending the
+  lineage. `Full` and `Diff` snapshots are unchanged from upstream (they require
+  `mem_file_path`, write the whole memory file and answer `204`), backend
+  attached or not. Firecracker guarantees that a page it reports dirty is either
+  in the memfd or zero (pages it marks dirty ahead of writing are faulted in),
+  so a backend needs no record of its own to produce a diff. See
+  [memory backend](docs/snapshotting/shared-memfd.md).
 
 ### Changed
 

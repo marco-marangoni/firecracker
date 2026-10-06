@@ -72,7 +72,7 @@ pub enum VmmAction {
     /// Get the ballon device latest statistics.
     GetBalloonStats,
     /// Get (and consume) the guest memory pages dirtied since the last snapshot or dirty-pages
-    /// request. Only allowed with a memory backend attached.
+    /// request, for pre-copy. Only allowed with a memory backend attached.
     GetDirtyPages,
     /// Get complete microVM configuration in JSON format.
     GetFullVmConfig,
@@ -951,6 +951,9 @@ impl RuntimeApiController {
         if create_params.snapshot_type == SnapshotType::Diff {
             log_dev_preview_warning("Virtual machine diff snapshots", None);
         }
+        if create_params.snapshot_type == SnapshotType::Backend {
+            log_dev_preview_warning("Virtual machine backend snapshots", None);
+        }
 
         let mut locked_vmm = self.vmm.lock().unwrap();
         let vm_info = VmInfo::from(&*locked_vmm);
@@ -969,7 +972,7 @@ impl RuntimeApiController {
                     elapsed_time_us
                 );
             }
-            SnapshotType::Diff => {
+            SnapshotType::Diff | SnapshotType::Backend => {
                 let elapsed_time_us = update_metric_with_elapsed_time(
                     &METRICS.latencies_us.vmm_diff_create_snapshot,
                     create_start_us,

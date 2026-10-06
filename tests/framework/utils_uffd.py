@@ -118,7 +118,7 @@ class UffdHandler:
 
     def copy(self, memory: dict, mem_path: str):
         """Ask the handler to apply the `memory` object returned by Firecracker
-        (`PUT /snapshot/create` for a diff, or `PUT /snapshot/dirty-pages`) to
+        (`PUT /snapshot/create` for a diff, or `PUT /snapshot/incremental`) to
         `mem_path`, a path inside the handler's chroot: authoritative pages from
         the memfd, zero pages zeroed, the rest left alone. Creates the file at
         `total_size` or merges into an existing one.

@@ -155,7 +155,7 @@ impl ApiServer {
                     &METRICS.latencies_us.full_create_snapshot,
                     "create full snapshot",
                 )),
-                SnapshotType::Diff => Some((
+                SnapshotType::Diff | SnapshotType::Backend => Some((
                     &METRICS.latencies_us.diff_create_snapshot,
                     "create diff snapshot",
                 )),
