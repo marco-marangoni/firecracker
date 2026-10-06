@@ -505,14 +505,9 @@ mod tests {
                 "body {body:?}"
             );
         }
-        parse_put_snapshot(
-            &Body::new(r#"{"zero_chunk_size": 4096}"#),
-            Some("dirty-pages"),
-        )
-        .unwrap_err();
         parse_put_snapshot(&Body::new(r#"{"format": "ranges"}"#), Some("dirty-pages")).unwrap_err();
         parse_put_snapshot(&Body::new("not json"), Some("dirty-pages")).unwrap_err();
-        // The old name is gone.
-        parse_put_snapshot(&Body::new("{}"), Some("dirty-ranges")).unwrap_err();
+        // The incremental endpoint name is not valid.
+        parse_put_snapshot(&Body::new("{}"), Some("incremental")).unwrap_err();
     }
 }

@@ -20,6 +20,11 @@ pub enum SnapshotType {
     /// Full snapshot.
     #[default]
     Full,
+    /// Backend snapshot: for a microVM with a memory backend attached, Firecracker does not write
+    /// guest memory but returns the layout of the pages that changed since the last snapshot or
+    /// `dirty-pages` call (the backend produces the memory from it), and writes the microVM state.
+    /// Finalizes the incremental workflow begun with `PUT /snapshot/dirty-pages`.
+    Backend,
 }
 
 /// Specifies the method through which guest memory will get populated when
@@ -52,9 +57,7 @@ pub struct CreateSnapshotParams {
     pub snapshot_type: SnapshotType,
     /// Path to the file that will contain the microVM state.
     pub snapshot_path: PathBuf,
-    /// Path to the file that will contain the guest memory. Mandatory, except for a `Diff`
-    /// snapshot of a microVM with a memory backend attached, where it must be absent: the
-    /// backend produces the diff from the layout returned in the response.
+    /// Path to the file that will contain the guest memory. Mandatory.
     #[serde(default)]
     pub mem_file_path: Option<PathBuf>,
     /// Whether to fsync the snapshot state and guest memory files.
@@ -204,7 +207,7 @@ pub struct Vm {
 
 /// Describes, to a memory backend, which pages of the guest memory file a diff snapshot consists
 /// of and where their content is. Returned by `PUT /snapshot/create` (`Diff`) and
-/// `PUT /snapshot/dirty-pages` when a memory backend is attached. (`Full` snapshots are written
+/// `PUT /snapshot/create` (Backend) when a memory backend is attached. (`Full` snapshots are written
 /// by Firecracker itself, backend or not.)
 ///
 /// Every page of the file falls in exactly one of three classes:
@@ -359,7 +362,7 @@ mod roaring_base64 {
     }
 }
 
-/// Body of a successful `PUT /snapshot/create` or `PUT /snapshot/dirty-pages` when a memory
+/// Body of a successful `PUT /snapshot/create` (Backend) or `PUT /snapshot/dirty-pages` when a memory
 /// backend is attached.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct SnapshotMemoryResponse {

@@ -4,10 +4,11 @@
 through a memfd and producing memory snapshots from it, byte-for-byte identical
 to the ones Firecracker writes itself.
 
-The test framework plays the orchestrator: it calls `PUT /snapshot/create` (or
-`PUT /snapshot/dirty-pages`), receives the `memory` object and forwards it to
-the example handler's control socket, which copies the set pages out of the memfd.
-Full snapshots are Firecracker's own, memory backend or not.
+The test framework plays the orchestrator: it calls `PUT /snapshot/create` (with
+`snapshot_type: Backend`) or `PUT /snapshot/dirty-pages`, receives the `memory`
+object and forwards it to the example handler's control socket, which copies the
+set pages out of the memfd. Full snapshots are Firecracker's own, memory backend
+or not.
 """
 
 # pylint: disable=too-many-lines
@@ -341,10 +342,11 @@ def test_precopy_dirty_pages(uvm, huge_pages):
         check_layout(memory, MEM_SIZE_MIB * 2**20)
         assert authoritative_bytes(memory) > 0, "a running guest dirties something"
 
-    # Final pass while paused, merged into the same file.
+    # Final pass while paused, merged into the same file, via `snapshot/create` with the
+    # `Backend` type (writes the microVM state and ends the lineage).
     vm.pause()
     memory = vm.api.snapshot_create.put(
-        snapshot_path="vmstate", snapshot_type="Diff"
+        snapshot_path="vmstate", snapshot_type="Backend"
     ).json()["memory"]
     check_layout(memory, MEM_SIZE_MIB * 2**20)
     vm.mem_backend.copy(memory, "/mem_precopy")
@@ -1007,7 +1009,7 @@ def test_negative_api(uvm, microvm_factory, guest_kernel, rootfs):
         vm.api.actions.put(action_type="InstanceStart")
     vm.kill()
 
-    # Without a backend: mem_file_path stays mandatory, dirty-pages is rejected.
+    # Without a backend: mem_file_path stays mandatory, dirty-pages and Backend are rejected.
     plain = microvm_factory.build(guest_kernel, rootfs)
     plain.spawn()
     plain.basic_config(vcpu_count=2, mem_size_mib=MEM_SIZE_MIB, track_dirty_pages=True)
@@ -1021,24 +1023,30 @@ def test_negative_api(uvm, microvm_factory, guest_kernel, rootfs):
             plain.api.snapshot_create.put(
                 snapshot_path="vmstate", snapshot_type=snapshot_type
             )
+    with pytest.raises(RuntimeError, match="requires a memory backend"):
+        plain.api.snapshot_create.put(snapshot_path="vmstate", snapshot_type="Backend")
     plain.resume()
     plain.ssh.check_output("true")
     plain.kill()
 
-    # With a backend: a Full is Firecracker's own (mem_file_path required); for a Diff
-    # mem_file_path must be absent; unknown fields are rejected before anything is written or
-    # consumed; a dead backend does not fail a Diff.
+    # With a backend: `Full`/`Diff` on `snapshot/create` behave exactly as without one
+    # (mem_file_path required). `Backend` is the backend path: mem_file_path must be absent,
+    # unknown fields are rejected before anything is written or consumed, and a dead backend
+    # does not fail it. `dirty-pages` is the pre-copy path.
     backed = boot_with_mem_backend(microvm_factory.build(guest_kernel, rootfs))
     backed.pause()
-    with pytest.raises(RuntimeError, match="mem_file_path"):
-        backed.api.snapshot_create.put(snapshot_path="vmstate", snapshot_type="Full")
+    for snapshot_type in ("Full", "Diff"):
+        with pytest.raises(RuntimeError, match="mem_file_path"):
+            backed.api.snapshot_create.put(
+                snapshot_path="vmstate", snapshot_type=snapshot_type
+            )
     with pytest.raises(RuntimeError, match="mem_file_path"):
         backed.api.snapshot_create.put(
-            snapshot_path="vmstate", mem_file_path="mem", snapshot_type="Diff"
+            snapshot_path="vmstate", mem_file_path="mem", snapshot_type="Backend"
         )
     with pytest.raises(RuntimeError, match="zero_chunk_size"):
         backed.api.snapshot_create.put(
-            snapshot_path="vmstate_bad", snapshot_type="Diff", zero_chunk_size=4096
+            snapshot_path="vmstate_bad", snapshot_type="Backend", zero_chunk_size=4096
         )
     with pytest.raises(RuntimeError, match="zero_chunk_size"):
         backed.api.snapshot_dirty_pages.put(zero_chunk_size=4096)
@@ -1050,7 +1058,7 @@ def test_negative_api(uvm, microvm_factory, guest_kernel, rootfs):
     backed.ssh.check_output("true")
     backed.pause()
     memory = backed.api.snapshot_create.put(
-        snapshot_path="vmstate", snapshot_type="Diff"
+        snapshot_path="vmstate", snapshot_type="Backend"
     ).json()["memory"]
     check_layout(memory, MEM_SIZE_MIB * 2**20)
     with pytest.raises((ConnectionError, FileNotFoundError, OSError)):
@@ -1063,7 +1071,8 @@ def test_negative_api(uvm, microvm_factory, guest_kernel, rootfs):
 @pytest.mark.parametrize("snapshot_type", [SnapshotType.FULL, SnapshotType.DIFF])
 def test_snapshot_types_with_backend(uvm, snapshot_type):
     """The file has the full size either way: a Full is written by Firecracker (204, no
-    layout), a Diff by the backend from the layout in the 200 response."""
+    layout), a Diff by the backend from the layout of a `snapshot/create` with
+    `snapshot_type: Backend` (200)."""
     vm = boot_with_mem_backend(uvm)
     snapshot = vm.make_snapshot(snapshot_type)
     assert snapshot.mem.stat().st_size == MEM_SIZE_MIB * 2**20

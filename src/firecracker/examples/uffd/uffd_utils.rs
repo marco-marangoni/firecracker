@@ -61,7 +61,7 @@ pub struct MemoryRange {
 
 // This is the same with the one used in src/vmm (`SnapshotMemoryLayout`).
 /// The `memory` object returned by `PUT /snapshot/create` (`Diff`) and
-/// `PUT /snapshot/dirty-pages` when a memory backend is attached: which pages of the memory file
+/// `PUT /snapshot/create` (Backend) or `PUT /snapshot/dirty-pages` when a memory backend is attached: which pages of the memory file
 /// make up the diff and where their content is. Every page is in one of three classes: *memfd
 /// authoritative* (copy it from the memfd), *zero* (make it read as zero), or neither (unchanged,
 /// not part of the diff). Full snapshots are written by Firecracker itself.
