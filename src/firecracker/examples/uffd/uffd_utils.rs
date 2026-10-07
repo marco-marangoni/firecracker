@@ -119,28 +119,26 @@ impl DecodedLayout {
     }
 
     /// Runs of consecutive pages of the same class, in file order, `Unchanged` runs omitted.
-    /// Iterates the two sets, so the cost is proportional to the number of pages in the diff,
-    /// not to the size of the file.
+    /// Walks the two sets run by run (`Iter::next_range`), so the cost is proportional to the
+    /// number of runs in the diff, not to the number of pages: a released or unplugged region
+    /// of any size is one step.
     pub fn runs(&self) -> Vec<(PageClass, MemoryRange)> {
         let mut runs: Vec<(PageClass, MemoryRange)> = Vec::new();
         for (class, set) in [
             (PageClass::Authoritative, &self.authoritative),
             (PageClass::Zero, &self.zero),
         ] {
-            for page in set.iter() {
-                let offset = u64::from(page) * self.page_size;
-                match runs.last_mut() {
-                    Some((last, range)) if *last == class && range.offset + range.len == offset => {
-                        range.len += self.page_size
-                    }
-                    _ => runs.push((
-                        class,
-                        MemoryRange {
-                            offset,
-                            len: self.page_size,
-                        },
-                    )),
-                }
+            let mut pages = set.iter();
+            while let Some(run) = pages.next_range() {
+                let first = u64::from(*run.start());
+                let count = u64::from(*run.end()) - first + 1;
+                runs.push((
+                    class,
+                    MemoryRange {
+                        offset: first * self.page_size,
+                        len: count * self.page_size,
+                    },
+                ));
             }
         }
         // Authoritative runs then zero runs; put them in file order for sequential I/O.
