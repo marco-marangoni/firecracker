@@ -113,6 +113,7 @@ def boot_vsock_vm(
     log_level=None,
     emit_metrics=False,
     pin_threads=False,
+    **config_kwargs,
 ):
     """Spawn, configure and start a microVM with a vsock device attached."""
     spawn_kwargs = {}
@@ -122,7 +123,7 @@ def boot_vsock_vm(
         spawn_kwargs["emit_metrics"] = True
     vm.spawn(**spawn_kwargs)
 
-    config_kwargs = {}
+    config_kwargs = dict(config_kwargs)
     if vcpu_count is not None:
         config_kwargs["vcpu_count"] = vcpu_count
     if mem_size_mib is not None:

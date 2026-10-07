@@ -192,21 +192,23 @@ impl RxBuffers {
     ) {
         self.used_bytes = bytes_written;
 
-        let mut used_heads: u16 = 0;
-        for parsed_dc in self.parsed_descriptors.iter() {
-            let used_bytes = bytes_written.min(parsed_dc.length);
-            // Safe because we know head_index isn't out of bounds
-            rx_queue
-                .write_used_element(self.used_descriptors, parsed_dc.head_index, used_bytes)
-                .unwrap();
-            bytes_written -= used_bytes;
-            self.used_descriptors += 1;
-            used_heads += 1;
-
-            if bytes_written == 0 {
-                break;
+        // One used element per chain the frame spilled into, the last one holding the remainder.
+        // Writing them as one run marks the used ring dirty once per frame, not once per chain.
+        let mut done = false;
+        let used_elements = self.parsed_descriptors.iter().map_while(|parsed_dc| {
+            if done {
+                return None;
             }
-        }
+            let used_bytes = bytes_written.min(parsed_dc.length);
+            bytes_written -= used_bytes;
+            done = bytes_written == 0;
+            Some((parsed_dc.head_index, used_bytes))
+        });
+        // Safe because we know head_index isn't out of bounds
+        let used_heads = rx_queue
+            .write_used_elements(self.used_descriptors, used_elements)
+            .unwrap();
+        self.used_descriptors += used_heads;
 
         // We need to set num_buffers before dropping chains from `self.iovec`. Otherwise
         // when we set headers, we will iterate over new, yet unused chains instead of the ones

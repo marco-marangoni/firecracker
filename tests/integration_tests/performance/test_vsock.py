@@ -9,6 +9,8 @@ import subprocess
 from pathlib import Path
 
 import pytest
+
+from framework.utils_hugepages import HugePagesConfig
 from tenacity import Retrying, stop_after_attempt, wait_fixed
 
 from framework.artifacts import ACPI_GUEST_KERNELS, pin_guest_kernel
@@ -24,8 +26,16 @@ from framework.utils_vsock import (
 pytestmark = pin_guest_kernel(ACPI_GUEST_KERNELS)
 
 
+@pytest.fixture(
+    params=[HugePagesConfig.NONE, HugePagesConfig.HUGETLBFS_2MB], ids=["4k", "2m"]
+)
+def huge_pages(request):
+    """Guest memory backing, always with dirty page tracking on."""
+    return request.param
+
+
 @pytest.fixture
-def vsock_uvm(uvm, request):
+def vsock_uvm(uvm, request, huge_pages):
     """Fixture to initialize a microVM with vsock device for perf tests."""
     vcpus = request.param if hasattr(request, "param") else 1
 
@@ -36,6 +46,8 @@ def vsock_uvm(uvm, request):
         log_level="Info",
         emit_metrics=True,
         pin_threads=True,
+        track_dirty_pages=True,
+        huge_pages=huge_pages,
     )
 
 
@@ -120,6 +132,7 @@ def consume_vsock_ping_output(ping_output):
 @pytest.mark.parametrize("mode", ["g2h", "h2g"])
 def test_vsock_throughput(
     uvm,
+    huge_pages,
     vcpus,
     payload_length,
     mode,
@@ -133,7 +146,12 @@ def test_vsock_throughput(
     mem_size_mib = 1024
     vm = uvm
     vm.spawn(log_level="Info", emit_metrics=True)
-    vm.basic_config(vcpu_count=vcpus, mem_size_mib=mem_size_mib)
+    vm.basic_config(
+        vcpu_count=vcpus,
+        mem_size_mib=mem_size_mib,
+        track_dirty_pages=True,
+        huge_pages=huge_pages,
+    )
     vm.add_net_iface()
     # Create a vsock device
     vm.api.vsock.put(vsock_id="vsock0", guest_cid=3, uds_path="/" + VSOCK_UDS_PATH)
@@ -144,6 +162,7 @@ def test_vsock_throughput(
             "performance_test": "test_vsock_throughput",
             "payload_length": payload_length,
             "mode": mode,
+            "mem_config": str(huge_pages),
             **vm.dimensions,
         }
     )
@@ -167,7 +186,7 @@ def test_vsock_throughput(
 
 @pytest.mark.nonci
 @pytest.mark.parametrize("vsock_uvm", [1, 2], indirect=True, ids=["1vcpu", "2vcpu"])
-def test_vsock_latency_g2h(vsock_uvm, metrics, bin_vsock_path):
+def test_vsock_latency_g2h(vsock_uvm, huge_pages, metrics, bin_vsock_path):
     """
     Test VSOCK latency for guest-to-host connections.
 
@@ -183,6 +202,7 @@ def test_vsock_latency_g2h(vsock_uvm, metrics, bin_vsock_path):
         {
             "performance_test": "test_vsock_latency",
             "mode": "g2h",
+            "mem_config": str(huge_pages),
             **vm.dimensions,
         }
     )
@@ -232,7 +252,7 @@ def test_vsock_latency_g2h(vsock_uvm, metrics, bin_vsock_path):
 
 @pytest.mark.nonci
 @pytest.mark.parametrize("vsock_uvm", [1, 2], indirect=True, ids=["1vcpu", "2vcpu"])
-def test_vsock_latency_h2g(vsock_uvm, metrics, bin_vsock_path):
+def test_vsock_latency_h2g(vsock_uvm, huge_pages, metrics, bin_vsock_path):
     """
     Test VSOCK latency for host-to-guest connections.
 
@@ -248,6 +268,7 @@ def test_vsock_latency_h2g(vsock_uvm, metrics, bin_vsock_path):
         {
             "performance_test": "test_vsock_latency",
             "mode": "h2g",
+            "mem_config": str(huge_pages),
             **vm.dimensions,
         }
     )

@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use bitvec::vec::BitVec;
 use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
 use serde::{Deserialize, Serialize};
-pub use vm_memory::bitmap::{AtomicBitmap, BS, Bitmap, BitmapSlice};
+pub use vm_memory::bitmap::{AtomicBitmap, BS, Bitmap, BitmapSlice, RefSlice, WithBitmapSlice};
 pub use vm_memory::mmap::MmapRegionBuilder;
 use vm_memory::mmap::{MmapRegionError, NewBitmap};
 pub use vm_memory::{
@@ -37,12 +37,69 @@ use crate::{DirtyBitmap, align_up, warn_unrestricted};
 /// Type of GuestMemoryMmap.
 pub type GuestMemoryMmap = vm_memory::GuestRegionCollection<GuestRegionMmapExt>;
 
+/// A region's dirty bitmap, shared between the region and the [`GuestMemorySliceMut`]s resolved
+/// into it.
+///
+/// `vm_memory` regions own their bitmap by value, so anything that wants to mark pages without a
+/// region lookup per write would have to hold a raw pointer into the region. Sharing the bitmap
+/// behind an `Arc` instead lets such writers hold a clone that keeps the bitmap alive on its own.
+///
+/// Slices of this bitmap are plain [`RefSlice`]s of the inner [`AtomicBitmap`], so
+/// `VolatileSlice::bitmap()` on Firecracker's regions has the same type as with a bare
+/// `AtomicBitmap`.
+#[derive(Clone, Debug, Default)]
+pub struct SharedAtomicBitmap(Arc<AtomicBitmap>);
+
+impl Deref for SharedAtomicBitmap {
+    type Target = AtomicBitmap;
+
+    fn deref(&self) -> &AtomicBitmap {
+        &self.0
+    }
+}
+
+impl PartialEq for SharedAtomicBitmap {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SharedAtomicBitmap {}
+
+impl<'a> WithBitmapSlice<'a> for SharedAtomicBitmap {
+    type S = RefSlice<'a, AtomicBitmap>;
+}
+
+impl Bitmap for SharedAtomicBitmap {
+    fn mark_dirty(&self, offset: usize, len: usize) {
+        self.0.mark_dirty(offset, len)
+    }
+
+    fn dirty_at(&self, offset: usize) -> bool {
+        self.0.dirty_at(offset)
+    }
+
+    fn slice_at(&self, offset: usize) -> RefSlice<'_, AtomicBitmap> {
+        RefSlice::new(&self.0, offset)
+    }
+}
+
+impl NewBitmap for SharedAtomicBitmap {
+    fn with_len(len: usize) -> Self {
+        Self(Arc::new(AtomicBitmap::with_len(len)))
+    }
+}
+
 /// A resolved guest-memory range with volatile accesses bounded by its original length.
 ///
 /// Reusing the resolved pointer avoids a region lookup on each access.
 ///
 /// The slice does not keep its mapping alive. Devices retain it in `ActiveState::mem` until
 /// reset. Ballooning and virtio-mem preserve the virtual address range when reclaiming pages.
+///
+/// A slice is read-only: the guest writes the memory it describes (e.g. a virtqueue descriptor
+/// table), so dirty page tracking is KVM's business. [`GuestMemorySliceMut`] is for ranges
+/// Firecracker writes to, and tracks the writes for dirty page tracking.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct GuestMemorySlice {
     base: *mut u8,
@@ -61,14 +118,13 @@ impl GuestMemorySlice {
         len: 0,
     };
 
-    /// Resolves `addr..addr + len`, which must lie within a single region, and marks it dirty.
+    /// Resolves `addr..addr + len`, which must lie within a single region.
     pub(crate) fn new<M: GuestMemoryBackend>(
         mem: &M,
         addr: GuestAddress,
         len: usize,
     ) -> Result<Self, GuestMemoryError> {
         let slice = mem.get_slice(addr, len)?;
-        slice.bitmap().mark_dirty(0, len);
         Ok(Self {
             base: slice.ptr_guard_mut().as_ptr(),
             len,
@@ -111,7 +167,118 @@ impl GuestMemorySlice {
         unsafe { self.read_obj(self.last_offset::<T>()?) }
     }
 
-    /// Writes `val` at `offset` bytes into the range, or returns `None` if it does not fit.
+    #[inline(always)]
+    fn last_offset<T>(&self) -> Option<usize> {
+        self.len.checked_sub(std::mem::size_of::<T>())
+    }
+}
+
+/// Access to a region's dirty bitmap as an owned handle, for code that writes to guest memory
+/// through a resolved pointer and cannot afford a region lookup per write.
+///
+/// Implemented for Firecracker's guest memory regions. Other region types (the kani proof
+/// memory, which has no bitmap) have nothing to mark and return `None`.
+pub trait RegionDirtyBitmap: GuestMemoryRegion {
+    /// The region's dirty bitmap, if dirty page tracking is on.
+    fn dirty_bitmap(&self) -> Option<SharedAtomicBitmap>;
+}
+
+impl RegionDirtyBitmap for GuestRegionMmapExt {
+    fn dirty_bitmap(&self) -> Option<SharedAtomicBitmap> {
+        // `MmapRegion::bitmap` (through `Deref`), the owning `Option<SharedAtomicBitmap>`; the
+        // trait method of the same name returns a borrowed slice view instead.
+        (**self).bitmap().clone()
+    }
+}
+
+impl<B: Bitmap> RegionDirtyBitmap for vm_memory::GuestRegionMmap<B> {
+    fn dirty_bitmap(&self) -> Option<SharedAtomicBitmap> {
+        None
+    }
+}
+
+/// A [`GuestMemorySlice`] Firecracker writes to (e.g. a virtqueue used ring), which reports its
+/// writes to dirty page tracking.
+///
+/// Writes through a resolved pointer bypass the guest memory bitmaps, so every write marks the
+/// page it touched dirty itself. To keep that cheap (one atomic OR, no region lookup) the slice
+/// takes a handle to the region's bitmap and computes its own offset within the region once,
+/// when created.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GuestMemorySliceMut {
+    slice: GuestMemorySlice,
+    /// The region's dirty bitmap, or `None` when dirty page tracking is off (or the region type
+    /// has none).
+    bitmap: Option<SharedAtomicBitmap>,
+    /// Offset of `slice` from the start of its region, in bytes.
+    region_offset: usize,
+    /// log2 of the bitmap's page size (the host page size).
+    page_shift: u32,
+}
+
+impl GuestMemorySliceMut {
+    /// An unresolved range used before queue initialization.
+    pub(crate) const UNRESOLVED: Self = Self {
+        slice: GuestMemorySlice::UNRESOLVED,
+        bitmap: None,
+        region_offset: 0,
+        page_shift: 0,
+    };
+
+    /// Resolves `addr..addr + len`, which must lie within a single region.
+    pub(crate) fn new<M>(mem: &M, addr: GuestAddress, len: usize) -> Result<Self, GuestMemoryError>
+    where
+        M: GuestMemoryBackend,
+        M::R: RegionDirtyBitmap,
+    {
+        let slice = GuestMemorySlice::new(mem, addr, len)?;
+        // `GuestMemorySlice::new` succeeded, so the range lies within one region.
+        let (region, region_addr) = mem
+            .to_region_addr(addr)
+            .ok_or(GuestMemoryError::InvalidGuestAddress(addr))?;
+        // Firecracker's bitmaps are created with `AtomicBitmap::with_len`, one bit per host page
+        // (which `store_dirty_bitmap` relies on as well). Only looked up when there is a bitmap,
+        // so that memories without one (the kani proofs') never reach `sysconf`.
+        let bitmap = region.dirty_bitmap();
+        let page_shift = bitmap
+            .as_ref()
+            .map_or(0, |_| host_page_size().trailing_zeros());
+        Ok(Self {
+            slice,
+            bitmap,
+            region_offset: u64_to_usize(region_addr.0),
+            page_shift,
+        })
+    }
+
+    /// Marks dirty the pages holding the `len` bytes at `offset` into the range.
+    #[inline(always)]
+    fn mark_dirty(&self, offset: usize, len: usize) {
+        let Some(bitmap) = &self.bitmap else {
+            return;
+        };
+        let start = self.region_offset + offset;
+        let first = start >> self.page_shift;
+        let last = (start + len - 1) >> self.page_shift;
+        // Naturally aligned `T`s never straddle a page, so this is one bit in practice;
+        // `set_addr_range` would recompute the same pages with extra bounds arithmetic.
+        //
+        // Between two snapshots the page is dirty after its first write, so checking the bit
+        // first turns every later write into a plain load instead of a locked OR. Checking is
+        // race-free because the data write precedes it: a `reset_dirty` racing with this call
+        // either lands before the check, which then sees a clear bit and sets it, or after it,
+        // in which case the data it would have marked is already in the snapshot.
+        if first == last {
+            if !bitmap.is_bit_set(first) {
+                bitmap.set_bit(first);
+            }
+        } else {
+            bitmap.set_addr_range(start, len);
+        }
+    }
+
+    /// Writes `val` at `offset` bytes into the range and marks it dirty, or returns `None` if it
+    /// does not fit.
     ///
     /// # Safety
     ///
@@ -120,12 +287,46 @@ impl GuestMemorySlice {
     #[must_use]
     pub(crate) unsafe fn write_obj<T: ByteValued>(&mut self, val: T, offset: usize) -> Option<()> {
         let ptr = self.ptr_at::<T>(offset)?;
-        // SAFETY: as in `read_obj`.
+        // SAFETY: `ptr_at` bounds the access. The caller guarantees alignment and a live mapping.
         unsafe { ptr.write_volatile(val) };
+        self.mark_dirty(offset, std::mem::size_of::<T>());
         Some(())
     }
 
-    /// Writes `val` into the final `T`-sized slot, or returns `None` if it does not fit.
+    /// Writes the `T`s yielded by `vals` back to back from `offset` bytes into the range, then
+    /// marks the span they cover dirty once. Returns how many were written, or `None` if one of
+    /// them did not fit; the ones before it are written and marked either way.
+    ///
+    /// # Safety
+    ///
+    /// In-bounds addresses must be aligned for `T` and valid for writes.
+    #[inline(always)]
+    #[must_use]
+    pub(crate) unsafe fn write_objs<T: ByteValued>(
+        &mut self,
+        offset: usize,
+        vals: impl Iterator<Item = T>,
+    ) -> Option<usize> {
+        let mut written = 0;
+        let mut fits = true;
+        for val in vals {
+            let Some(ptr) = self.ptr_at::<T>(offset + written * std::mem::size_of::<T>()) else {
+                fits = false;
+                break;
+            };
+            // SAFETY: `ptr_at` bounds the access. The caller guarantees alignment and a live
+            // mapping.
+            unsafe { ptr.write_volatile(val) };
+            written += 1;
+        }
+        if written > 0 {
+            self.mark_dirty(offset, written * std::mem::size_of::<T>());
+        }
+        fits.then_some(written)
+    }
+
+    /// Writes `val` into the final `T`-sized slot and marks it dirty, or returns `None` if it does
+    /// not fit.
     ///
     /// # Safety
     ///
@@ -136,10 +337,14 @@ impl GuestMemorySlice {
         // SAFETY: the caller upholds `write_obj`'s requirements at the tail offset.
         unsafe { self.write_obj(val, self.last_offset::<T>()?) }
     }
+}
 
-    #[inline(always)]
-    fn last_offset<T>(&self) -> Option<usize> {
-        self.len.checked_sub(std::mem::size_of::<T>())
+/// The read side of a mutable slice is the plain slice: reads need no dirty tracking.
+impl Deref for GuestMemorySliceMut {
+    type Target = GuestMemorySlice;
+
+    fn deref(&self) -> &GuestMemorySlice {
+        &self.slice
     }
 }
 
@@ -434,11 +639,11 @@ unsafe impl Sync for RawGuestRegionMmap {}
 pub struct GuestRegionMmap {
     /// Held for its `Drop` impl which unmaps the guest memory region.
     _region: RawGuestRegionMmap,
-    proxy: vm_memory::GuestRegionMmap<Option<AtomicBitmap>>,
+    proxy: vm_memory::GuestRegionMmap<Option<SharedAtomicBitmap>>,
 }
 
 impl Deref for GuestRegionMmap {
-    type Target = vm_memory::GuestRegionMmap<Option<AtomicBitmap>>;
+    type Target = vm_memory::GuestRegionMmap<Option<SharedAtomicBitmap>>;
 
     fn deref(&self) -> &Self::Target {
         &self.proxy
@@ -469,7 +674,7 @@ impl GuestRegionMmap {
 
         let mut builder = MmapRegionBuilder::new_with_bitmap(
             size,
-            track_dirty_pages.then(|| AtomicBitmap::with_len(size)),
+            track_dirty_pages.then(|| SharedAtomicBitmap::with_len(size)),
         )
         .with_mmap_prot(prot)
         .with_mmap_flags(flags);
@@ -523,7 +728,7 @@ pub struct GuestMemorySlot<'a> {
     /// Start guest address of the slot
     pub(crate) guest_addr: GuestAddress,
     /// Corresponding slice in host memory
-    pub(crate) slice: VolatileSlice<'a, BS<'a, Option<AtomicBitmap>>>,
+    pub(crate) slice: VolatileSlice<'a, BS<'a, Option<SharedAtomicBitmap>>>,
 }
 
 impl From<&GuestMemorySlot<'_>> for kvm_userspace_memory_region {
@@ -941,9 +1146,9 @@ impl GuestRegionMmapExt {
 }
 
 impl Deref for GuestRegionMmapExt {
-    type Target = MmapRegion<Option<AtomicBitmap>>;
+    type Target = MmapRegion<Option<SharedAtomicBitmap>>;
 
-    fn deref(&self) -> &MmapRegion<Option<AtomicBitmap>> {
+    fn deref(&self) -> &MmapRegion<Option<SharedAtomicBitmap>> {
         &self.inner
     }
 }
@@ -953,7 +1158,7 @@ impl GuestMemoryRegionBytes for GuestRegionMmapExt {}
 #[allow(clippy::cast_possible_wrap)]
 #[allow(clippy::cast_possible_truncation)]
 impl GuestMemoryRegion for GuestRegionMmapExt {
-    type B = Option<AtomicBitmap>;
+    type B = Option<SharedAtomicBitmap>;
 
     fn len(&self) -> GuestUsize {
         self.inner.len()
@@ -1662,7 +1867,7 @@ mod tests {
         GuestMemorySlice::new(&mem, GuestAddress(0xff8), 0x10).unwrap_err();
         GuestMemorySlice::new(&mem, GuestAddress(0x3000), 0x10).unwrap_err();
 
-        let mut cache = GuestMemorySlice::new(&mem, GuestAddress(0x100), 0x10).unwrap();
+        let mut cache = GuestMemorySliceMut::new(&mem, GuestAddress(0x100), 0x10).unwrap();
         // SAFETY: `mem` outlives the caches. All in-bounds accesses are aligned; the remaining
         // accesses return `None` without dereferencing a pointer.
         unsafe {
@@ -1686,20 +1891,27 @@ mod tests {
             cache.write_last::<u16>(0xbeef).unwrap();
             assert_eq!(cache.read_last::<u16>().unwrap(), 0xbeef);
             assert_eq!(mem.read_obj::<u16>(GuestAddress(0x10e)).unwrap(), 0xbeef);
-            let mut short = GuestMemorySlice::new(&mem, GuestAddress(0x200), 1).unwrap();
+            let mut short = GuestMemorySliceMut::new(&mem, GuestAddress(0x200), 1).unwrap();
             assert_eq!(short.read_last::<u16>(), None);
             assert_eq!(short.write_last::<u16>(0), None);
 
-            let mut unresolved = GuestMemorySlice::UNRESOLVED;
+            // A read-only slice over the same range sees the writes.
+            let ro = GuestMemorySlice::new(&mem, GuestAddress(0x100), 0x10).unwrap();
+            assert_eq!(ro.read_obj::<u32>(0).unwrap(), 0xdead_beef);
+            assert_eq!(ro.read_last::<u16>().unwrap(), 0xbeef);
+            assert_eq!(ro.read_obj::<u8>(0x10), None);
+
+            let mut unresolved = GuestMemorySliceMut::UNRESOLVED;
             assert_eq!(unresolved.read_obj::<u8>(0), None);
             assert_eq!(unresolved.write_obj::<u8>(0, 0), None);
             assert_eq!(unresolved.read_last::<u8>(), None);
             assert_eq!(unresolved.write_last::<u8>(0), None);
+            assert_eq!(GuestMemorySlice::UNRESOLVED.read_obj::<u8>(0), None);
         }
     }
 
     #[test]
-    fn test_guest_memory_slice_marks_range_dirty() {
+    fn test_guest_memory_slice_mut_dirty_tracking() {
         let page_size = host_page_size();
         let mem = into_region_ext(
             anonymous(
@@ -1709,18 +1921,52 @@ mod tests {
             )
             .unwrap(),
         );
-
-        mem.reset_dirty();
-        GuestMemorySlice::new(&mem, GuestAddress(page_size as u64), page_size).unwrap();
-
         let dirty_at = |addr: usize| {
             mem.get_slices(GuestAddress(addr as u64), 1)
                 .flatten()
                 .all(|slice| slice.bitmap().dirty_at(0))
         };
-        assert!(!dirty_at(0));
-        assert!(dirty_at(page_size));
-        assert!(!dirty_at(page_size * 2));
+        let clean = || !(0..3).any(|p| dirty_at(p * page_size));
+
+        // Resolving a slice marks nothing, and neither do reads.
+        mem.reset_dirty();
+        // A slice spanning the end of page 1 and the start of page 2.
+        let mut slice =
+            GuestMemorySliceMut::new(&mem, GuestAddress((2 * page_size - 8) as u64), 16).unwrap();
+        // SAFETY: `mem` outlives the slice; all accesses are aligned and in bounds.
+        unsafe {
+            slice.read_obj::<u32>(0).unwrap();
+            slice.read_last::<u16>().unwrap();
+            assert!(clean());
+
+            // A write marks the page it lands on, and only that one.
+            slice.write_obj::<u32>(1, 0).unwrap();
+            assert!(!dirty_at(0));
+            assert!(dirty_at(page_size));
+            assert!(!dirty_at(2 * page_size));
+
+            mem.reset_dirty();
+            slice.write_last::<u16>(2).unwrap();
+            assert!(!dirty_at(page_size));
+            assert!(dirty_at(2 * page_size));
+
+            // An out-of-bounds write marks nothing.
+            mem.reset_dirty();
+            assert_eq!(slice.write_obj::<u32>(4, 16), None);
+            assert!(clean());
+
+            // Without dirty page tracking, writes mark nothing and do not fault.
+            let untracked = into_region_ext(
+                anonymous(&[(GuestAddress(0), page_size)], false, HugePageConfig::None).unwrap(),
+            );
+            let mut slice = GuestMemorySliceMut::new(&untracked, GuestAddress(0), 16).unwrap();
+            slice.write_obj::<u32>(5, 0).unwrap();
+            assert_eq!(slice.read_obj::<u32>(0).unwrap(), 5);
+
+            // An unresolved slice never marks and never writes.
+            let mut unresolved = GuestMemorySliceMut::UNRESOLVED;
+            assert_eq!(unresolved.write_obj::<u8>(0, 0), None);
+        }
     }
 
     #[test]

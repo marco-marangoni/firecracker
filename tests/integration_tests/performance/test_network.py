@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from framework.utils_hugepages import HugePagesConfig
+
 from framework.artifacts import ACPI_GUEST_KERNELS, pin_guest_kernel
 from framework.utils_iperf import IPerf3Test, emit_iperf3_metrics
 
@@ -40,8 +42,16 @@ def consume_ping_output(ping_putput):
             yield float(time[0])
 
 
+@pytest.fixture(
+    params=[HugePagesConfig.NONE, HugePagesConfig.HUGETLBFS_2MB], ids=["4k", "2m"]
+)
+def huge_pages(request):
+    """Guest memory backing, always with dirty page tracking on."""
+    return request.param
+
+
 @pytest.fixture
-def network_microvm(request, uvm):
+def network_microvm(request, uvm, huge_pages):
     """Creates a microvm with the networking setup used by the performance tests in this file.
     This fixture receives its vcpu count via indirect parameterization"""
 
@@ -50,9 +60,15 @@ def network_microvm(request, uvm):
 
     vm = uvm
     vm.spawn(log_level="Info", emit_metrics=True)
-    vm.basic_config(vcpu_count=guest_vcpus, mem_size_mib=guest_mem_mib)
+    vm.basic_config(
+        vcpu_count=guest_vcpus,
+        mem_size_mib=guest_mem_mib,
+        track_dirty_pages=True,
+        huge_pages=huge_pages,
+    )
     vm.add_net_iface()
     vm.start()
+    vm.huge_pages = huge_pages
 
     return vm
 
@@ -72,6 +88,7 @@ def test_network_latency(network_microvm, metrics):
         {
             "performance_test": "test_network_latency",
             **network_microvm.dimensions,
+            "mem_config": str(network_microvm.huge_pages),
         }
     )
 
@@ -118,6 +135,7 @@ def test_network_tcp_throughput(
             "payload_length": payload_length,
             "mode": mode,
             **network_microvm.dimensions,
+            "mem_config": str(network_microvm.huge_pages),
         }
     )
 

@@ -7,6 +7,8 @@ import os
 
 import pytest
 
+from framework.utils_hugepages import HugePagesConfig
+
 import framework.utils_fio as fio
 import host_tools.drive as drive_tools
 from framework.artifacts import ACPI_GUEST_KERNELS, pin_guest_kernel
@@ -116,6 +118,15 @@ def emit_fio_metrics(logs_dir, metrics):
             metrics.put_metric("clat_write", value / 1000, "Microseconds")
 
 
+
+@pytest.fixture(
+    params=[HugePagesConfig.NONE, HugePagesConfig.HUGETLBFS_2MB], ids=["4k", "2m"]
+)
+def huge_pages(request):
+    """Guest memory backing, always with dirty page tracking on."""
+    return request.param
+
+
 @pytest.mark.nonci
 @pytest.mark.parametrize("vcpus", [1, 2], ids=["1vcpu", "2vcpu"])
 @pytest.mark.parametrize("fio_mode", [fio.Mode.RANDREAD, fio.Mode.RANDWRITE])
@@ -123,6 +134,7 @@ def emit_fio_metrics(logs_dir, metrics):
 @pytest.mark.parametrize("fio_engine", [fio.Engine.LIBAIO, fio.Engine.PSYNC])
 def test_block_performance(
     uvm,
+    huge_pages,
     vcpus,
     fio_mode,
     fio_block_size,
@@ -136,7 +148,12 @@ def test_block_performance(
     """
     vm = uvm
     vm.spawn(log_level="Info", emit_metrics=True)
-    vm.basic_config(vcpu_count=vcpus, mem_size_mib=GUEST_MEM_MIB)
+    vm.basic_config(
+        vcpu_count=vcpus,
+        mem_size_mib=GUEST_MEM_MIB,
+        track_dirty_pages=True,
+        huge_pages=huge_pages,
+    )
     vm.add_net_iface()
     # Add a secondary block device for benchmark tests.
     fs = drive_tools.FilesystemFile(
@@ -152,6 +169,7 @@ def test_block_performance(
             "fio_mode": fio_mode,
             "fio_block_size": str(fio_block_size),
             "fio_engine": fio_engine,
+            "mem_config": str(huge_pages),
             **vm.dimensions,
         }
     )

@@ -33,6 +33,7 @@ def uvm_booted_memhp(
     huge_pages,
     _uffd_handler,
     snapshot_type,
+    track_dirty_pages=False,
 ):
     """Boots a VM with the given memory hotplugging config"""
 
@@ -44,18 +45,18 @@ def uvm_booted_memhp(
         # we need enough memory to be able to hotplug up to 16GB
         "mem_size_mib": 512,
     }
+    if track_dirty_pages:
+        uvm_config["track_dirty_pages"] = True
     if vhost_user:
         # We need to setup ssh keys manually because we did not specify rootfs
         # in microvm_factory.build method
         ssh_key = rootfs.with_suffix(".id_rsa")
         uvm.ssh_key = ssh_key
-        uvm.basic_config(
-            **uvm_config,
-            add_root_device=False,
-            track_dirty_pages=(
-                snapshot_type.needs_dirty_page_tracking if snapshot_type else False
-            ),
+        uvm_config.setdefault(
+            "track_dirty_pages",
+            snapshot_type.needs_dirty_page_tracking if snapshot_type else False,
         )
+        uvm.basic_config(**uvm_config, add_root_device=False)
         uvm.add_vhost_user_drive(
             "rootfs", rootfs, is_root_device=True, is_read_only=True
         )
@@ -531,7 +532,9 @@ def test_memory_hotplug_latency(
             "block_size_mib": 2,
         }
         uvm = microvm_factory.build(guest_kernel, rootfs, pci=True)
-        uvm = uvm_booted_memhp(uvm, None, None, False, config, huge_pages, None, None)
+        uvm = uvm_booted_memhp(
+            uvm, None, None, False, config, huge_pages, None, None, track_dirty_pages=True
+        )
 
         if i == 0:
             metrics.set_dimensions(
@@ -542,6 +545,7 @@ def test_memory_hotplug_latency(
                     "performance_test": "test_memory_hotplug_latency",
                     "hotplug_size": str(hotplug_size),
                     "huge_pages": huge_pages,
+                    "mem_config": "dirty_tracking",
                     **uvm.dimensions,
                 }
             )
