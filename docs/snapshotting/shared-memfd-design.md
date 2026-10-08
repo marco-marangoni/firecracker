@@ -111,10 +111,10 @@ whose layout equals the snapshot file layout.
   `MADV_REMOVE` rather than a direct `fallocate` so that a registered uffd still
   receives the `remove` event, which is how a backend learns that a range it has
   not populated now reads as zero instead of the snapshot file's content. Every
-  discarded range is also recorded so that the next diff records the zeroed
-  pages (this benefits Firecracker-written diffs too): on hugetlbfs, or when
-  dirty tracking is off, in a separate per-region discard bitmap at backing-page
-  granularity; otherwise folded into the host-page dirty bitmap. See §9.
+  freed backing page is also recorded, in a per-region discard bitmap at
+  backing-page granularity, and its dirty marks are cleared first, so that the
+  next diff reports the zeroed pages as zero (this benefits Firecracker-written
+  diffs too). See §9.
 - Shared mappings have costlier page faults than anonymous memory, and THP on
   shmem depends on the host's `shmem_enabled`. This is the price of sharing, as
   for vhost-user today.
@@ -410,15 +410,21 @@ host page size), disjoint, in the portable serialization format, then base64;
 `bitmap_encoding` names the serialization so a peer fails cleanly if it ever
 changes.
 
-The classification is `dirty ∧ resident` → authoritative, `dirty ∧ ¬resident` →
-zero, `¬dirty` → unchanged, where *dirty* is the union of KVM's log and
-Firecracker's `AtomicBitmap` (every page written or discarded since the last
-consumption, and every page of an unplugged virtio-mem slot) and *resident* is
-`mincore(2)` over Firecracker's mapping, taken *after* the dirty state is read.
-Nothing is aggregated or rounded: each page is classified on its own. Unplugged
-slots are dirty and never resident, so they are zero pages; Roaring stores them
-as one run per 65536-page container, a few bytes whatever the size of the
-hotplug region.
+*(Revised: with dirty tracking on, the classification no longer reads `mincore`;
+see "Discards: balloon and virtio-mem" in §9 for the records and the proofs.)*
+
+With dirty tracking on, the classification is: *dirty* → authoritative,
+*discarded ∧ ¬dirty* → zero, *unplugged* → zero, the rest → unchanged, where
+*dirty* is the union of KVM's log and Firecracker's `AtomicBitmap` (every page
+written since the last consumption) and *discarded* is the per-region discard
+record (every backing page freed since the last consumption), with a freed
+hugetlbfs page copied whole if any page of it is dirty. Without dirty tracking
+it is `dirty ∧ resident` → authoritative, `dirty ∧ ¬resident` → zero, `¬dirty` →
+unchanged, where *dirty* is `mincore`-resident ∨ discarded ∨ unplugged and
+*resident* is `mincore(2)` over the dirty runs of Firecracker's mapping, taken
+*after* the dirty state is read. Nothing is aggregated or rounded beyond the
+backing page. Unplugged slots are zero pages; Roaring stores them as one run per
+65536-page container, a few bytes whatever the size of the hotplug region.
 
 Procedure, on the VMM thread, inside the API loop (for the pre-copy step
 `dirty-pages` the microVM may be running; for the finalize step
@@ -432,13 +438,15 @@ Procedure, on the VMM thread, inside the API loop (for the pre-copy step
    failure consumes no tracking state;
 1. `prepare_dirty_tracking_reset` (return device-marked, unwritten RX buffers
    before the dirty state is read), for the running-guest case;
-1. read the dirty state: `KVM_GET_DIRTY_LOG` (or `mincore`, when tracking is
-   off) ORed with Firecracker's bitmap per plugged slot, plus the discard
-   bitmap;
-1. `mincore` over every plugged slot;
-1. classify (`SnapshotMemoryLayout::classify`: `dirty & resident`,
-   `dirty - resident`, then `optimize()` to pick run containers; one function
-   shared with the benchmark), reset Firecracker's dirty and discard bitmaps;
+1. read the dirty state: `KVM_GET_DIRTY_LOG` per plugged slot, immediately
+   followed by `KVM_CLEAR_DIRTY_LOG` of what was read (or `mincore`, when
+   tracking is off), ORed a word at a time with Firecracker's bitmap, taken
+   (read and cleared) with `get_and_reset`; read the discard record;
+1. with dirty tracking on, classify from the two records
+   (`SnapshotMemoryLayout::classify_tracked`); otherwise `mincore` over the
+   dirty runs of every plugged slot and classify
+   (`SnapshotMemoryLayout::classify`: `dirty & resident`, `dirty - resident`);
+   both `optimize()` to pick run containers; then clear the discard record;
 1. `mark_virtio_queue_memory_dirty`, as today, so queue pages are in the next
    diff;
 1. serialise: Roaring portable format then base64 per set, and return the body.
@@ -929,48 +937,78 @@ the `remove` event and stops serving the range from its snapshot file.
 
 This design records every discard so the next `Diff` (Firecracker-written or
 backend-copied) reports the zeroed pages instead of leaving the pre-release
-bytes in a merged file. Where the record goes avoids ever carrying two host-page
-bitmaps:
+bytes in a merged file, and, with dirty tracking on, classifies from the records
+alone, without `mincore`:
 
 - `dirty_host_pages` — the existing host-page dirty bitmap (`AtomicBitmap`),
-  present only when `track_dirty_pages` is on. Holds writes.
+  present only when `track_dirty_pages` is on. Holds writes, including the zeros
+  `discard_range` writes to the partial huge pages it cannot free.
 - a per-region discard bitmap (`GuestRegionMmapExt::discarded_blocks`,
-  `Option<Mutex<BitVec>>`) — one bit per backing page. Allocated only when it
-  would *not* be a second host-page bitmap: on hugetlbfs (one bit per 2 MiB,
-  coarser than the dirty bitmap) or when there is no dirty bitmap
-  (`track_dirty_pages` off). `discard_range` sets every block the range touches.
+  `Mutex<BitVec>`) — one bit per backing page (host page on tmpfs, 2 MiB on
+  hugetlbfs), always present. Holds the backing pages `discard_range` *freed*,
+  and only those: a zero-written edge is a write, recorded as one.
 
-On tmpfs with dirty tracking on, `discarded_blocks` is `None` and
-`discard_range` folds the discard into the host-page dirty bitmap via
-`mark_dirty`, so that one bitmap is all that is carried. On hugetlbfs with dirty
-tracking on, both exist deliberately: the dirty bitmap for writes, the discard
-bitmap so a discard flips one bit per 2 MiB instead of marking 512 host pages —
-not a duplicate, since the granularities differ. With dirty tracking off, the
-discard bitmap is the only bitmap.
+Before freeing a range, `discard_range` clears its pages' dirty marks: in
+Firecracker's bitmap (`reset_addr_range`) and in KVM's log
+(`KVM_CLEAR_DIRTY_LOG` over the range, see below). Clear first, punch second: a
+guest write landing in between is logged after the clear, so the page is copied
+(its new content, or the hole's zeros); clearing after the punch would wipe the
+mark of such a write and lose it
+(`clearing_marks_after_the_punch_breaks_without_mincore`). The clear is an
+optimisation, not a requirement: a page written and then released keeps a stale
+mark otherwise and is copied — from a hole, so as zeros, which is what the guest
+reads — rather than reported zero. Backends are good at zeros, so reporting them
+is worth the clear.
 
-A page is dirty if it is in the dirty bitmap or the discard bitmap, each at its
-own granularity: `snapshot_layout` ORs the host-page dirty set with the discard
-bitmap (where one exists), expanding each set block to its host pages, then
-`classify` splits the result by per-host-page `mincore` exactly as before.
+**Classification with dirty tracking** (`classify_tracked`): a dirty page is
+copied; a page in the discard record that is not dirty is zero; an unplugged
+slot is zero; the rest is unchanged. A dirty hole reads as zero from the memfd,
+so copying it is right; a page in the discard record with no mark since was
+punched and at most re-faulted by a read, so it reads zero — the lemma `D` of
+the model, which the inductive proof shows every operation preserves. The zero
+set is per page on every backing: a freed huge page the guest partially rewrote
+has copy pages and zero pages in the same response, and the memfd (faulted back
+in whole, zero-filled where not written) agrees with both. A chunked backend
+therefore reads a chunk with a zero page from the memfd like any other; it must
+not zero-fill it (`chunked_zero_fill_breaks`). No residency is read, so swap
+does not affect the result. The proofs:
+`snapshot_without_mincore_preserves_invariant`,
+`paused_snapshot_without_mincore_is_correct`,
+`racy_then_paused_snapshot_without_mincore_is_correct`;
+`test_model_tracked_classification_matches_real` checks `classify_tracked`
+against the model on every input.
 
-Two consequences the model pins. With dirty tracking off and no discard record,
-a `mincore`-only diff degrades to `dirty := resident`, whose zero set is empty,
-so a discarded page survives with stale content
-(`dirty_tracking_off_without_discard_bitmap_breaks_after_discard`). The discard
-bitmap fixes it — `dirty := resident ∨ discarded`, a discarded page lands in
-`pages_to_discard`, a changed page is caught by `mincore` since it stays
-resident (`dirty_tracking_off_with_discard_bitmap_is_correct`).
+Recording only freed pages is what makes this sound
+(`recording_edges_as_discards_breaks_without_mincore`): were a partially covered
+huge page recorded as discarded, the pages of it the range did not touch would
+be reported zero while holding content. With `mincore` the same recording was
+harmless (the block is resident, so it was copied), which is why the earlier
+revision could set the bit of every block the range touched.
 
-The coarse discard bit is a filter that triggers the per-host-page `mincore`,
-never a verdict that zeroes the whole 2 MiB — on tmpfs that distinction is
-load-bearing, because residency there is per host page. On hugetlbfs it happens
-not to matter: `hugetlbfs_two_bitmaps_classification_is_correct` proves the
-split correct, and `hugetlbfs_zeroing_whole_discarded_block_is_also_correct`
-proves that even the whole-block shortcut is sound there, because residency is
-uniform per huge page (`H`) so a block never mixes a resident re-written page
-with a non-resident one. The implementation expands through `mincore` anyway, so
-the same code is correct on both backings. `track_dirty_pages` thus governs only
-the KVM write log; discards are tracked without it, at their own granularity.
+**Classification without dirty tracking** (`classify`): the only signal is
+residency. `dirty := mincore-resident ∨ discarded ∨ unplugged`, and `mincore`
+over those pages splits it: resident is copied, the rest is zero. `mincore` is
+taken after the dirty state (a page written in between is dirty and resident,
+hence copied, never zero) and asked about exactly the dirty runs, so its cost is
+proportional to the diff. This mode still requires swap off. Without the discard
+record it would be unsound after a discard
+(`dirty_tracking_off_without_discard_bitmap_breaks_after_discard`); with it,
+`dirty_tracking_off_with_discard_bitmap_is_correct`.
+
+`KVM_CLEAR_DIRTY_LOG`: `KVM_GET_DIRTY_LOG` is get-and-clear and cannot clear a
+range. With `KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2` (Linux 5.2+), enabled at VM
+creation when the host has it, it only reads, and `KVM_CLEAR_DIRTY_LOG` clears
+(and write-protects again) the pages of a given mask. Firecracker then clears
+exactly what it read right after every read (`get_dirty_bitmap`,
+`reset_dirty_bitmap`): the same work the atomic call did, with a window in which
+a guest write is either in the mask (re-protected by the clear, and its content
+is what gets copied) or not (it stays logged). The measured cost of the KVM side
+is 1–4 ms on a 16 GiB guest, so there was no reason to give up the atomic read
+for speed; the capability is for the range clear on discards. Draining the whole
+log into Firecracker's bitmap at every discard would have done without it, at
+the price of a full-slot read, write-protect and TLB flush per balloon request
+(one per MiB inflated). Without the capability discards keep their marks and
+everything else is as before.
 
 With the zeroing of edges the discard record is exact on hugetlbfs too: a freed
 huge page is dirty and not resident (reported zero), a zero-written edge is

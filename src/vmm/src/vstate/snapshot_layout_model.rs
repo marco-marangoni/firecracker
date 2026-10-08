@@ -44,12 +44,12 @@
 //! pages. A fault populates a whole backing page, a discard frees a whole
 //! one or zero-writes the pages it cannot free, virtio-mem slots are whole backing pages, and
 //! `mincore` reports per backing page. The lemma `H` records that residency is uniform within a
-//! huge page and `Z` that a huge page with a zero page in a pending layout holds nothing but
-//! zeros, marks, and pages of later layouts. Together they let a chunked backend on hugetlbfs
-//! apply a layout with no copy of its own ([`State::apply_layout_chunked`]: read a chunk with a
-//! layout page whole from the memfd, or zero-fill one with a zero page), which
-//! `hugetlbfs_chunked_apply_preserves_invariant` proves correct for chunks no larger than a huge
-//! page and `chunked_apply_across_backing_pages_breaks` shows wrong otherwise.
+//! huge page. It lets a chunked backend on hugetlbfs apply a layout with no copy of its own
+//! ([`State::apply_layout_chunked`]: read every chunk with a layout page whole from the memfd),
+//! which `hugetlbfs_chunked_apply_preserves_invariant` proves correct for chunks no larger than
+//! a huge page and `chunked_apply_across_backing_pages_breaks` shows wrong otherwise. Reading
+//! is the only option: the zero set is per page, so a chunk may hold a zero page next to a copy
+//! page, and zero-filling it wipes the latter (`chunked_zero_fill_breaks`).
 //!
 //! `Full` snapshots are not the backend's: `full_from_the_memfd_alone_is_impossible` and
 //! `firecracker_cannot_tell_base_holes_from_zero_holes` show why no response could make them so
@@ -79,6 +79,28 @@
 //! The order of the two reads
 //! ([`RESIDENCY_AFTER_DIRTY`]) is what makes a racy `incremental` pass preserve `I`. The
 //! `should_panic` harnesses show that dropping any of the three breaks the proof.
+//!
+//! # Without `mincore`
+//!
+//! With dirty tracking on, the dirty records alone classify ([`State::snapshot_without_mincore`]):
+//! a dirty page is copied (a dirty hole is a zero hole by `L`, and the memfd reads a hole as
+//! zero, so the copy is right either way), a page in the discard record that is not dirty is
+//! zero (it was punched and nothing wrote it since: a write would have marked it), an unplugged
+//! page is zero, the rest is unchanged. No residency is read, so the swap-off requirement of
+//! `mincore` goes away. It needs one rule the `mincore` classification did not
+//! ([`DISCARD_RECORDS_PUNCHED_BLOCKS_ONLY`]): the discard record must hold only blocks that were
+//! actually punched; the zero-written edge of a partially covered huge page is a Firecracker
+//! write and belongs in Firecracker's bitmap, otherwise the rest of that block, still holding
+//! content, would be reported zero (`recording_edges_as_discards_breaks_without_mincore`). The
+//! marks need not be cleared on a discard (a stale mark on a punched page costs a copy of
+//! zeros, never a wrong byte); if they are, it must be before the punch, never after
+//! (`clearing_marks_after_the_punch_breaks_without_mincore`). The proof rests on two more
+//! clauses of the lemma: `D`, *a page in the discard record that no write marked since reads as
+//! zero*, and the discard record being per backing page (part of `H`). The zero set is per
+//! page: a punched huge page the guest partially rewrote has copy pages and zero pages in the
+//! same layout, each right on its own (the write faulted the whole huge page back in,
+//! zero-filled where not written, so the memfd reads zero exactly where the layout says zero).
+//! With dirty tracking off there is no dirty record and the classification is the `mincore` one.
 
 #![allow(dead_code)]
 
@@ -98,6 +120,13 @@ pub const DISCARD_ZEROES_UNPUNCHABLE_EDGES: bool = true;
 /// Rule 3: residency is read after the dirty state, never before, so that a page written between
 /// the two reads is seen as resident (and reported in the next set) rather than as a dirty hole.
 pub const RESIDENCY_AFTER_DIRTY: bool = true;
+/// Rule 4 (for the classification without `mincore`): the discard record holds only backing
+/// pages that were punched. A page `discard_range` zero-writes instead (the partial huge page at
+/// either end of a hugetlbfs range) is recorded as a write in Firecracker's bitmap, not as a
+/// discard of its block: with `mincore` the difference is invisible (the block is resident, so
+/// it is copied either way), without it a block recorded discarded is zeroed wherever it is not
+/// dirty, which would zero the pages of a partially covered block the range did not touch.
+pub const DISCARD_RECORDS_PUNCHED_BLOCKS_ONLY: bool = true;
 
 /// What a hole in the memfd reads as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,8 +165,8 @@ pub struct Page {
     /// `dirty_huge_pages` bitmap on hugetlbfs (one bit per 2 MiB), where it is a separate,
     /// always-on bitmap independent of `track_dirty_pages`; on tmpfs the block is one host page
     /// and the discard record is simply folded into `dirty_host_pages` (`fc_marked`), so no second
-    /// host-page bitmap is carried. Set by a balloon release, a virtio-mem unplug, or a
-    /// zero-written hugetlbfs edge.
+    /// host-page bitmap is carried. Set by a balloon release or a virtio-mem unplug (and, before
+    /// [`DISCARD_RECORDS_PUNCHED_BLOCKS_ONLY`], by a zero-written hugetlbfs edge).
     pub discarded_block: bool,
     /// The guest kernel freed this page (balloon, free page reporting) or it is unplugged, and
     /// has not written it since. A well-behaved Linux guest will zero-initialize such a page on
@@ -376,7 +405,10 @@ impl State {
 
     /// A discard of a page the kernel cannot free on its own (part of a hugetlbfs huge page the
     /// range does not cover entirely): `discard_range` writes zeros to it through the mapping
-    /// instead, which faults the backing page in, and marks it. The guest reads zero either way.
+    /// instead, which faults the backing page in, and records it: as a write of that page
+    /// ([`DISCARD_RECORDS_PUNCHED_BLOCKS_ONLY`]), or as a discard of its whole block (what
+    /// `discard_range` did when the record was only ever split by `mincore`). The guest reads
+    /// zero either way.
     pub fn discard_edge(&mut self, p: usize) {
         if self.pages[p].unplugged {
             return;
@@ -385,7 +417,59 @@ impl State {
             self.fault_in(p);
             self.pages[p].memfd = Memfd::Present(0);
         }
-        self.pages[p].discarded_block = true;
+        if DISCARD_RECORDS_PUNCHED_BLOCKS_ONLY {
+            self.pages[p].fc_marked = true;
+        } else {
+            self.discard_edge_recorded_as_discard(p);
+        }
+    }
+
+    /// The pre-rule-4 record of a zero-written edge: the whole block it is in goes in the discard
+    /// record (`discard_range` sets the bit of every block the range touches), whether or not the
+    /// other pages of the block were touched.
+    fn discard_edge_recorded_as_discard(&mut self, p: usize) {
+        for q in 0..PAGES {
+            if self.same_backing_page(p, q) {
+                self.pages[q].discarded_block = true;
+            }
+        }
+    }
+
+    /// A discard that also clears the dirty marks of the backing page (an implementation that
+    /// wants a page written and then released to be reported zero rather than copied as zeros).
+    /// `clear_first` is the order: clear then punch, or punch then clear; `racing_write` is a
+    /// guest write to `p` landing between the two. Only whole backing pages are freed.
+    pub fn discard_clearing_marks(
+        &mut self,
+        p: usize,
+        racing_write: Option<u8>,
+        clear_first: bool,
+    ) {
+        if self.pages[p].unplugged {
+            return;
+        }
+        let clear = |s: &mut Self| {
+            for q in 0..PAGES {
+                if s.same_backing_page(p, q) {
+                    s.pages[q].kvm_marked = false;
+                    s.pages[q].fc_marked = false;
+                    s.pages[q].armed = false;
+                }
+            }
+        };
+        if clear_first {
+            clear(self);
+        } else {
+            self.discard(p);
+        }
+        if let Some(v) = racing_write {
+            self.guest_write(p, v);
+        }
+        if clear_first {
+            self.discard(p);
+        } else {
+            clear(self);
+        }
     }
 
     /// virtio-mem unplugs the slot containing `p` (slots are whole backing pages): discarded,
@@ -420,6 +504,55 @@ impl State {
     /// running guest can interleave.
     pub fn snapshot(&mut self, race: Race) -> Layout {
         self.snapshot_ordered(race, RESIDENCY_AFTER_DIRTY)
+    }
+
+    /// The classification without `mincore`: copy what is dirty, zero what is in the discard
+    /// record and not dirty (and every unplugged page), leave the rest. Per page, on either
+    /// backing: a punched huge page the guest partially rewrote has copy pages and zero pages in
+    /// the same layout, and the memfd (faulted back in whole, zero-filled where not written)
+    /// agrees with both. Both records are read and reset in turn; `race.after_dirty` is a guest
+    /// write between the two reads, `race.after_resident` one after the second. Without dirty
+    /// tracking there is no dirty record, and this is [`Self::snapshot`].
+    pub fn snapshot_without_mincore(&mut self, race: Race) -> Layout {
+        if !self.dirty_tracking {
+            return self.snapshot(race);
+        }
+        // 1. The dirty record: KVM's log and Firecracker's bitmap, read and reset together (a
+        //    device that marked ahead has its buffers returned first: nothing stays armed).
+        let mut dirty = [false; PAGES];
+        for (page, dirty) in self.pages.iter_mut().zip(&mut dirty) {
+            *dirty = page.kvm_marked || page.fc_marked;
+            page.kvm_marked = false;
+            page.fc_marked = false;
+            page.armed = false;
+        }
+        if let Some((p, v)) = race.after_dirty {
+            self.guest_write(p, v);
+        }
+        // 2. The discard record, read and reset.
+        let mut discarded = [false; PAGES];
+        for (page, discarded) in self.pages.iter_mut().zip(&mut discarded) {
+            *discarded = page.discarded_block;
+            page.discarded_block = false;
+        }
+        if let Some((p, v)) = race.after_resident {
+            self.guest_write(p, v);
+        }
+        // 3. Classify. An unplugged slot has no KVM log to read and reads as zero: zero whole.
+        let layout = Layout {
+            authoritative: std::array::from_fn(|p| !self.pages[p].unplugged && dirty[p]),
+            zero: std::array::from_fn(|p| {
+                self.pages[p].unplugged || (discarded[p] && !dirty[p])
+            }),
+        };
+        // 4 and 5. As in `snapshot_ordered`.
+        self.arm_rings();
+        if self.pending[MAX_PENDING - 1].is_some() {
+            self.apply_oldest();
+        }
+        let slot = self.pending.iter().position(Option::is_none).unwrap();
+        self.pending[slot] = Some(layout);
+        layout
     }
 
     fn read_dirty(&mut self) -> [bool; PAGES] {
@@ -637,11 +770,12 @@ impl State {
     }
 
     /// A backend that works in chunks (of one page, or of [`HUGE`] pages with `huge_chunks`)
-    /// applies a layout chunk by chunk with no previous copy of its own: a chunk with a zero page
-    /// is zero-filled (`zero_fill`) or read whole from the memfd, a chunk with an authoritative
-    /// page is read whole from the memfd, any other chunk is left alone. Correct only when a chunk
-    /// never contains an unchanged page that is a base hole: on hugetlbfs with chunks no larger
-    /// than the huge page, or for a booted microVM.
+    /// applies a layout chunk by chunk with no previous copy of its own: a chunk with a page in
+    /// either set is read whole from the memfd, any other chunk is left alone. Correct only when
+    /// a chunk never contains an unchanged page that is a base hole: on hugetlbfs with chunks no
+    /// larger than the huge page, or for a booted microVM. `zero_fill` is the shortcut of
+    /// zero-filling a chunk that has a zero page instead of reading it, wrong because the zero
+    /// set is per page (`chunked_zero_fill_breaks`).
     pub fn apply_layout_chunked(&mut self, layout: Layout, huge_chunks: bool, zero_fill: bool) {
         for p in 0..PAGES {
             let in_chunk = |q: usize| {
@@ -750,9 +884,12 @@ impl State {
 
     /// `L`: a marked hole reads as zero (a marked page is in the memfd or zero: the property
     /// Firecracker promises the backend); an armed page is marked; an unplugged page is a zero
-    /// hole and not armed (unplugging discards the slot and nothing writes it afterwards); and a
+    /// hole and not armed (unplugging discards the slot and nothing writes it afterwards); a
     /// page a pending layout classifies is not a base hole (it was resident or a zero hole when
-    /// classified, and only a discard or an unplug makes a hole of it afterwards, a zero one).
+    /// classified, and only a discard or an unplug makes a hole of it afterwards, a zero one);
+    /// and `D`: a page in the discard record that no write marked since reads as zero (it was
+    /// punched, and at most re-faulted by a read). `D` is what the classification without
+    /// `mincore` rests on: it is why "in the discard record and not dirty" may be zeroed.
     pub fn lemma(&self) -> bool {
         (0..PAGES).all(|p| {
             let page = &self.pages[p];
@@ -760,39 +897,14 @@ impl State {
                 && (!page.armed || page.fc_marked)
                 && (!page.unplugged || (page.memfd == Memfd::Hole(HoleReads::Zero) && !page.armed))
                 && (!self.pending_covers(p) || page.memfd != Memfd::Hole(HoleReads::Base))
+                && (!page.discarded_block || page.kvm_marked || page.fc_marked || page.guest() == 0)
         }) && self.backing_pages_are_uniform()
-            && self.zero_pages_have_zero_huge_pages()
     }
 
-    /// `Z` (huge backing only): if a pending layout classifies `p` zero, every page `q` of `p`'s
-    /// huge page either reads zero to the guest, or is marked, or is in a *later* pending layout.
-    /// (The huge page was a hole when `p` was classified, and every write to it since is
-    /// accounted for.) What lets a chunked backend zero-fill a chunk that has a zero page.
-    pub fn zero_pages_have_zero_huge_pages(&self) -> bool {
-        if !self.huge {
-            return true;
-        }
-        (0..MAX_PENDING).all(|k| {
-            let Some(layout) = self.pending[k] else {
-                return true;
-            };
-            (0..PAGES).all(|p| {
-                !layout.zero[p]
-                    || (0..PAGES).all(|q| {
-                        !self.same_backing_page(p, q)
-                            || self.pages[q].guest() == 0
-                            || self.pages[q].marked()
-                            || (k + 1..MAX_PENDING).any(|j| {
-                                self.pending[j].is_some_and(|l| l.authoritative[q] || l.zero[q])
-                            })
-                    })
-            })
-        })
-    }
-
-    /// `H`: residency and plug state are per backing page. Every page of a backing page is
-    /// present, or every page is a base hole, or every page is a zero hole; and all are plugged
-    /// or all unplugged. Trivial for 4 KiB backing.
+    /// `H`: residency, plug state and the discard record are per backing page. Every page of a
+    /// backing page is present, or every page is a base hole, or every page is a zero hole; all
+    /// are plugged or all unplugged; and all are in the discard record or none (it is one bit per
+    /// backing page). Trivial for 4 KiB backing.
     pub fn backing_pages_are_uniform(&self) -> bool {
         if !self.huge {
             return true;
@@ -804,7 +916,9 @@ impl State {
         };
         (0..PAGES).all(|q| {
             let first = &self.pages[q & !(HUGE - 1)];
-            kind(&self.pages[q]) == kind(first) && self.pages[q].unplugged == first.unplugged
+            kind(&self.pages[q]) == kind(first)
+                && self.pages[q].unplugged == first.unplugged
+                && self.pages[q].discarded_block == first.discarded_block
         })
     }
 
@@ -828,6 +942,33 @@ pub fn real_layout(dirty: &[bool; PAGES], resident: &[bool; PAGES]) -> Layout {
         4096,
         &set(dirty),
         &set(resident),
+    );
+    Layout {
+        authoritative: std::array::from_fn(|p| layout.page_is_authoritative(p as u64 * 4096)),
+        zero: std::array::from_fn(|p| layout.page_is_discarded(p as u64 * 4096)),
+    }
+}
+
+/// The real classification without `mincore` on the model's inputs: `dirty`, `discarded` and
+/// `unplugged` page sets, one region of `PAGES` pages.
+pub fn real_layout_tracked(
+    dirty: &[bool; PAGES],
+    discarded: &[bool; PAGES],
+    unplugged: &[bool; PAGES],
+) -> Layout {
+    let set = |bits: &[bool; PAGES]| -> RoaringBitmap {
+        bits.iter()
+            .enumerate()
+            .filter(|(_, b)| **b)
+            .map(|(p, _)| u32::try_from(p).unwrap())
+            .collect()
+    };
+    let layout = crate::vmm_config::snapshot::SnapshotMemoryLayout::classify_tracked(
+        (PAGES * 4096) as u64,
+        4096,
+        &set(dirty),
+        &set(discarded),
+        &set(unplugged),
     );
     Layout {
         authoritative: std::array::from_fn(|p| layout.page_is_authoritative(p as u64 * 4096)),
@@ -919,7 +1060,7 @@ mod verification {
     /// Applies one arbitrary operation.
     fn any_step(s: &mut State) {
         let p = any_index();
-        match kani::any::<u8>() % 11 {
+        match kani::any::<u8>() % 13 {
             0 => s.guest_write(p, kani::any()),
             1 => s.device_mark_ahead(p),
             2 => s.device_write_armed(p, kani::any()),
@@ -932,6 +1073,10 @@ mod verification {
                 s.apply_oldest();
             }
             9 => s.firecracker_full(false),
+            10 => s.discard_clearing_marks(p, kani::any(), true),
+            11 => {
+                s.snapshot_without_mincore(any_race());
+            }
             _ => {
                 s.snapshot(any_race());
             }
@@ -988,25 +1133,29 @@ mod verification {
     }
 
     /// A chunked backend on hugetlbfs, with chunks no larger than a huge page, needs no previous
-    /// copy: reading every chunk that has a page in the layout whole from the memfd, or
-    /// zero-filling those that have a zero page, preserves `I ∧ L` from any state, however late
-    /// the layout is applied.
+    /// copy: reading every chunk that has a page in the layout whole from the memfd preserves
+    /// `I ∧ L` from any state, however late the layout is applied.
     #[kani::proof]
     #[kani::unwind(5)]
     fn hugetlbfs_chunked_apply_preserves_invariant() {
         let mut s = any_state_with_backing(true);
-        s.apply_oldest_chunked(kani::any(), kani::any());
+        s.apply_oldest_chunked(kani::any(), false);
         assert!(s.invariant());
         assert!(s.lemma());
     }
 
-    /// And the result of a paused snapshot applied that way is guest memory.
+    /// And the result of a paused snapshot, in either classification, applied that way is guest
+    /// memory.
     #[kani::proof]
     #[kani::unwind(5)]
     fn hugetlbfs_chunked_paused_snapshot_is_correct() {
         let mut s = any_state_with_backing(true);
-        s.snapshot(Race::default());
-        s.apply_all_chunked(kani::any(), kani::any());
+        if kani::any() {
+            s.snapshot_without_mincore(Race::default());
+        } else {
+            s.snapshot(Race::default());
+        }
+        s.apply_all_chunked(kani::any(), false);
         assert!(s.file_matches_guest());
     }
 
@@ -1020,6 +1169,139 @@ mod verification {
         let mut s = any_state_with_backing(false);
         kani::assume(s.apply_oldest_chunked(true, false));
         assert!(s.invariant());
+    }
+
+    /// The classification without `mincore` preserves `I ∧ L` from any state, racy or not (it is
+    /// also one of the steps of `operations_preserve_invariant`).
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn snapshot_without_mincore_preserves_invariant() {
+        let mut s = any_state();
+        s.snapshot_without_mincore(any_race());
+        assert!(s.invariant());
+        assert!(s.lemma());
+    }
+
+    /// And a paused snapshot without `mincore`, applied by the backend, yields guest memory, with
+    /// a well-formed layout.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn paused_snapshot_without_mincore_is_correct() {
+        let mut s = any_state();
+        let layout = s.snapshot_without_mincore(Race::default());
+        s.apply_all();
+        assert!(s.file_matches_guest());
+        for p in 0..PAGES {
+            assert!(!(layout.authoritative[p] && layout.zero[p]));
+        }
+    }
+
+    /// Also after a racy pre-copy pass, in either classification, whose layout is applied late.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn racy_then_paused_snapshot_without_mincore_is_correct() {
+        let mut s = any_state();
+        if kani::any() {
+            s.snapshot_without_mincore(any_race());
+        } else {
+            s.snapshot(any_race());
+        }
+        s.snapshot_without_mincore(Race::default());
+        s.apply_all();
+        assert!(s.file_matches_guest());
+    }
+
+    /// Why a chunked backend must read a chunk with a zero page rather than zero-fill it: a
+    /// punched huge page the guest partially rewrote has a copy page and a zero page in the same
+    /// layout, and zero-filling the chunk wipes the rewritten page. (Reading the chunk from the
+    /// memfd is right: `hugetlbfs_chunked_paused_snapshot_is_correct`.)
+    #[kani::proof]
+    #[kani::unwind(5)]
+    #[kani::should_panic]
+    fn chunked_zero_fill_breaks() {
+        let mut s = State::booted([false; PAGES], true);
+        s.guest_write(0, kani::any());
+        s.snapshot(Race::default());
+        s.apply_all();
+        s.discard(0); // the block of pages 0 and 1 is punched
+        let v: u8 = kani::any();
+        kani::assume(v != 0);
+        s.guest_write(0, v); // and page 0 rewritten: page 1 is zero, page 0 is `v`
+        s.snapshot_without_mincore(Race::default());
+        s.apply_all_chunked(true, true);
+        assert!(s.file_matches_guest());
+    }
+
+    /// Why rule 4: recording a zero-written edge as a discard of its block (what `discard_range`
+    /// does today) is fine with `mincore`, which sees the block resident and copies it, and wrong
+    /// without: the pages of the block the range did not touch are reported zero while the guest
+    /// reads their content. (Here: a restored hugetlbfs page next to the edge, never written.)
+    #[kani::proof]
+    #[kani::unwind(5)]
+    #[kani::should_panic]
+    fn recording_edges_as_discards_breaks_without_mincore() {
+        let base: [u8; PAGES] = kani::any();
+        kani::assume(base[0] != 0);
+        let mut s = State::restored(base, [false; PAGES], true);
+        for p in 0..PAGES {
+            s.pages[p].file = s.pages[p].base;
+        }
+        // The pre-rule-4 edge discard of page 1: zero-written, block recorded discarded.
+        s.fault_in(1);
+        s.pages[1].memfd = Memfd::Present(0);
+        s.discard_edge_recorded_as_discard(1);
+        s.snapshot_without_mincore(Race::default());
+        s.apply_all();
+        assert!(s.file_matches_guest());
+    }
+
+    /// With `mincore`, the same recording is harmless.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn recording_edges_as_discards_is_harmless_with_mincore() {
+        let mut s = any_state();
+        let p = any_index();
+        kani::assume(!s.pages[p].unplugged);
+        s.fault_in(p);
+        s.pages[p].memfd = Memfd::Present(0);
+        s.discard_edge_recorded_as_discard(p);
+        s.snapshot(Race::default());
+        s.apply_all();
+        assert!(s.file_matches_guest());
+    }
+
+    /// Clearing the dirty marks on a discard is not needed (a stale mark on a punched page copies
+    /// zeros, which is what the guest reads), but if done, clear first and punch second: a guest
+    /// write racing in between is then logged after the clear and the page is copied.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn clearing_marks_before_the_punch_is_correct_without_mincore() {
+        let mut s = any_state();
+        s.discard_clearing_marks(any_index(), kani::any(), true);
+        assert!(s.invariant() && s.lemma());
+        s.snapshot_without_mincore(Race::default());
+        s.apply_all();
+        assert!(s.file_matches_guest());
+    }
+
+    /// Punch first and clear second, and a guest write racing in between faults the page back in
+    /// with content and is logged, after which the clear wipes the mark: a page in the discard
+    /// record with content and no write mark, which is exactly what `D` forbids (the state is
+    /// still fine for the `mincore` classification: `I` holds, the page is marked by the discard
+    /// record and resident). The classification without `mincore` then reports it zero.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    #[kani::should_panic]
+    fn clearing_marks_after_the_punch_breaks_without_mincore() {
+        let mut s = any_state();
+        let p = any_index();
+        let v: u8 = kani::any();
+        kani::assume(v != 0 && !s.pages[p].unplugged);
+        s.discard_clearing_marks(p, Some(v), false);
+        assert!(s.invariant());
+        s.snapshot_without_mincore(Race::default());
+        s.apply_all();
+        assert!(s.file_matches_guest());
     }
 
     /// Without the discard bitmap, dirty tracking off is unsound after a discard: a diff
@@ -1369,7 +1651,7 @@ mod tests {
         }
         fn step(&mut self, s: &mut State) {
             let p = self.page();
-            match self.next() % 10 {
+            match self.next() % 12 {
                 0 => s.guest_write(p, self.byte()),
                 1 => s.device_mark_ahead(p),
                 2 => s.device_write_armed(p, self.byte()),
@@ -1381,12 +1663,17 @@ mod tests {
                 8 => {
                     s.apply_oldest();
                 }
-                _ => {
+                9 => s.discard_clearing_marks(p, (self.next() & 1 == 1).then(|| self.byte()), true),
+                kind => {
                     let race = Race {
                         after_dirty: (self.next() & 1 == 1).then(|| (self.page(), self.byte())),
                         after_resident: (self.next() & 1 == 1).then(|| (self.page(), self.byte())),
                     };
-                    s.snapshot(race);
+                    if kind == 10 {
+                        s.snapshot_without_mincore(race);
+                    } else {
+                        s.snapshot(race);
+                    }
                 }
             }
         }
@@ -1412,14 +1699,49 @@ mod tests {
                 assert!(s.invariant(), "{s:?}");
                 assert!(s.lemma(), "{s:?}");
             }
-            s.snapshot(Race::default());
-            if huge && rng.next() & 1 == 1 {
+            let chunked = huge && rng.next() & 1 == 1;
+            if rng.next() & 1 == 1 && !chunked {
+                s.snapshot_without_mincore(Race::default());
+            } else {
+                s.snapshot(Race::default());
+            }
+            if chunked {
                 s.apply_all_chunked(true, rng.next() & 2 == 2);
             } else {
                 s.apply_all();
             }
             assert!(s.file_matches_guest(), "{s:?}");
         }
+    }
+
+    /// Rule 4 on the scenario that needs it: a partial hugetlbfs discard next to a never-written
+    /// restored page. Recorded as a discard of the block, the classification without `mincore`
+    /// zeroes the neighbour; recorded as a write, it does not.
+    #[test]
+    fn test_edge_recording_without_mincore() {
+        let mut s = State::restored([9; PAGES], [false; PAGES], true);
+        for p in 0..PAGES {
+            s.pages[p].file = s.pages[p].base;
+        }
+        s.fault_in(1);
+        s.pages[1].memfd = Memfd::Present(0);
+        s.discard_edge_recorded_as_discard(1);
+        let layout = s.snapshot_without_mincore(Race::default());
+        assert!(layout.zero[0]);
+        s.apply_all();
+        assert!(!s.file_matches_guest());
+
+        let mut s = State::restored([9; PAGES], [false; PAGES], true);
+        for p in 0..PAGES {
+            s.pages[p].file = s.pages[p].base;
+        }
+        s.discard_edge(1);
+        let layout = s.snapshot_without_mincore(Race::default());
+        assert!(layout.authoritative[1] && !layout.zero[0] && !layout.authoritative[0]);
+        s.apply_all();
+        assert!(s.file_matches_guest());
+        assert_eq!(s.pages[1].file, 0);
+        assert_eq!(s.pages[0].file, 9);
     }
 
     /// The two bugs the model encodes, reproduced on the scenarios that found them.
@@ -1452,6 +1774,30 @@ mod tests {
         s.snapshot(Race::default());
         s.apply_all();
         assert!(s.file_matches_guest());
+    }
+
+    /// The model's classification without `mincore` is `SnapshotMemoryLayout::classify_tracked`,
+    /// for every dirty set, discard record and plug state.
+    #[test]
+    fn test_model_tracked_classification_matches_real() {
+        for bits in 0..(1u32 << (3 * PAGES)) {
+            let dirty: [bool; PAGES] = std::array::from_fn(|p| bits >> p & 1 == 1);
+            let discarded: [bool; PAGES] = std::array::from_fn(|p| bits >> (PAGES + p) & 1 == 1);
+            let unplugged: [bool; PAGES] =
+                std::array::from_fn(|p| bits >> (2 * PAGES + p) & 1 == 1);
+            let mut s = State::booted([false; PAGES], false);
+            for p in 0..PAGES {
+                s.pages[p].kvm_marked = dirty[p];
+                s.pages[p].discarded_block = discarded[p];
+                s.pages[p].unplugged = unplugged[p];
+            }
+            let model = s.snapshot_without_mincore(Race::default());
+            assert_eq!(
+                real_layout_tracked(&dirty, &discarded, &unplugged),
+                model,
+                "{dirty:?} {discarded:?} {unplugged:?}"
+            );
+        }
     }
 
     /// The model's classification is `SnapshotMemoryLayout::classify`, for all 256 inputs.

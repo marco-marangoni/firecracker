@@ -22,7 +22,7 @@ Some optimizations unlocked by `SharedMemfd` are:
 With these optimizations, the guest pause for a snapshot+restore drops by two
 orders of magnitude.\
 For illustrative purposes, on hugetlbfs, guest downtime goes from ~450 ms per
-GiB of resident memory to ~11 ms + 3 ms per GiB of guest memory (3.5 s → 35 ms
+GiB of resident memory to ~13 ms + 0.6 ms/GiB of guest memory (3.5 s → 18 ms
 for an 8 GiB guest): no memory is copied during the pause, which now only waits
 for the state save, the final dirty-page bitmap and Firecracker's restore.
 
@@ -295,15 +295,19 @@ and you have sets with constant-time membership and ordered iteration. In the
 example, `pages_to_copy` decodes to pages 0–1, 9–12, 40, 58–67, 100, 130–131,
 157 and 170–180, and `pages_to_discard` to pages 192–255, the unplugged slot.
 
-The classification relies on `mincore` being accurate, with or without dirty
-tracking; **swap must be disabled** for the API to return correct information.
+With dirty tracking on, the classification comes from KVM's dirty log,
+Firecracker's bitmap and the record of discarded pages alone. Without dirty
+tracking it relies on `mincore`, and **swap must be disabled** for the API to
+return correct information.
 
 A backend that stores memory in chunks (512 KiB, 2 MiB, ...) applies a response
 chunk by chunk. When using 2M hugetlbfs, with chunks aligned to and no larger
-than 2 MiB, a chunk with a page in either set can be read whole from the memfd,
-and a chunk with a page in `pages_to_discard` can simply be zero-filled. For all
-other configurations, the changes need to be applied on top of the previous
-version of the chunk.
+than 2 MiB, a chunk with a page in either set can be read whole from the memfd.
+This holds for chunks with pages in `pages_to_discard` too, but such a chunk
+must not simply be zero-filled: a freed huge page the guest partially rewrote
+has pages in `pages_to_copy` and pages in `pages_to_discard` in the same
+response. For all other configurations, the changes need to be applied on top
+of the previous version of the chunk.
 
 Sizes: a set costs at most 43 KiB per GiB of guest memory, base64 included,
 whatever the dirty pattern, so a response is at most 86 KiB per GiB. That is the
@@ -373,10 +377,10 @@ APIs, and tell the backend which pages to copy.
 - Restoring with a memory backend always populates memory through the uffd.
   Populating from a snapshot file while sharing memory (the `File` backend's
   behaviour) is not offered.
-- The host must not swap: the classification uses `mincore` to tell a punched
-  page from one with content, with or without dirty tracking, and a swapped-out
-  page looks like a punched one. (Firecracker's own `mincore` diffs have the
-  same requirement.)
+- Without dirty tracking the host must not swap: the classification then uses
+  `mincore` to tell a punched page from one with content, and a swapped-out page
+  looks like a punched one. (Firecracker's own `mincore` diffs have the same
+  requirement.) With dirty tracking on, `mincore` is not used.
 - Firecracker does not monitor the backend. Killing it leaves the microVM
   running, and, in case of a restore, with nobody to serve page faults.
 - Firecracker cannot know nor control what the vhost-user server writes to guest
