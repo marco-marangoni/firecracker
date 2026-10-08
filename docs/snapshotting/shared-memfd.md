@@ -5,6 +5,27 @@
 > The `SharedMemfd` memory backend is in developer preview. The API described
 > here may change in incompatible ways before it is stabilised.
 
+`SharedMemfd` is an advanced feature for users looking for a custom or
+high-performance snapshot solution.
+
+Some optimizations unlocked by `SharedMemfd` are:
+
+- VM post-copy: a VM can be resumed while the snapshot is being downloaded. The
+  memory can be faulted in on-demand or pre-fetched according to the userfaultfd
+  protocol
+- VM pre-copy: the guest memory can be copied in batches while the VM is still
+  running
+- Resuming or creating a snapshot can be implemented without using the disk as
+  an intermediary. All the guest memory is either copied via userfaultfd, or
+  read/written on the shared `memfd`
+
+With these optimizations, the guest pause for a snapshot+restore drops by two
+orders of magnitude.\
+For illustrative purposes, on hugetlbfs, guest downtime goes from ~450 ms per
+GiB of resident memory to ~11 ms + 3 ms per GiB of guest memory (3.5 s → 35 ms
+for an 8 GiB guest): no memory is copied during the pause, which now only waits
+for the state save, the final dirty-page bitmap and Firecracker's restore.
+
 ## What it is
 
 `SharedMemfd` is a `backend_type` for `mem_backend`, next to `File` and `Uffd`.
@@ -25,16 +46,7 @@ backend produces the memory part of snapshots. Nothing about snapshots adds to
 the fault-handling obligations: Firecracker tracks what it discards and reports
 it as zero pages, so the backend needs no page-level bookkeeping of its own.
 
-Some use-cases for `SharedMemfd` are:
-
-- VM post-copy: a VM can be resumed while the snapshot is being downloaded. The
-  memory can be faulted in on-demand or pre-fetched according to the userfaultfd
-  protocol
-- VM pre-copy: the guest memory can be copied in batches while the VM is still
-  running
-- Resuming or creating a snapshot can be implemented without using the disk as
-  an intermediary. All the guest memory is either copied via userfaultfd, or
-  read/written on the shared `memfd`
+See read carefully the "Consistency" and "Limitations" sections below. 
 
 ## The handshake
 
@@ -93,10 +105,10 @@ The array has one entry per guest memory region, in guest address order:
 | `page_size`           | Page size in bytes: 4096, or 2097152 (2 MiB) with hugetlbfs.                                                          |
 | `page_size_kib`       | Deprecated copy of `page_size`. The value is in bytes despite the name. Will be removed in 2.0.                       |
 
-The regions are the guest's DRAM (one region, or two on x86 when memory extends
-past the 32-bit MMIO gap) and the virtio-mem hotplug region if there is one,
-plugged or not. They are contiguous in the memfd, and their sizes add up to the
-size of the memfd, which the API calls `total_size`.
+The regions are the guest's physical memory regions (one region, or two on x86
+when memory extends past the 32-bit MMIO gap) and the virtio-mem hotplug region
+if there is one, plugged or not. They are contiguous in the memfd, and their
+sizes add up to the size of the memfd.
 
 The format of the handshake is the same as the `Uffd` backend.
 
@@ -104,13 +116,15 @@ The format of the handshake is the same as the `Uffd` backend.
 
 | How the microVM was started                      | fds received    |
 | :----------------------------------------------- | :-------------- |
+| `snapshot/load` with `backend_type: File`        | N/A, no socket  |
 | `snapshot/load` with `backend_type: Uffd`        | `[uffd]`        |
 | `snapshot/load` with `backend_type: SharedMemfd` | `[uffd, memfd]` |
 | At boot with `machine-config.mem_backend`        | `[memfd]`       |
+| At boot without `machine-config.mem_backend`     | N/A, no socket  |
 
 The userfaultfd comes first and the memfd last. The order of the fds is part of
 the API contract. A properly architected backend should be aware of
-Firecracker's lifecycle and can always assert the exact FDs it expects.
+Firecracker's lifecycle and can always assert the exact fds it expects.
 
 The memfd is all the guest memory, laid out like a full memory snapshot file:
 region *n* starts at its `offset`. Firecracker maps it `MAP_SHARED`, so reading
@@ -205,9 +219,9 @@ rejected with 400 when no memory backend is attached. After the call the microVM
 must not be resumed until the backend has copied every `pages_to_copy` page out
 of the memfd.
 
-When following the rules explained in the "Consistency" section below, this API
-is enough for a backend to produce snapshots identical to what Firecracker would
-have done, with the benefit of no disk I/O for the guest memory.
+When the backend follows the rules explained in the "Consistency" section below,
+the resulting snapshots are identical to the ones produced using the `Diff` or
+`Full` snapshot types, without any disk I/O for the guest memory.
 
 ### `PUT /snapshot/dirty-pages`: optional pre-copy
 
@@ -234,7 +248,6 @@ returns. In that case, it is guaranteed they will be returned on the next call
 ```json
 {
   "memory": {
-    "total_size": 1048576,
     "page_size": 4096,
     "bitmap_encoding": "roaring",
     "pages_to_copy": "OzAAAAEAAB8ACAAAAAEACQADACgAAAA6AAkAZAAAAIIAAQCdAAAAqgAKAA==",
@@ -263,9 +276,6 @@ Every page of the memory file is in exactly one of three classes:
 The two sets are given as page indices (page `i` is the `page_size` bytes at
 file offset `i * page_size`); the full object is:
 
-- `total_size` is the size of a full memory file (the sum of all region sizes,
-  including the hotplug region, plugged or not). Create the target file at this
-  size.
 - `page_size` is the granularity of both sets, in bytes. It is the host page
   size (usually 4096), also when the guest memory is backed by 2 MiB hugetlbfs
   pages.
@@ -276,8 +286,8 @@ file offset `i * page_size`); the full object is:
 - `pages_to_copy` and `pages_to_discard` are each the standard base64 (RFC 4648,
   with padding) of a [Roaring bitmap](https://roaringbitmap.org) in the
   [portable serialization format](https://github.com/RoaringBitmap/RoaringFormatSpec),
-  32-bit members, each member a page index. The two sets are disjoint and no
-  member is at or past `total_size / page_size`.
+  32-bit members, each member a page index. The two sets are disjoint, and they
+  span the whole memfd.
 
 Roaring libraries exist for every mainstream language (CRoaring, `roaring` for
 Rust and Go, RoaringBitmap for Java, `pyroaring`); deserialize the two strings
@@ -357,6 +367,9 @@ APIs, and tell the backend which pages to copy.
 
 ## Limitations
 
+- Guest memory is a `MAP_SHARED` mapping, which results in slower page faults.
+  Please benchmark your use-case before enabling this feature. With hugetlbfs,
+  the regression effectively disappears.
 - Restoring with a memory backend always populates memory through the uffd.
   Populating from a snapshot file while sharing memory (the `File` backend's
   behaviour) is not offered.
