@@ -257,6 +257,20 @@ pub enum ControlRequest {
         mem_path: PathBuf,
         memory: SnapshotMemoryLayout,
     },
+    /// Turn this connection into a page server: after the request, the peer sends
+    /// `(offset: u64, len: u64)` little-endian pairs and gets `len` raw bytes of the memfd back
+    /// for each, until it closes the connection. Used by a post-copy destination to fetch the
+    /// pages its pre-copy target does not have.
+    Serve,
+    /// Post-copy: serve this microVM's faults from the pre-copy target for pages it has, from
+    /// the source backend at `source_sock` (a [`ControlRequest::Serve`] peer) for the pages of
+    /// `memory.pages_to_copy`, and as zero for `memory.pages_to_discard`. The pending pages are
+    /// also pulled in the background while no fault is waiting, and written into the target, so
+    /// that it ends up a complete snapshot and the source can be released.
+    PostCopy {
+        memory: SnapshotMemoryLayout,
+        source_sock: PathBuf,
+    },
 }
 
 /// Reply to a [`ControlRequest`].
@@ -407,6 +421,124 @@ pub struct UffdHandler {
     pub page_size: usize,
     backing_buffer: *const u8,
     uffd: Uffd,
+    post_copy: Option<PostCopy>,
+}
+
+/// Post-copy state of a destination handler (see [`ControlRequest::PostCopy`]).
+#[derive(Debug)]
+pub struct PostCopy {
+    /// Pages of the layout still to be fetched from the source.
+    pending: RoaringBitmap,
+    /// Pages that read as zero.
+    zero: RoaringBitmap,
+    /// Connection to the source backend, in `Serve` mode.
+    source: UnixStream,
+    /// The pre-copy target, written as pages arrive.
+    target: File,
+    /// The layout's page (the host page); a fault covers `fault_size / page_size` of them.
+    page_size: u64,
+    fault_size: u64,
+    started: std::time::Instant,
+    total_pages: u64,
+    on_demand_pages: u64,
+    background_pages: u64,
+    buf: Vec<u8>,
+    zeros: Vec<u8>,
+}
+
+impl PostCopy {
+    /// Pages pulled per background step while no fault is waiting.
+    const BACKGROUND_PAGES: u64 = 256;
+
+    fn new(
+        layout: DecodedLayout,
+        source_sock: &Path,
+        target: File,
+    ) -> Result<Self, std::io::Error> {
+        let mut source = UnixStream::connect(source_sock)?;
+        set_socket_buffers(&source);
+        source.write_all(&serde_json::to_vec(&ControlRequest::Serve).unwrap())?;
+        let total_pages = layout.authoritative.len();
+        Ok(Self {
+            pending: layout.authoritative,
+            zero: layout.zero,
+            source,
+            target,
+            page_size: layout.page_size,
+            fault_size: 0,
+            started: std::time::Instant::now(),
+            total_pages,
+            on_demand_pages: 0,
+            background_pages: 0,
+            buf: Vec::new(),
+            zeros: Vec::new(),
+        })
+    }
+
+    /// Binds the state to a mapping whose faults are `fault_size` bytes (a multiple of the
+    /// layout page: the backing page, 2 MiB on hugetlbfs).
+    fn attach(&mut self, fault_size: u64) -> Result<(), String> {
+        if fault_size % self.page_size != 0 {
+            return Err(format!(
+                "layout page size {} does not divide the mapping's {fault_size}",
+                self.page_size
+            ));
+        }
+        self.fault_size = fault_size;
+        self.buf = vec![0; (Self::BACKGROUND_PAGES * self.page_size).max(fault_size) as usize];
+        self.zeros = vec![0; fault_size as usize];
+        Ok(())
+    }
+
+    /// The layout pages a fault at file offset `offset` covers.
+    fn fault_pages(&self, offset: u64) -> std::ops::Range<u32> {
+        let first = u32::try_from(offset / self.page_size).unwrap();
+        first..first + u32::try_from(self.fault_size / self.page_size).unwrap()
+    }
+
+    /// Fetches `pages` pages at page index `first` from the source into `buf` and the target.
+    /// `on_demand` is whether a fault asked for them (for the accounting; the pending ones among
+    /// them count, a fault fetches its whole block).
+    fn fetch(&mut self, first: u32, pages: u64, on_demand: bool) -> Result<&[u8], std::io::Error> {
+        let range = first..first + pages as u32;
+        let newly = self.pending.range_cardinality(range.clone());
+        if on_demand {
+            self.on_demand_pages += newly;
+        } else {
+            self.background_pages += newly;
+        }
+        let offset = u64::from(first) * self.page_size;
+        let len = pages * self.page_size;
+        let mut request = [0u8; 16];
+        request[..8].copy_from_slice(&offset.to_le_bytes());
+        request[8..].copy_from_slice(&len.to_le_bytes());
+        self.source.write_all(&request)?;
+        let buf = &mut self.buf[..len as usize];
+        self.source.read_exact(buf)?;
+        self.target.write_all_at(buf, offset)?;
+        self.pending.remove_range(range);
+        if self.pending.is_empty() {
+            println!(
+                "Post-copy complete: {} pages, {} on demand, {} in the background, {} ms",
+                self.total_pages,
+                self.on_demand_pages,
+                self.background_pages,
+                self.started.elapsed().as_millis()
+            );
+        }
+        Ok(buf)
+    }
+
+    /// One background step: the first pending run, bounded.
+    fn pull_some(&mut self) {
+        let Some(run) = self.pending.iter().next_range() else {
+            return;
+        };
+        let first = *run.start();
+        let pages = (u64::from(*run.end()) - u64::from(first) + 1).min(Self::BACKGROUND_PAGES);
+        self.fetch(first, pages, false)
+            .expect("fetch from the source backend failed");
+    }
 }
 
 impl UffdHandler {
@@ -431,6 +563,21 @@ impl UffdHandler {
             page_size,
             backing_buffer,
             uffd,
+            post_copy: None,
+        }
+    }
+
+    /// Whether post-copy is on and pages are still pending.
+    pub fn post_copy_pending(&self) -> bool {
+        self.post_copy
+            .as_ref()
+            .is_some_and(|pc| !pc.pending.is_empty())
+    }
+
+    /// Pulls a few pending pages from the source; called while no fault is waiting.
+    pub fn post_copy_step(&mut self) {
+        if let Some(pc) = self.post_copy.as_mut() {
+            pc.pull_some();
         }
     }
 
@@ -472,6 +619,9 @@ impl UffdHandler {
             .find(|region| region.contains(fault_page_addr))
             .cloned()
         {
+            if self.post_copy.is_some() {
+                return self.populate_post_copy(&region, fault_page_addr, len);
+            }
             return self.populate_from_file(&region, fault_page_addr, len);
         }
 
@@ -479,6 +629,37 @@ impl UffdHandler {
             "Could not find addr: {:?} within guest region mappings.",
             addr
         );
+    }
+
+    /// Post-copy: zero for a discarded page, a fetch from the source for a page the pre-copy
+    /// target does not have yet, the target otherwise. A fault covers one backing page, which
+    /// on hugetlbfs is many layout pages; residency, hence the zero class, is uniform across
+    /// them, while only the pending pages of the block are fetched: they land in the target,
+    /// and the block is then populated from the target like any other.
+    fn populate_post_copy(
+        &mut self,
+        region: &GuestRegionUffdMapping,
+        dst: u64,
+        len: usize,
+    ) -> bool {
+        let pc = self.post_copy.as_mut().unwrap();
+        let file_offset = region.offset + (dst - region.base_host_virt_addr);
+        let pages = pc.fault_pages(file_offset);
+        if pc.zero.contains(pages.start) {
+            debug_assert!(pc.zero.contains_range(pages.clone()));
+            let src = pc.zeros.as_ptr();
+            return self.copy_into(src, dst, len);
+        }
+        let mut runs = Vec::new();
+        let mut pending = pc.pending.range(pages);
+        while let Some(run) = pending.next_range() {
+            runs.push((*run.start(), u64::from(*run.end() - *run.start()) + 1));
+        }
+        for (first, count) in runs {
+            pc.fetch(first, count, true)
+                .expect("fetch from the source backend failed");
+        }
+        self.populate_from_file(region, dst, len)
     }
 
     fn populate_from_file(
@@ -489,7 +670,12 @@ impl UffdHandler {
     ) -> bool {
         let offset = dst - region.base_host_virt_addr;
         let src = self.backing_buffer as u64 + region.offset + offset;
+        self.copy_into(src as *const u8, dst, len)
+    }
 
+    /// `UFFDIO_COPY` of `len` bytes from `src` to the faulting page at `dst`. Returns `false` on
+    /// `EAGAIN` (a `remove` event is pending; retry later).
+    fn copy_into(&mut self, src: *const u8, dst: u64, len: usize) -> bool {
         unsafe {
             match self.uffd.copy(src as *const _, dst as *mut _, len, true) {
                 // Make sure the UFFD copied some bytes.
@@ -651,7 +837,12 @@ fn write_zeros(file: &File, range: &MemoryRange) -> Result<(), std::io::Error> {
 
 #[derive(Debug)]
 pub struct Runtime {
-    stream: UnixStream,
+    /// Firecracker's connection, once it has connected.
+    stream: Option<UnixStream>,
+    /// Where Firecracker connects, until it has. Control requests are served meanwhile.
+    listener: Option<UnixListener>,
+    /// Whether the panic hook (which kills Firecracker) was requested before it connected.
+    panic_hook_wanted: bool,
     /// The snapshot memory file page faults are populated from, if any. A handler started for a
     /// boot has none: there are no faults to serve.
     backing_file: Option<File>,
@@ -663,6 +854,54 @@ pub struct Runtime {
     memfd: Option<(File, usize)>,
     /// Socket on which the orchestrator sends [`ControlRequest`]s.
     control: Option<UnixListener>,
+    /// A `PostCopy` request received before Firecracker's handshake; attached to the uffd then.
+    pending_post_copy: Option<PostCopy>,
+}
+
+/// Sizes a page-serving socket's buffers for multi-MiB transfers (the default is ~200 KiB,
+/// which costs a wakeup every few dozen pages).
+fn set_socket_buffers(sock: &UnixStream) {
+    let size: libc::c_int = 8 << 20;
+    for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+        // SAFETY: `size` outlives the call and its length is passed.
+        unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                opt,
+                (&raw const size).cast::<c_void>(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+}
+
+/// Maps (and populates) the snapshot memory file page faults are served from. Returns the
+/// mapping and its size; a null pointer and 0 without a file.
+fn map_backing_file(backing_file: Option<&File>) -> (*mut u8, usize) {
+    let Some(backing_file) = backing_file else {
+        return (ptr::null_mut(), 0);
+    };
+    let file_meta = backing_file
+        .metadata()
+        .expect("can not get backing file metadata");
+    let backing_memory_size = file_meta.len() as usize;
+    // # Safety:
+    // File size and fd are valid
+    let ret = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            backing_memory_size,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE | libc::MAP_POPULATE,
+            backing_file.as_raw_fd(),
+            0,
+        )
+    };
+    if ret == libc::MAP_FAILED {
+        panic!("mmap on backing file failed");
+    }
+    (ret.cast::<u8>(), backing_memory_size)
 }
 
 impl Runtime {
@@ -673,40 +912,30 @@ impl Runtime {
         backing_file: Option<File>,
         control: Option<UnixListener>,
     ) -> Self {
-        let (backing_memory, backing_memory_size) = match &backing_file {
-            Some(backing_file) => {
-                let file_meta = backing_file
-                    .metadata()
-                    .expect("can not get backing file metadata");
-                let backing_memory_size = file_meta.len() as usize;
-                // # Safety:
-                // File size and fd are valid
-                let ret = unsafe {
-                    libc::mmap(
-                        ptr::null_mut(),
-                        backing_memory_size,
-                        libc::PROT_READ,
-                        libc::MAP_PRIVATE | libc::MAP_POPULATE,
-                        backing_file.as_raw_fd(),
-                        0,
-                    )
-                };
-                if ret == libc::MAP_FAILED {
-                    panic!("mmap on backing file failed");
-                }
-                (ret.cast::<u8>(), backing_memory_size)
-            }
-            None => (ptr::null_mut(), 0),
-        };
+        let mapping = map_backing_file(backing_file.as_ref());
+        Self::with_mapping(Some(stream), None, backing_file, mapping, control)
+    }
 
+    /// `new`, with the memory file already mapped by [`map_backing_file`], and either a
+    /// connection from Firecracker or the listener it will connect to.
+    fn with_mapping(
+        stream: Option<UnixStream>,
+        listener: Option<UnixListener>,
+        backing_file: Option<File>,
+        (backing_memory, backing_memory_size): (*mut u8, usize),
+        control: Option<UnixListener>,
+    ) -> Self {
         Self {
             stream,
+            listener,
+            panic_hook_wanted: false,
             backing_file,
             backing_memory,
             backing_memory_size,
             uffds: HashMap::default(),
             memfd: None,
             control,
+            pending_post_copy: None,
         }
     }
 
@@ -719,7 +948,10 @@ impl Runtime {
         let mut creds_size = size_of::<libc::ucred>() as u32;
         let ret = unsafe {
             libc::getsockopt(
-                self.stream.as_raw_fd(),
+                self.stream
+                    .as_ref()
+                    .expect("Firecracker has not connected yet")
+                    .as_raw_fd(),
                 libc::SOL_SOCKET,
                 libc::SO_PEERCRED,
                 (&raw mut creds).cast::<c_void>(),
@@ -732,7 +964,13 @@ impl Runtime {
         creds
     }
 
-    pub fn install_panic_hook(&self) {
+    /// Kills Firecracker if the handler panics. Deferred until Firecracker connects if it has
+    /// not yet.
+    pub fn install_panic_hook(&mut self) {
+        if self.stream.is_none() {
+            self.panic_hook_wanted = true;
+            return;
+        }
         let peer_creds = self.peer_process_credentials();
 
         let default_panic_hook = std::panic::take_hook();
@@ -750,7 +988,7 @@ impl Runtime {
     /// Handles one handshake from Firecracker: keeps the memfd if one was shared and starts
     /// serving faults if a uffd came along. Returns the uffd's fd to add to the poll set.
     fn handle_handshake(&mut self) -> Option<RawFd> {
-        let handshake = Handshake::receive(&self.stream);
+        let handshake = Handshake::receive(self.stream.as_ref().unwrap());
         if let Some(memfd) = handshake.memfd {
             println!(
                 "Received guest memory memfd ({} bytes)",
@@ -763,18 +1001,24 @@ impl Runtime {
             self.backing_file.is_some(),
             "Received a uffd but no snapshot memory file was given to populate faults from"
         );
-        let handler = UffdHandler::new(
+        let mut handler = UffdHandler::new(
             handshake.mappings,
             uffd,
             self.backing_memory,
             self.backing_memory_size,
         );
+        if let Some(mut pc) = self.pending_post_copy.take() {
+            pc.attach(handler.page_size as u64)
+                .expect("post-copy layout does not fit the mapping");
+            handler.post_copy = Some(pc);
+        }
         let fd = handler.uffd.as_raw_fd();
         self.uffds.insert(fd, handler);
         Some(fd)
     }
 
-    /// Serves one connection on the control socket: reads a request until EOF, answers, closes.
+    /// Serves one connection on the control socket: reads a request, answers, closes. A `Serve`
+    /// request keeps the connection as a page server until the peer closes it.
     fn handle_control_connection(&mut self) {
         let listener = self.control.as_ref().unwrap();
         let (mut conn, _) = match listener.accept() {
@@ -784,12 +1028,17 @@ impl Runtime {
                 return;
             }
         };
-        let mut raw = Vec::new();
-        if let Err(err) = conn.read_to_end(&mut raw) {
-            eprintln!("Failed to read control request: {err}");
-            return;
-        }
-        let response = match serde_json::from_slice::<ControlRequest>(&raw) {
+        // Exactly one JSON value, without waiting for EOF: a `Serve` peer keeps writing, and
+        // keeps using the same buffered reader for its requests (unbuffered, serde reads the
+        // body a byte per syscall).
+        let mut reader = std::io::BufReader::new(&conn);
+        let request =
+            ControlRequest::deserialize(&mut serde_json::Deserializer::from_reader(&mut reader));
+        let response = match request {
+            Ok(ControlRequest::Serve) => {
+                self.serve_pages(&mut reader, &conn);
+                return;
+            }
             Ok(request) => self.handle_control_request(request),
             Err(err) => ControlResponse::Done {
                 success: false,
@@ -804,16 +1053,97 @@ impl Runtime {
         }
     }
 
+    /// `Serve`: answers `(offset, len)` requests read from `requests` with raw bytes of the memfd
+    /// on `conn`, until EOF.
+    fn serve_pages(&mut self, requests: &mut impl Read, mut conn: &UnixStream) {
+        let Some((memfd, _)) = &self.memfd else {
+            eprintln!("Serve requested but no memfd received from Firecracker");
+            return;
+        };
+        set_socket_buffers(conn);
+        let mut request = [0u8; 16];
+        let mut buf = Vec::new();
+        let mut served = 0u64;
+        loop {
+            match requests.read_exact(&mut request) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(err) => {
+                    eprintln!("Serve: failed to read a request: {err}");
+                    break;
+                }
+            }
+            let offset = u64::from_le_bytes(request[..8].try_into().unwrap());
+            let len = u64::from_le_bytes(request[8..].try_into().unwrap());
+            buf.resize(len as usize, 0);
+            // A hole reads as zero, which is what the page is.
+            memfd
+                .read_exact_at(&mut buf, offset)
+                .expect("read from the memfd failed");
+            if let Err(err) = conn.write_all(&buf) {
+                eprintln!("Serve: failed to write a reply: {err}");
+                break;
+            }
+            served += len;
+        }
+        println!("Served {served} bytes from the memfd");
+    }
+
     fn handle_control_request(&mut self, request: ControlRequest) -> ControlResponse {
+        let failed = |message: String| ControlResponse::Done {
+            success: false,
+            message,
+            zeroed_bytes: 0,
+            copied_bytes: 0,
+        };
         match request {
+            ControlRequest::Serve => unreachable!("handled by the connection"),
+            ControlRequest::PostCopy {
+                memory,
+                source_sock,
+            } => {
+                let Some(target) = self.backing_file.as_ref() else {
+                    return failed("no memory file to serve from".to_string());
+                };
+                let layout = match memory.decode() {
+                    Ok(layout) => layout,
+                    Err(err) => return failed(format!("invalid layout: {err}")),
+                };
+                let target = match target.try_clone() {
+                    Ok(target) => target,
+                    Err(err) => return failed(format!("cannot reopen the memory file: {err}")),
+                };
+                match PostCopy::new(layout, &source_sock, target) {
+                    Ok(mut pc) => {
+                        let pending = pc.pending.len();
+                        // Before Firecracker connects the state waits for the handshake:
+                        // Firecracker's own accesses at restore (kvmclock, vmgenid) must
+                        // already be served post-copy, or their blocks are populated stale.
+                        match self.uffds.values_mut().next() {
+                            Some(handler) => {
+                                if let Err(err) = pc.attach(handler.page_size as u64) {
+                                    return failed(err);
+                                }
+                                handler.post_copy = Some(pc);
+                            }
+                            None => self.pending_post_copy = Some(pc),
+                        }
+                        ControlResponse::Done {
+                            success: true,
+                            message: format!("post-copy: {pending} pages to fetch"),
+                            zeroed_bytes: 0,
+                            copied_bytes: 0,
+                        }
+                    }
+                    Err(err) => failed(format!(
+                        "cannot connect to the source at {}: {err}",
+                        source_sock.display()
+                    )),
+                }
+            }
             ControlRequest::Copy { mem_path, memory } => {
                 let Some((memfd, _page_size)) = &self.memfd else {
-                    return ControlResponse::Done {
-                        success: false,
-                        message: "no memfd received from Firecracker".to_string(),
-                        zeroed_bytes: 0,
-                        copied_bytes: 0,
-                    };
+                    return failed("no memfd received from Firecracker".to_string());
                 };
                 match copy_pages(memfd, &mem_path, &memory) {
                     Ok(stats) => ControlResponse::Done {
@@ -830,12 +1160,7 @@ impl Runtime {
                         zeroed_bytes: stats.zeroed_bytes,
                         copied_bytes: stats.copied_bytes,
                     },
-                    Err(err) => ControlResponse::Done {
-                        success: false,
-                        message: format!("copy into {} failed: {err}", mem_path.display()),
-                        zeroed_bytes: 0,
-                        copied_bytes: 0,
-                    },
+                    Err(err) => failed(format!("copy into {} failed: {err}", mem_path.display())),
                 }
             }
         }
@@ -850,9 +1175,14 @@ impl Runtime {
     pub fn run(&mut self, pf_event_dispatch: impl Fn(&mut UffdHandler)) {
         let mut pollfds = vec![];
 
-        // Poll the stream for incoming handshakes
+        // Poll the stream for incoming handshakes, or the listener until Firecracker connects.
+        let firecracker_fd = match (&self.stream, &self.listener) {
+            (Some(stream), _) => stream.as_raw_fd(),
+            (None, Some(listener)) => listener.as_raw_fd(),
+            (None, None) => panic!("no connection from Firecracker and nowhere to accept one"),
+        };
         pollfds.push(libc::pollfd {
-            fd: self.stream.as_raw_fd(),
+            fd: firecracker_fd,
             events: libc::POLLIN,
             revents: 0,
         });
@@ -868,13 +1198,22 @@ impl Runtime {
         loop {
             let pollfd_ptr = pollfds.as_mut_ptr();
             let pollfd_size = pollfds.len() as u64;
+            // With post-copy pages pending, do not block: pull some whenever nothing is waiting.
+            let pending = self.uffds.values().any(UffdHandler::post_copy_pending);
+            let timeout = if pending { 0 } else { -1 };
 
             // # Safety:
             // Pollfds vector is valid
-            let mut nready = unsafe { libc::poll(pollfd_ptr, pollfd_size, -1) };
+            let mut nready = unsafe { libc::poll(pollfd_ptr, pollfd_size, timeout) };
 
             if nready == -1 {
                 panic!("Could not poll for events!")
+            }
+            if nready == 0 {
+                for handler in self.uffds.values_mut() {
+                    handler.post_copy_step();
+                }
+                continue;
             }
 
             for i in 0..pollfds.len() {
@@ -883,7 +1222,21 @@ impl Runtime {
                 }
                 if pollfds[i].revents & libc::POLLIN != 0 {
                     nready -= 1;
-                    if pollfds[i].fd == self.stream.as_raw_fd() {
+                    if self.stream.is_none()
+                        && Some(pollfds[i].fd) == self.listener.as_ref().map(|l| l.as_raw_fd())
+                    {
+                        let (stream, _) = self
+                            .listener
+                            .as_ref()
+                            .unwrap()
+                            .accept()
+                            .expect("Cannot listen on UDS socket");
+                        pollfds[i].fd = stream.as_raw_fd();
+                        self.stream = Some(stream);
+                        if self.panic_hook_wanted {
+                            self.install_panic_hook();
+                        }
+                    } else if Some(pollfds[i].fd) == self.stream.as_ref().map(|s| s.as_raw_fd()) {
                         if let Some(uffd_fd) = self.handle_handshake() {
                             pollfds.push(libc::pollfd {
                                 fd: uffd_fd,
@@ -946,19 +1299,28 @@ impl Args {
     /// Opens the memory file and binds the control socket (if given), then waits for
     /// Firecracker to connect and returns a runtime for that connection.
     pub fn into_runtime(self) -> Runtime {
-        let backing_file = self
-            .mem_file_path
-            .map(|path| File::open(path).expect("Cannot open memfile"));
+        // Read-write: a post-copy destination writes fetched pages into it.
+        let backing_file = self.mem_file_path.map(|path| {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .expect("Cannot open memfile")
+        });
         let control = self
             .control_sock_path
             .map(|path| UnixListener::bind(path).expect("Cannot bind to control socket path"));
 
-        // Get the handshake from UDS. We'll use the uffd to handle PFs for Firecracker and/or
-        // keep the memfd to copy snapshots from.
+        // Firecracker connects to the uffd socket for the handshake (a uffd to handle PFs for
+        // and/or the memfd to copy snapshots from); the runtime accepts it from its loop, so
+        // that control requests are served before as well (a post-copy destination gets its
+        // layout before Firecracker restores). The memory file is mapped and populated here, so
+        // that a handler started ahead of the restore has done that work by the time
+        // Firecracker connects.
         let listener = UnixListener::bind(self.uffd_sock_path).expect("Cannot bind to socket path");
-        let (stream, _) = listener.accept().expect("Cannot listen on UDS socket");
+        let mapping = map_backing_file(backing_file.as_ref());
 
-        Runtime::new(stream, backing_file, control)
+        Runtime::with_mapping(None, Some(listener), backing_file, mapping, control)
     }
 }
 
