@@ -616,6 +616,18 @@
                         "index": 1,
                         "type": "dword",
                         "op": "eq",
+                        "val": 3222843072,
+                        "comment": "KVM_CLEAR_DIRTY_LOG"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
                         "val": 3255348834,
                         "comment": "KVM_GET_IRQCHIP"
                     }

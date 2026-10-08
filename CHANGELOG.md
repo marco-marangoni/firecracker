@@ -35,8 +35,12 @@ and this project adheres to
   `mem_file_path`, write the whole memory file and answer `204`), backend
   attached or not. Firecracker guarantees that a page it reports dirty is either
   in the memfd or zero (pages it marks dirty ahead of writing are faulted in),
-  so a backend needs no record of its own to produce a diff. See
-  [memory backend](docs/snapshotting/shared-memfd.md).
+  so a backend needs no record of its own to produce a diff. With dirty tracking
+  on, the classification uses the dirty log and the discard record only, not
+  `mincore`, so swap no longer affects it; pages released by the balloon or
+  virtio-mem are reported in `pages_to_discard` rather than copied as zeros, for
+  which Firecracker enables `KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2` where the host
+  has it (Linux 5.2+). See [memory backend](docs/snapshotting/shared-memfd.md).
 
 ### Changed
 

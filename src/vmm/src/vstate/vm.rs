@@ -26,7 +26,7 @@ use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::terminal::Terminal;
 
-use crate::arch::GSI_MSI_END;
+use crate::arch::{GSI_MSI_END, host_page_size};
 pub use crate::arch::{KvmVm, KvmVmError, VmState};
 use crate::logger::{debug, info};
 use crate::pci::PciSBDF;
@@ -38,7 +38,7 @@ use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorGroup};
 use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{
     GuestMemoryExtension, GuestMemoryMmap, GuestMemoryRegion, GuestMemoryState, GuestRegionMmap,
-    GuestRegionMmapExt, MemoryError, mincore_resident,
+    GuestRegionMmapExt, KvmDirtyLog, MemoryError, mincore_resident,
 };
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::{StartThreadedError, VcpuError, VcpuHandle};
@@ -83,6 +83,11 @@ pub struct VmCommon {
     pub vcpus_handles: Mutex<Vec<VcpuHandle>>,
     /// Event fd written to by vCPUs on exit.
     pub vcpus_exit_evt: EventFd,
+    /// KVM's dirty log with manual protection (`KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2`): reading it
+    /// no longer clears it, [`Self::get_dirty_bitmap`] clears what it read right after, and a
+    /// discard clears the pages it punches beforehand so that they are reported zero. `None` if
+    /// the host lacks the capability, in which case reads clear and discards leave the marks.
+    pub dirty_log: Option<Arc<KvmDirtyLog>>,
     /// Test-only countdown that forces the Nth-next `set_user_memory_region` call to fail, used
     /// to exercise partial-failure handling. 0 means never fail.
     #[cfg(test)]
@@ -100,6 +105,8 @@ pub enum VmError {
     CreateVm(kvm_ioctls::Error),
     /// Failed to get KVM's dirty log: {0}
     GetDirtyLog(kvm_ioctls::Error),
+    /// Failed to clear KVM's dirty log: {0}
+    ClearDirtyLog(std::io::Error),
     /// {0}
     Arch(#[from] KvmVmError),
     /// Error during eventfd operations: {0}
@@ -183,6 +190,8 @@ impl KvmVm {
 
         let vcpus_exit_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(VmError::EventFd)?;
 
+        let dirty_log = Self::enable_manual_dirty_log(&fd);
+
         Ok(VmCommon {
             fd,
             max_memslots: kvm.max_nr_memslots(),
@@ -195,9 +204,39 @@ impl KvmVm {
             uffd: None,
             vcpus_handles: Mutex::new(Vec::new()),
             vcpus_exit_evt,
+            dirty_log,
             #[cfg(test)]
             fail_set_user_memory_region_in: AtomicU32::new(0),
         })
+    }
+
+    /// Enables `KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2` on `fd` if the host has it (5.2+) and returns
+    /// the handle to clear ranges of the log with. `None` if it has not or enabling failed:
+    /// the dirty log then works as before (reads clear), and discards do not clear their pages.
+    fn enable_manual_dirty_log(fd: &VmFd) -> Option<Arc<KvmDirtyLog>> {
+        if fd.check_extension_raw(u64::from(kvm_bindings::KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2)) <= 0 {
+            info!("KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2 is not available; discards keep dirty marks");
+            return None;
+        }
+        // The handle first: once the capability is on, reads no longer clear, so nothing may
+        // fail after enabling it.
+        let dirty_log = match KvmDirtyLog::new(fd) {
+            Ok(dirty_log) => dirty_log,
+            Err(err) => {
+                info!("Cannot duplicate the VM fd for KVM_CLEAR_DIRTY_LOG: {err}");
+                return None;
+            }
+        };
+        let mut cap = kvm_bindings::kvm_enable_cap {
+            cap: kvm_bindings::KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2,
+            ..Default::default()
+        };
+        cap.args[0] = KvmDirtyLog::ENABLE;
+        if let Err(err) = fd.enable_cap(&cap) {
+            info!("Failed to enable KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2: {err}");
+            return None;
+        }
+        Some(Arc::new(dirty_log))
     }
 
     /// Creates the specified number of [`Vcpu`]s.
@@ -456,6 +495,9 @@ impl KvmVm {
     }
 
     fn register_memory_region(&mut self, region: Arc<GuestRegionMmapExt>) -> Result<(), VmError> {
+        if let Some(dirty_log) = &self.common.dirty_log {
+            let _ = region.kvm_dirty_log.set(Arc::clone(dirty_log));
+        }
         let new_guest_memory = self
             .common
             .guest_memory
@@ -566,7 +608,16 @@ impl KvmVm {
             .iter()
             .flat_map(|region| region.plugged_slots())
             .for_each(|mem_slot| {
-                let _ = self.fd().get_dirty_log(mem_slot.slot, mem_slot.slice.len());
+                let Ok(bitmap) = self.fd().get_dirty_log(mem_slot.slot, mem_slot.slice.len())
+                else {
+                    return;
+                };
+                // With manual protection the read does not clear.
+                if let Some(dirty_log) = &self.common.dirty_log {
+                    let pages = u32::try_from(mem_slot.slice.len() / host_page_size())
+                        .expect("slot larger than 16 TiB");
+                    let _ = dirty_log.clear(mem_slot.slot, 0, pages, &bitmap);
+                }
             });
     }
 
@@ -577,10 +628,24 @@ impl KvmVm {
             .flat_map(|region| region.plugged_slots())
             .map(|mem_slot| {
                 let bitmap = match mem_slot.slice.bitmap() {
-                    Some(_) => self
-                        .fd()
-                        .get_dirty_log(mem_slot.slot, mem_slot.slice.len())
-                        .map_err(VmError::GetDirtyLog)?,
+                    Some(_) => {
+                        let bitmap = self
+                            .fd()
+                            .get_dirty_log(mem_slot.slot, mem_slot.slice.len())
+                            .map_err(VmError::GetDirtyLog)?;
+                        // With manual protection the read did not clear: clear exactly what
+                        // was read, before the pages are copied. A write landing in between is
+                        // either in the mask (re-protected now, and its content is what gets
+                        // copied) or not (it stays logged for the next diff).
+                        if let Some(dirty_log) = &self.common.dirty_log {
+                            let pages = u32::try_from(mem_slot.slice.len() / host_page_size())
+                                .expect("slot larger than 16 TiB");
+                            dirty_log
+                                .clear(mem_slot.slot, 0, pages, &bitmap)
+                                .map_err(VmError::ClearDirtyLog)?;
+                        }
+                        bitmap
+                    }
                     None => mincore_bitmap(
                         mem_slot.slice.ptr_guard_mut().as_ptr(),
                         mem_slot.slice.len(),

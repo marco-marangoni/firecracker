@@ -302,8 +302,9 @@ impl SnapshotMemoryLayout {
     }
 
     /// Builds the layout from the sets of `dirty` and `resident` pages (page indices):
-    /// `dirty ∧ resident` is authoritative, `dirty ∧ ¬resident` is zero. This is the single
-    /// definition of the classification. Both results are run-optimised for the wire.
+    /// `dirty ∧ resident` is authoritative, `dirty ∧ ¬resident` is zero. This is the
+    /// classification without dirty tracking, where `dirty` is what `mincore` found resident plus
+    /// the discard record. Both results are run-optimised for the wire.
     pub fn classify(
         total_size: u64,
         page_size: u64,
@@ -312,6 +313,33 @@ impl SnapshotMemoryLayout {
     ) -> Self {
         let mut authoritative = dirty & resident;
         let mut zero = dirty - resident;
+        authoritative.optimize();
+        zero.optimize();
+        Self {
+            total_size,
+            page_size,
+            bitmap_encoding: BitmapEncoding::Roaring,
+            pages_to_copy: authoritative,
+            pages_to_discard: zero,
+        }
+    }
+
+    /// Builds the layout from the two records of a dirty-tracking guest, without residency:
+    /// `dirty` (KVM's log and Firecracker's bitmap) is authoritative; `discarded` (the punched
+    /// backing pages, as page indices) is zero where it is not dirty; `unplugged` (the pages of
+    /// unplugged virtio-mem slots) is zero. Per page on every backing: a punched huge page the
+    /// guest partially rewrote was faulted back in whole and zero-filled where not written, so
+    /// the memfd reads zero exactly where this says zero. (The formal argument is
+    /// `snapshot_without_mincore` in `snapshot_layout_model`.)
+    pub fn classify_tracked(
+        total_size: u64,
+        page_size: u64,
+        dirty: &RoaringBitmap,
+        discarded: &RoaringBitmap,
+        unplugged: &RoaringBitmap,
+    ) -> Self {
+        let mut authoritative = dirty - unplugged;
+        let mut zero = (discarded - dirty) | unplugged;
         authoritative.optimize();
         zero.optimize();
         Self {
@@ -440,6 +468,31 @@ mod tests {
             }
             expected
         });
+    }
+
+    #[test]
+    fn test_snapshot_memory_layout_classify_tracked() {
+        // 24 pages: an unplugged block 0..8 with stale marks on pages 2 and 4, a punched 2 MiB
+        // block 8..16 of which page 9 was rewritten, and a punched block 16..24 nobody touched
+        // since.
+        let mut dirty = RoaringBitmap::new();
+        dirty.insert(2);
+        dirty.insert(4);
+        dirty.insert(9);
+        let mut discarded = RoaringBitmap::new();
+        discarded.insert_range(8..24);
+        let mut unplugged = RoaringBitmap::new();
+        unplugged.insert_range(0..8);
+        let layout =
+            SnapshotMemoryLayout::classify_tracked(24 * 4096, 4096, &dirty, &discarded, &unplugged);
+        // Dirty, not unplugged: copied, including the rewritten page of the punched block.
+        assert_eq!(pages(&layout.pages_to_copy), vec![9]);
+        // Unplugged, and punched-and-not-dirty: zero, page by page.
+        assert_eq!(
+            pages(&layout.pages_to_discard),
+            (0..8).chain(8..9).chain(10..24).collect::<Vec<_>>()
+        );
+        assert!((&layout.pages_to_copy & &layout.pages_to_discard).is_empty());
     }
 
     #[test]
