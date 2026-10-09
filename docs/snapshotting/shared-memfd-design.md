@@ -369,12 +369,12 @@ later writes to the file until the guest writes it, so the orchestrator can fill
 the file during the pause as it would without a prepare. `mem_backend`,
 `track_dirty_pages` and `huge_pages` in the load request are rejected after a
 prepare rather than compared, so that there is one place a value comes from. The
-handshake moving to prepare time is what lets a backend populate the
-destination's memfd during the pre-copy: pages present in it never fault, so the
-post-copy residual is all the handler serves after the resume. Measured on the
-16 GiB hugetlbfs pause benchmark (`test_memory_backend_pause.py`):
-`snapshot/load` 17 ms → 4 ms, total pause of a pre-copy + post-copy transfer 23
-ms → 13 ms, of which `snapshot/create` is 5 ms.
+handshake moving to prepare time lets a backend populate the destination's memfd
+during the pre-copy, which is correct only if the memfd is complete before the
+load; it is not compatible with post-copy, see §8. Measured on the 16 GiB
+hugetlbfs pause benchmark (`test_memory_backend_pause.py`): `snapshot/load` 17
+ms → 4 ms, total pause of a pre-copy + post-copy transfer 23 ms → 13 ms, of
+which `snapshot/create` is 5 ms.
 
 Two more pieces of the pause moved out afterwards. The vCPU threads are spawned
 and seccomp-filtered at prepare time rather than at the end of the load (about
@@ -919,6 +919,102 @@ Options considered:
   never writes guest memory itself, so the bitmaps have exactly one consumer and
   ownership is unambiguous.
 
+#### Post-copy: deferring the final copy
+
+With pre-copy alone the pause still contains the copy of the final set, the
+pages the guest wrote between the last round and the pause (its working set, 70
+MiB for the benchmark's 64 MiB rewrite loop), 36–64 ms on the benchmark at 16
+GiB. Post-copy takes that copy out as well: the destination resumes with the
+pre-copy target as it is, and the final set is fetched from the source
+afterwards, on demand and in the background. The pause is then independent of
+what the guest writes and of the guest's size: 10–12 ms from 512 MiB to 16 GiB
+on both page sizes, all of it `snapshot/create` (4 ms), `snapshot/load` (4–5
+ms), the resume and the HTTP round trips.
+
+Nothing changes in Firecracker's API for it; it is an arrangement between the
+orchestrator and two handlers, implemented in the example handler as two control
+requests. The source backend accepts `Serve`: it keeps the source memfd after
+the finalizing `snapshot/create` and answers page-range requests out of it for
+as long as the connection lasts. The destination handler accepts
+`PostCopy { memory, source_sock }` with the final layout and the source
+backend's socket: from then on a fault on a page of `pages_to_copy` is served by
+fetching the page from the source, a page of `pages_to_discard` is served as
+zero without a fetch, and every other page from the pre-copy target as before.
+While no fault is waiting, the handler pulls the pending pages in the background
+and writes them into the target, so that the target ends up a complete snapshot
+of the final state and the source can be released. On hugetlbfs the fault unit
+is the 2 MiB block; the handler assembles it from the target and fetches only
+the block's pending pages (fetching the whole block cost 3 ms/GiB of
+pause-adjacent time in the first version). The benchmark drains a 70 MiB
+residual 100 ms after the resume, with roughly a third of it fetched on demand
+and the rest in the background.
+
+Correctness rests on three things, two of them already rules of §7:
+
+- The source is paused and stays paused until the drain is complete, so the
+  content of a residual page in the source memfd is final, and the final layout
+  classifies every page exactly: what it does not list did not change since the
+  last round the target holds.
+- Responses still apply in order: the target must hold every pre-copy round
+  before the residual is applied on top; the background pull is the last
+  application.
+- The layout must reach the destination handler *before* `snapshot/load`.
+  Firecracker writes guest memory while restoring (kvmclock, vmgenid, virtqueue
+  pages); if one of those pages is in the residual, its fault must already be
+  served from the source, or the handler populates the block with stale target
+  content and the guest later reads it. The first version of the benchmark sent
+  the layout after the load and the guest panicked on hugetlbfs within
+  milliseconds of the resume.
+
+It also rests on every page the destination touches raising a `MISSING` fault,
+and that is where the destination's memory and the pre-copy target must stay
+separate. A page present in the destination's memory never faults: if the
+backend had pre-copied the rounds straight into the destination's memfd
+(`SharedMemfd` restore, handshake at prepare time), a residual page copied in an
+earlier round would be present with that round's content and be read by the
+guest, or overwritten by Firecracker's restore-time writes, without the handler
+ever hearing of it. Pre-populating the destination memfd is therefore only
+correct when the memfd is complete before the load (the final copy done during
+the pause, the pre-copy → lazy workflow); with post-copy the target is a file
+the handler maps, or anything else that is not the destination's memory. The
+mechanism that would lift this is minor-fault registration:
+`UFFDIO_REGISTER_MODE_MINOR` on the memfd mapping (Linux 5.13+ on hugetlbfs,
+5.14+ on shmem) raises a fault on the first touch of a page that is in the page
+cache but not yet mapped; the handler then refreshes it from the source if it is
+in the residual and `UFFDIO_CONTINUE`s. It needs Firecracker to register
+`MISSING | MINOR` for `SharedMemfd` restores and the handler to handle
+`Pagefault { kind: Minor }`; it is not implemented, and cannot be tested on a
+5.10 host.
+
+#### Decision: pre-copy before post-copy, not pure post-copy
+
+Cloud Hypervisor's `memory_mode=postcopy` pauses immediately and fetches the
+whole memory after the resume; its downtime is the same as ours but the source
+stays busy for 8 s (2M) to 96 s (4K) on 16 GiB, serving faults the whole time,
+and the guest runs at page-fault speed until then. Our arrangement requires the
+pre-copy rounds first, so that the residual is the working set and the drain
+takes 100 ms. The cost is that the orchestrator runs two phases; the example
+handler does not implement a pure post-copy mode because the pre-copy target
+must already hold every page not in the residual.
+
+#### What the pause still contains
+
+Of the 10–12 ms at 16 GiB with a prepared destination: about 3 ms of HTTP round
+trips (four calls through the API socket from the test harness, roughly 0.7 ms
+each, two of which `pause: true` on `snapshot/create` and `resume_vm: true` on
+`snapshot/load` fold away), about 2–3 ms of vCPU state reads and writes (the
+`KVM_GET/SET_MSRS` pair dominates, 0.5–0.7 ms per vCPU each way), 1–2 ms for
+`KVM_GET_DIRTY_LOG` and `KVM_CLEAR_DIRTY_LOG` on the two slots, about 1 ms
+parsing the vmstate, and the tail of device save and restore ioctls. Nothing is
+proportional to memory any more except the dirty-log read. For reference, Cloud
+Hypervisor's local migration (`memory_mode=memfds`, no memory copied) measured
+85–125 ms of downtime on the same host and guest with its default configuration,
+of which ~75 ms is the virtio-block device bringing up its io_uring engine on
+the destination, and 6–17 ms with the block device on synchronous I/O; its
+device and vCPU restore proper is about 3 ms. That comparison also turned up a
+bug in its local migration (the source's device workers service the
+destination's queues while shutting down, because teardown resumes them).
+
 ### 9. Backend implementation (reference)
 
 There is no separate reference backend. The existing example handlers in
@@ -1386,6 +1482,17 @@ user can see.
 - A lost `Diff` response is the orchestrator's problem; it falls back to `Full`.
 - Restore with a backend always uses a uffd for population; file population with
   sharing is deferred.
+- `PUT /snapshot/prepare` does the snapshot-independent half of a load ahead of
+  it from the machine configuration, including starting the vCPU threads; the
+  load checks the snapshot against the prepared microVM and rejects a mismatch
+  rather than reconciling, and the machine configuration is frozen afterwards
+  (§6). `snapshot/create` takes `pause: true` to fold the pause into the call.
+- Post-copy is an arrangement between the orchestrator and the two handlers, not
+  an API: the source backend serves pages out of the paused source's memfd, the
+  destination handler fetches the final layout's pages on demand and in the
+  background after the resume. It requires the pre-copy rounds first and a
+  pre-copy target that is not the destination's own memory, until minor-fault
+  registration lifts the latter (§8).
 - Firecracker tells the backend where the bytes of every *changed* page come
   from (memfd or zero); for unchanged pages the backend knows (zero after a
   boot, the base after a restore). Earlier versions of this design had the
@@ -1427,6 +1534,17 @@ document:
 - Two paused restores of the same snapshot are not byte-identical: KVM writes
   the kvmclock pages at restore. The cross-check test tolerates exactly those
   pages (§10).
+- The first description of `snapshot/prepare` presented pre-copying straight
+  into the destination's memfd as the payoff of the early handshake ("pages
+  present in it never fault, so the residual is all the handler serves"). That
+  is the bug, not the feature, once post-copy is involved: a residual page
+  already present never faults and is read stale. The destination's memory and
+  the pre-copy target must stay separate with post-copy; minor-fault
+  registration is the way to lift that (§8).
+- Post-copy's layout has to reach the destination handler before
+  `snapshot/load`, not after: Firecracker's own restore-time writes fault pages
+  in, and on hugetlbfs a block populated from the stale target then carried the
+  guest's old virtqueue state (§8).
 - `/proc` is not available to a jailed handler; fd classification uses `fstat`
   (§2).
 - The `backend_type` value is `SharedMemfd`, named after the mechanism like

@@ -6,27 +6,14 @@
 > here may change in incompatible ways before it is stabilised.
 
 `SharedMemfd` is an advanced feature for users looking for a custom or
-high-performance snapshot solution.
+high-performance snapshot, restore or live-migration solution.
 
-Some optimizations unlocked by `SharedMemfd` are, in order of gain:
-
-1. VM post-copy: a VM can be resumed while the snapshot is being downloaded. The
-   memory can be faulted in on-demand or pre-fetched according to the
-   userfaultfd protocol
-1. VM pre-copy: the guest memory can be copied in batches while the VM is still
-   running
-1. Resuming or creating a snapshot can be implemented without using the disk as
-   an intermediary. All the guest memory is either copied via userfaultfd, or
-   read/written on the shared `memfd`
-1. For a live migration, `/snapshot/prepare` allows pre-initializing the
-   destination VM while the source VM is still running
-
-With these optimizations, the guest pause for a snapshot+restore drops by up to
-three orders of magnitude.\
+With a fully optimized backend, the guest pause for a snapshot+restore drops by
+up to three orders of magnitude.\
 For illustrative purposes, on hugetlbfs, guest downtime goes from ~450 ms per
-GiB of resident memory to ~10 ms regardless of VM size: no memory is copied
-during the pause, and all expensive operations are done either before a pause or
-after a resume.
+GiB of resident memory (when using a `Diff` snapshot to file) to ~10 ms
+regardless of VM size: no memory is copied during the pause, and all expensive
+operations are done either before a pause or after a resume.
 
 ## What it is
 
@@ -48,6 +35,19 @@ backend produces the memory part of snapshots. Nothing about snapshots adds to
 the fault-handling obligations: Firecracker tracks what it discards and reports
 it as zero pages, so the backend needs no page-level bookkeeping of its own.
 
+Some optimizations unlocked by `SharedMemfd` are, in order of gain:
+
+1. VM post-copy: a VM can be resumed while the snapshot is being downloaded. The
+   memory can be faulted in on-demand or pre-fetched according to the
+   userfaultfd protocol
+1. VM pre-copy: the guest memory can be copied in batches while the VM is still
+   running
+1. Resuming or creating a snapshot can be implemented without using the disk as
+   an intermediary. All the guest memory is either copied via userfaultfd, or
+   read/written on the shared `memfd`
+1. For a live migration, `/snapshot/prepare` allows pre-initializing the
+   destination VM while the source VM is still running
+
 Read carefully the "Consistency" and "Limitations" sections below.
 
 ## The handshake
@@ -61,10 +61,10 @@ descriptor with it.
 ### The socket
 
 The backend creates and listens on a `SOCK_STREAM` Unix domain socket which is
-then passed to Firecracker (via the config file, `PUT /machine-config`, or
-`PUT /snapshot/load`). Firecracker then connects to the path given in the
-request (relative to its chroot when jailed) and sends the handshake message. If
-nobody is listening, the API call fails.
+then passed to Firecracker (via the config file, `PUT /machine-config`,
+`PUT /snapshot/load` or `PUT /snapshot/prepare`). Firecracker then connects 
+to the path given in the request (relative to its chroot when jailed) and sends
+the handshake message. If nobody is listening, the API call fails.
 
 After that, Firecracker never reads from or writes to the socket, and keeps it
 open until it exits. The backend can use the connection to learn Firecracker's
@@ -224,6 +224,7 @@ workflow is then something like:
 ```
 PUT /machine-config   { ... }
 PUT /memory-hotplug   (if the snapshot has a hotpluggable region)
+PUT /cpu-config
 PUT /snapshot/prepare {"mem_backend": {"backend_type": "SharedMemfd",
                                        "backend_path": "/run/backend.sock"}}
 
@@ -232,8 +233,11 @@ PUT /snapshot/prepare {"mem_backend": {"backend_type": "SharedMemfd",
 PUT /snapshot/load    {"snapshot_path": "/path/vmstate", "resume_vm": true}
 ```
 
-During `/snapshot/prepare`, the backend receives the handshake and can populate
-the memfd before the load.
+During `/snapshot/prepare`, the backend receives the handshake and can either
+fully populate the memfd before the load, or populate a separate buffer in case
+of post-copy.\
+Note: for post-copy, the backend cannot pre-copy directly into the memfd, as
+post-copy requires the backend to receive UFFD events for all memory.
 
 The load then checks the snapshot against the prepared microVM, vCPU count,
 memory size, page size, memory layout and KVM capability modifiers (from
@@ -388,7 +392,8 @@ To resume from a snapshot as fast as possible, it's optionally possible to start
 your backend and prepare Firecracker while the source VM is running using
 `PUT /machine-config`, `PUT /memory-hotplug`, `PUT /cpu-config` and
 `PUT /snapshot/prepare`. The backend can start pre-populating guest memory into
-the memfd at this point.
+the memfd at this point, as long as the memfd is complete before `snapshot/load`
+(see the post-copy workflow for the case where it is not).
 
 These APIs do most of the initialization work, and leave Firecracker in a state
 where `/snapshot/load` can resume a VM in a few milliseconds.
@@ -422,7 +427,9 @@ For a VM migration, it's also possible to shorten the pause time by deferring
 the final copy of `pages_to_copy` using a post-copy approach. The pause then no
 longer depends on how much the guest writes, or the size of the VM:
 
-1. Prepare the destination VM
+1. Prepare the destination VM. The pre-copy target, where the destination's
+   backend will serve faults from, needs to be separate from the memfd, so it
+   can then correctly resolve dirty but populated pages
 1. Run the pre-copy loop as above, copying each response into the target
 1. Call `/snapshot/create` with `snapshot_type: Backend, pause: true` on the
    source. The response is the residual changes since the last round.
