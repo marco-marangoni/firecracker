@@ -635,8 +635,8 @@ fn check_prepared_vm(
         return Err(PreparedVmError::ParamsFixed);
     }
     let vcpus = microvm_state.vcpu_states.len();
-    if vcpus != prepared.vcpus.len() {
-        return Err(PreparedVmError::VcpuCount(vcpus, prepared.vcpus.len()));
+    if vcpus != prepared.vcpu_count() {
+        return Err(PreparedVmError::VcpuCount(vcpus, prepared.vcpu_count()));
     }
     let mem_size_mib = microvm_state.vm_info.mem_size_mib;
     if mem_size_mib != machine_config.mem_size_mib as u64 {
@@ -999,6 +999,7 @@ mod tests {
             snapshot_path: snapshot_path.clone(),
             mem_file_path,
             sync_snapshot_files: false,
+            pause: false,
         };
         let mem = Some(PathBuf::from("/proc/nonexistent/mem"));
 

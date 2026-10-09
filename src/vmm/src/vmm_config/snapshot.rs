@@ -64,6 +64,10 @@ pub struct CreateSnapshotParams {
     /// Activated virtio-block devices are always fsync'd, independently of this.
     #[serde(default = "default_sync_snapshot_files")]
     pub sync_snapshot_files: bool,
+    /// Pause the microVM first, as `PATCH /vm {"state": "Paused"}` would, saving the round trip.
+    /// The microVM stays paused afterwards. No-op if it is paused already.
+    #[serde(default)]
+    pub pause: bool,
 }
 
 /// Default value for [CreateSnapshotParams::sync_snapshot_files].

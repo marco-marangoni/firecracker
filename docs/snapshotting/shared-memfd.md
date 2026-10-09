@@ -203,7 +203,7 @@ backend serves page faults exactly as a UFFD handler does.
 The choice is per instance and is **not** recorded in the snapshot: a snapshot
 made with a memory backend restores fine with `File` or `Uffd`, and vice versa.
 
-### Setting up the microVM ahead of the restore: `PUT /snapshot/prepare`
+### Optional microVM setup ahead of the restore: `PUT /snapshot/prepare`
 
 ```json
 {
@@ -217,8 +217,8 @@ made with a memory backend restores fine with `File` or `Uffd`, and vice versa.
 Most of what `PUT /snapshot/load` does depends only on the microVM's shape, not
 on the snapshot: mapping guest memory, registering it with KVM, creating the VM
 and its vCPUs, and setting up a backend if applicable. Since `/snapshot/load` is
-in the hot path, `PUT /snapshot/prepare` lets you do that part ahead of time,
-to prepare a destination VM while the source VM is still running. The resume
+in the hot path, `PUT /snapshot/prepare` lets you do that part ahead of time, to
+prepare a destination VM while the source VM is still running. The resume
 workflow is then something like:
 
 ```
@@ -242,10 +242,11 @@ memory size, page size, memory layout and KVM capability modifiers (from
 and must be left out of the load request. The machine configuration cannot
 change once a microVM is prepared, and a prepared microVM cannot be booted.
 
-### `PUT /snapshot/create`
+### Capture VM state: `PUT /snapshot/create`
 
-The microVM must be `Paused`, as for any snapshot. `PUT /snapshot/create` takes
-a `snapshot_type`: `Full`, `Diff`, or `Backend`.
+The microVM must be `Paused`, as for any snapshot, unless the request carries
+`pause: true`, which pauses it first (and leaves it paused).
+`PUT /snapshot/create` takes a `snapshot_type`: `Full`, `Diff`, or `Backend`.
 
 `Full` and `Diff` behave exactly as without a memory backend: `mem_file_path` is
 mandatory and Firecracker writes the whole of guest memory to it through its own
@@ -264,7 +265,7 @@ When the backend follows the rules explained in the "Consistency" section below,
 the resulting snapshots are identical to the ones produced using the `Diff` or
 `Full` snapshot types, without any disk I/O for the guest memory.
 
-### `PUT /snapshot/dirty-pages`: optional pre-copy
+### Optional pre-copy: `PUT /snapshot/dirty-pages`
 
 Pre-copy is optional and only useful if you want to shorten the pause of a
 `/snapshot/create Backend`. While the guest runs, `dirty-pages` returns the
@@ -397,8 +398,7 @@ where `/snapshot/load` can resume a VM in a few milliseconds.
 To produce a snapshot, with no pre-copy, the workflow is as follows:
 
 1. (optional) prepare the destination VM
-1. Pause the microVM
-1. Call `/snapshot/create` with `snapshot_type: Backend`
+1. Call `/snapshot/create` with `snapshot_type: Backend, pause: true`
 1. Copy `pages_to_copy` into a file, zero `pages_to_discard`
 1. The microVM can be resumed here, or the file restored on the destination VM
 
@@ -411,8 +411,7 @@ the guest is paused:
 1. Copy `pages_to_copy` into a file, zero `pages_to_discard`
 1. Repeat from step 2 until the changed set is small enough, or after a timeout
    or iteration limit
-1. Pause the microVM
-1. Call `/snapshot/create` with `snapshot_type: Backend`
+1. Call `/snapshot/create` with `snapshot_type: Backend, pause: true`
 1. Final copy of `pages_to_copy`, final zeroing of `pages_to_discard`
 1. The microVM can be resumed here, or the file restored on the destination VM
 
@@ -425,9 +424,8 @@ longer depends on how much the guest writes, or the size of the VM:
 
 1. Prepare the destination VM
 1. Run the pre-copy loop as above, copying each response into the target
-1. Pause the microVM
-1. Call `/snapshot/create` with `snapshot_type: Backend` on the source. The
-   response is the residual changes since the last round.
+1. Call `/snapshot/create` with `snapshot_type: Backend, pause: true` on the
+   source. The response is the residual changes since the last round.
 1. Hand the `pages_to_copy` and `pages_to_discard` bitmaps to the destination's
    backend, together with a way to reach the source's backend, which keeps the
    source memfd and serves pages out of it on request.

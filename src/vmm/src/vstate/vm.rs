@@ -286,9 +286,28 @@ impl KvmVm {
     /// and stores the resulting handles. The barrier is used to synchronize TLS
     /// initialization across all vCPU threads before returning.
     pub fn start_vcpus(
-        self: &Arc<Self>,
+        &self,
+        vcpus: Vec<Vcpu>,
+        vcpu_seccomp_filter: Arc<crate::seccomp::BpfProgram>,
+    ) -> Result<(), StartVcpusError> {
+        self.start_vcpus_filtered(vcpus, vcpu_seccomp_filter, false)
+    }
+
+    /// [`Self::start_vcpus`] for vCPUs that will receive their state on their threads: the
+    /// seccomp filter is installed after that (see [`Vcpu::start_threaded`]).
+    pub fn start_vcpus_deferred_seccomp(
+        &self,
+        vcpus: Vec<Vcpu>,
+        vcpu_seccomp_filter: Arc<crate::seccomp::BpfProgram>,
+    ) -> Result<(), StartVcpusError> {
+        self.start_vcpus_filtered(vcpus, vcpu_seccomp_filter, true)
+    }
+
+    fn start_vcpus_filtered(
+        &self,
         mut vcpus: Vec<Vcpu>,
         vcpu_seccomp_filter: Arc<crate::seccomp::BpfProgram>,
+        defer_seccomp: bool,
     ) -> Result<(), StartVcpusError> {
         let vcpu_count = vcpus.len();
         let barrier = Arc::new(Barrier::new(vcpu_count + 1));
@@ -312,6 +331,7 @@ impl KvmVm {
                 self,
                 vcpu_seccomp_filter.clone(),
                 barrier.clone(),
+                defer_seccomp,
             )?);
         }
         drop(handles);
