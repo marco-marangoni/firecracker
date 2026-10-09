@@ -12,7 +12,7 @@ use super::persist::{create_snapshot, restore_from_snapshot};
 use super::resources::VmResources;
 use super::{Vmm, VmmError};
 use crate::EventManager;
-use crate::builder::StartMicrovmError;
+use crate::builder::{self, PreparedVm, StartMicrovmError};
 use crate::cpu_config::templates::{CustomCpuTemplate, GuestConfigError};
 use crate::device_manager::pci_mngr::PciManagerError;
 use crate::devices::virtio::balloon::device::{HintingStatus, StartHintingCmd};
@@ -44,7 +44,8 @@ use crate::vmm_config::net::{
 use crate::vmm_config::pmem::{PmemConfig, PmemConfigError, PmemDeviceUpdateConfig};
 use crate::vmm_config::serial::SerialConfig;
 use crate::vmm_config::snapshot::{
-    CreateSnapshotParams, LoadSnapshotParams, SnapshotMemoryResponse, SnapshotType,
+    CreateSnapshotParams, LoadSnapshotParams, MemBackendType, PrepareLoadParams,
+    SnapshotMemoryResponse, SnapshotType,
 };
 use crate::vmm_config::vsock::{VsockConfigError, VsockDeviceConfig};
 use crate::vmm_config::{self, RateLimiterUpdate};
@@ -108,6 +109,10 @@ pub enum VmmAction {
     /// This also pauses device emulation: `ApiServerAdapter::handle_request` stops
     /// polling the event loop and only serves API requests until `Resume`.
     Pause,
+    /// Set up guest memory and the KVM VM for a coming `LoadSnapshot`, from the machine
+    /// configuration, so that the load itself has less to do. This action can only be called
+    /// before the microVM has booted.
+    PrepareLoad(PrepareLoadParams),
     /// Repopulate the MMDS contents.
     PutMMDS(Value),
     /// Configure the guest vCPU features.
@@ -212,6 +217,8 @@ pub enum VmmActionError {
     OperationNotSupportedPostBoot,
     /// The requested operation is not supported before starting the microVM.
     OperationNotSupportedPreBoot,
+    /// Prepare load error: {0}
+    PrepareLoad(#[from] PrepareLoadError),
     /// Start microvm error: {0}
     StartMicrovm(#[from] StartMicrovmError),
     /// Vsock config error: {0}
@@ -301,6 +308,12 @@ pub struct PrebootApiController<'a> {
     // Configuring boot specific resources will set this to true.
     // Loading from snapshot will not be allowed once this is true.
     boot_path: bool,
+    // Setting the machine configuration (or memory hotplug) sets this to true. Loading from
+    // snapshot is then only allowed through a prepared VM, which is what the configuration is
+    // for; otherwise the snapshot would silently override it.
+    machine_configured: bool,
+    // The VM `PUT /snapshot/prepare` set up for the coming `PUT /snapshot/load`.
+    prepared_vm: Option<PreparedVm>,
     // Some PrebootApiRequest errors are irrecoverable and Firecracker
     // should cleanly teardown if they occur.
     fatal_error: Option<BuildMicrovmFromRequestsError>,
@@ -316,6 +329,8 @@ impl fmt::Debug for PrebootApiController<'_> {
             .field("event_manager", &"?")
             .field("built_vmm", &self.built_vmm)
             .field("boot_path", &self.boot_path)
+            .field("machine_configured", &self.machine_configured)
+            .field("prepared_vm", &self.prepared_vm.is_some())
             .field("fatal_error", &self.fatal_error)
             .finish()
     }
@@ -330,6 +345,21 @@ pub enum LoadSnapshotError {
     RestoreFromSnapshot(#[from] RestoreFromSnapshotError),
     /// Failed to resume microVM: {0}
     ResumeMicrovm(#[from] VmmError),
+}
+
+/// Error type for [`PrebootApiController::prepare_load`]
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum PrepareLoadError {
+    /// Preparing a snapshot load is not allowed after configuring boot-specific resources.
+    NotAllowed,
+    /// A VM is already prepared.
+    AlreadyPrepared,
+    /// The machine configuration cannot change once a VM is prepared.
+    MachineConfigFrozen,
+    /// Cannot restore hugetlbfs backed memory by mapping the memory file. Please use uffd.
+    HugetlbfsFile,
+    /// Failed to prepare the VM: {0}
+    Prepare(#[from] StartMicrovmError),
 }
 
 /// Shorthand type for a request containing a boxed VmmAction.
@@ -365,6 +395,8 @@ impl<'a> PrebootApiController<'a> {
             event_manager,
             built_vmm: None,
             boot_path: false,
+            machine_configured: false,
+            prepared_vm: None,
             fatal_error: None,
         }
     }
@@ -488,6 +520,9 @@ impl<'a> PrebootApiController<'a> {
             LoadSnapshot(config) => self
                 .load_snapshot(&config)
                 .map_err(VmmActionError::LoadSnapshot),
+            PrepareLoad(config) => self
+                .prepare_load(&config)
+                .map_err(VmmActionError::PrepareLoad),
             PatchMMDS(value) => mmds_patch_data(
                 self.vm_resources
                     .locked_mmds_or_default()
@@ -596,7 +631,8 @@ impl<'a> PrebootApiController<'a> {
         &mut self,
         cfg: MachineConfigUpdate,
     ) -> Result<VmmData, VmmActionError> {
-        self.boot_path = true;
+        self.check_machine_config_not_frozen()?;
+        self.machine_configured = true;
         self.vm_resources
             .update_machine_config(&cfg)
             .map(|()| VmmData::Empty)
@@ -607,8 +643,18 @@ impl<'a> PrebootApiController<'a> {
         &mut self,
         cpu_template: CustomCpuTemplate,
     ) -> Result<VmmData, VmmActionError> {
+        self.check_machine_config_not_frozen()?;
         self.vm_resources.set_custom_cpu_template(cpu_template);
         Ok(VmmData::Empty)
+    }
+
+    /// A prepared VM was built from the machine configuration, memory hotplug configuration and
+    /// CPU template as they were; changing them afterwards would be silently ignored.
+    fn check_machine_config_not_frozen(&self) -> Result<(), VmmActionError> {
+        if self.prepared_vm.is_some() {
+            return Err(PrepareLoadError::MachineConfigFrozen.into());
+        }
+        Ok(())
     }
 
     fn set_vsock_device(&mut self, cfg: VsockDeviceConfig) -> Result<VmmData, VmmActionError> {
@@ -629,7 +675,8 @@ impl<'a> PrebootApiController<'a> {
         &mut self,
         cfg: MemoryHotplugConfig,
     ) -> Result<VmmData, VmmActionError> {
-        self.boot_path = true;
+        self.check_machine_config_not_frozen()?;
+        self.machine_configured = true;
         self.vm_resources.set_memory_hotplug_config(cfg)?;
         Ok(VmmData::Empty)
     }
@@ -637,6 +684,9 @@ impl<'a> PrebootApiController<'a> {
     // On success, this command will end the pre-boot stage and this controller
     // will be replaced by a runtime controller.
     fn start_microvm(&mut self) -> Result<VmmData, VmmActionError> {
+        if self.prepared_vm.is_some() {
+            return Err(PrepareLoadError::AlreadyPrepared.into());
+        }
         build_and_boot_microvm(
             &self.instance_info,
             self.vm_resources,
@@ -650,6 +700,30 @@ impl<'a> PrebootApiController<'a> {
         .map_err(VmmActionError::StartMicrovm)
     }
 
+    /// `PUT /snapshot/prepare`: sets up the VM for the coming load from the machine configuration
+    /// (see [`builder::prepare_vm`]). Rejected once boot-specific resources are configured, as a
+    /// load is, since they would be silently dropped; and twice.
+    fn prepare_load(&mut self, params: &PrepareLoadParams) -> Result<VmmData, PrepareLoadError> {
+        if self.boot_path {
+            return Err(PrepareLoadError::NotAllowed);
+        }
+        if self.prepared_vm.is_some() {
+            return Err(PrepareLoadError::AlreadyPrepared);
+        }
+        if params.mem_backend.backend_type == MemBackendType::File
+            && self.vm_resources.machine_config.huge_pages.is_hugetlbfs()
+        {
+            return Err(PrepareLoadError::HugetlbfsFile);
+        }
+        let prepare_start_us = get_time_us(ClockType::Monotonic);
+        self.prepared_vm = Some(builder::prepare_vm(self.vm_resources, &params.mem_backend)?);
+        debug!(
+            "'prepare load' VMM action took {} us.",
+            get_time_us(ClockType::Monotonic) - prepare_start_us
+        );
+        Ok(VmmData::Empty)
+    }
+
     // On success, this command will end the pre-boot stage and this controller
     // will be replaced by a runtime controller.
     fn load_snapshot(
@@ -658,7 +732,9 @@ impl<'a> PrebootApiController<'a> {
     ) -> Result<VmmData, LoadSnapshotError> {
         let load_start_us = get_time_us(ClockType::Monotonic);
 
-        if self.boot_path {
+        // Boot-specific resources would be dropped; so would the machine configuration, unless a
+        // VM was prepared from it.
+        if self.boot_path || (self.machine_configured && self.prepared_vm.is_none()) {
             let err = LoadSnapshotError::LoadSnapshotNotAllowed;
             info!("{}", err);
             return Err(err);
@@ -671,10 +747,14 @@ impl<'a> PrebootApiController<'a> {
             self.seccomp_filters,
             load_params,
             self.vm_resources,
+            &mut self.prepared_vm,
         )
-        .inspect_err(|_| {
-            // If restore fails, we consider the process is too dirty to recover.
-            self.fatal_error = Some(BuildMicrovmFromRequestsError::Restore);
+        .inspect_err(|err| {
+            // If restore fails, we consider the process is too dirty to recover; except when
+            // the snapshot was rejected against the prepared VM, before anything was done.
+            if !matches!(err, RestoreFromSnapshotError::Prepared(_)) {
+                self.fatal_error = Some(BuildMicrovmFromRequestsError::Restore);
+            }
         })?;
         // Resume VM
         if load_params.resume_vm {
@@ -874,6 +954,7 @@ impl RuntimeApiController {
             | ConfigureMetrics(_)
             | ConfigureSerial(_)
             | LoadSnapshot(_)
+            | PrepareLoad(_)
             | PutCpuConfiguration(_)
             | SetBalloonDevice(_)
             | SetVsockDevice(_)
@@ -1363,10 +1444,10 @@ mod tests {
         check_unsupported(runtime_request(VmmAction::LoadSnapshot(
             LoadSnapshotParams {
                 snapshot_path: PathBuf::new(),
-                mem_backend: MemBackendConfig {
+                mem_backend: Some(MemBackendConfig {
                     backend_type: MemBackendType::File,
                     backend_path: PathBuf::new(),
-                },
+                }),
                 track_dirty_pages: false,
                 resume_vm: false,
                 network_overrides: vec![],

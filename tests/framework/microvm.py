@@ -1097,6 +1097,7 @@ class Microvm:
                 "kernel_file": str(self.guest_kernel.vmlinux),
                 "rootfs_file": str(self.rootfs_file) if self.rootfs_file else None,
                 "vcpus_count": self.vcpus_count,
+                "mem_size_mib": self.mem_size_bytes // 2**20,
             },
         )
 
@@ -1124,6 +1125,8 @@ class Microvm:
         uffd_handler_name: str = None,
         mem_backend: bool = False,
         track_dirty_pages: bool = None,
+        prepare: bool = False,
+        memory_hotplug: dict = None,
     ):
         """Restore a snapshot.
 
@@ -1134,6 +1137,13 @@ class Microvm:
         handler through UFFD. With `mem_backend` as well, the handler is started
         as a memory backend (`backend_type: SharedMemfd`): it additionally
         receives the guest memory memfd and can produce snapshots from it.
+
+        With `prepare`, the machine configuration is set from the snapshot's
+        metadata (and `memory_hotplug`, the `PUT /memory-hotplug` body, if the
+        snapshot has a hotpluggable region) and `PUT /snapshot/prepare` sets up
+        guest memory and the KVM VM before `PUT /snapshot/load`, which then
+        names only the snapshot. (With the `File` backend the memory file is
+        complete here already; a real orchestrator would fill it in between.)
         """
 
         jailed_snapshot = snapshot.copy_to_chroot(Path(self.chroot()))
@@ -1212,20 +1222,37 @@ class Microvm:
 
         if track_dirty_pages is None:
             track_dirty_pages = jailed_snapshot.snapshot_type.needs_dirty_page_tracking
-        self.api.snapshot_load.put(
-            mem_backend=mem_backend_config,
-            snapshot_path=str(jailed_vmstate),
-            enable_diff_snapshots=track_dirty_pages,
-            resume_vm=resume,
-            **optional_kwargs,
-        )
+        if prepare:
+            self.api.machine_config.put(
+                vcpu_count=jailed_snapshot.meta["vcpus_count"],
+                mem_size_mib=jailed_snapshot.meta["mem_size_mib"],
+                huge_pages=huge_pages or HugePagesConfig.NONE,
+                track_dirty_pages=track_dirty_pages,
+            )
+            if memory_hotplug is not None:
+                self.api.memory_hotplug.put(**memory_hotplug)
+            self.api.snapshot_prepare.put(mem_backend=mem_backend_config)
+            optional_kwargs.pop("huge_pages", None)
+            self.api.snapshot_load.put(
+                snapshot_path=str(jailed_vmstate),
+                resume_vm=resume,
+                **optional_kwargs,
+            )
+        else:
+            self.api.snapshot_load.put(
+                mem_backend=mem_backend_config,
+                snapshot_path=str(jailed_vmstate),
+                enable_diff_snapshots=track_dirty_pages,
+                resume_vm=resume,
+                **optional_kwargs,
+            )
 
         if huge_pages is not None:
             self.huge_pages = huge_pages
 
+        response = self.api.machine_config.get()
+        self.mem_size_bytes = int(response.json()["mem_size_mib"]) * 2**20
         if self.memory_monitor:
-            response = self.api.machine_config.get()
-            self.mem_size_bytes = int(response.json()["mem_size_mib"]) * 2**20
             # Notify monitor that this is a restored VM
             self.memory_monitor.set_threshold_for_restored_vm()
             self.memory_monitor.start()

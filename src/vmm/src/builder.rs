@@ -4,6 +4,7 @@
 //! Enables pre-boot setup, instantiation and booting of a Firecracker VMM.
 
 use std::fmt::Debug;
+use std::fs::File;
 use std::io;
 use std::os::unix::io::AsRawFd;
 #[cfg(feature = "gdb")]
@@ -17,7 +18,6 @@ use utils::time::TimestampUs;
 use vm_allocator::AllocPolicy;
 use vm_memory::GuestAddress;
 
-#[cfg(target_arch = "aarch64")]
 use crate::Vcpu;
 use crate::arch::{ConfigurationError, configure_system_for_boot, load_kernel};
 #[cfg(target_arch = "aarch64")]
@@ -47,7 +47,7 @@ use crate::persist::{self, MicrovmState, MicrovmStateError};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Persist;
-use crate::utils::{u32_mib_to_bytes, u64_to_usize};
+use crate::utils::{mib_to_bytes, u32_mib_to_bytes, u64_to_usize};
 use crate::vmm_config::boot_source::{
     DEFAULT_KERNEL_CMDLINE, append_root_device_cmdline, build_cmdline,
 };
@@ -55,8 +55,9 @@ use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::MachineConfigError;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vmm_config::pmem::PmemConfig;
+use crate::vmm_config::snapshot::{MemBackendConfig, MemBackendType};
 use crate::vstate::kvm::{Kvm, KvmError};
-use crate::vstate::memory::GuestRegionMmap;
+use crate::vstate::memory::{GuestRegionMmap, MemfdBacking};
 #[cfg(target_arch = "aarch64")]
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::VcpuError;
@@ -71,6 +72,10 @@ pub enum StartMicrovmError {
     AttachBlockDevice(io::Error),
     /// Cannot hand guest memory to the memory backend: {0}
     MemBackend(persist::GuestMemoryFromUffdError),
+    /// Cannot open the memory file: {0}
+    MemoryFile(io::Error),
+    /// The memory file is {0} bytes; the configured guest memory needs {1}
+    MemoryFileSize(u64, u64),
     /// Could not attach device: {0}
     AttachDevice(#[from] AttachDeviceError),
     /// System configuration error: {0}
@@ -139,6 +144,144 @@ impl std::convert::From<linux_loader::cmdline::Error> for StartMicrovmError {
     }
 }
 
+/// A KVM VM with guest memory registered and vCPUs created, and the UFFD set up when there is a
+/// memory backend: everything a snapshot load needs that does not depend on the snapshot. Built by
+/// `PUT /snapshot/prepare` ahead of the load ([`prepare_vm`]), or by the load itself
+/// ([`prepare_vm_from_snapshot`]).
+#[derive(Debug)]
+pub struct PreparedVm {
+    /// The VM, with every memory region registered.
+    pub vm: KvmVm,
+    /// Its vCPUs, created but not configured.
+    pub vcpus: Vec<Vcpu>,
+    /// The userfaultfd guest memory is registered with, if a backend serves it.
+    pub uffd: Option<Uffd>,
+    /// Whether the backend holds the memfd guest memory is backed by.
+    pub mem_backend_attached: bool,
+}
+
+/// `PUT /snapshot/prepare`: what a load would do before reading the snapshot, from the machine
+/// configuration instead. Guest memory (and the hotpluggable region, if configured) is set up as
+/// the load would, the VM and its vCPUs are created and memory is registered with KVM. With a
+/// `Uffd` or `SharedMemfd` backend, memory is also registered with a UFFD, which is handed to
+/// the backend (plus the memfd, for `SharedMemfd`). With `File`, the memory file is mapped
+/// privately: it must already exist at its full size, but since pages are read from it on
+/// fault and nothing faults before the load, its content may be written until then. The load
+/// then checks the snapshot against what was prepared and applies the snapshot's plug state.
+///
+/// Registering memory with KVM is the dominant cost of a load on hosts that allocate per-page
+/// slot metadata eagerly (about 0.5 ms per GiB on 5.10); this takes it out of the pause.
+pub fn prepare_vm(
+    vm_resources: &VmResources,
+    mem_backend: &MemBackendConfig,
+) -> Result<PreparedVm, StartMicrovmError> {
+    let cpu_template = vm_resources
+        .machine_config
+        .cpu_template
+        .get_cpu_template()?;
+    let kvm = Kvm::new(cpu_template.kvm_capabilities.clone())?;
+    let mut vm = KvmVm::new(kvm)?;
+    let vcpus = vm.create_vcpus(vm_resources.machine_config.vcpu_count)?;
+
+    if mem_backend.backend_type == MemBackendType::File {
+        // The layout a boot gives, and a snapshot of it records: the DRAM regions, then the
+        // hotpluggable one, consecutive in the file.
+        let machine_config = &vm_resources.machine_config;
+        let mut regions =
+            crate::arch::arch_memory_regions(mib_to_bytes(machine_config.mem_size_mib));
+        let hotplug = match &vm_resources.memory_hotplug {
+            Some(config) => {
+                let addr = allocate_virtio_mem_address(&vm, config.total_size_mib)?;
+                let size = u64_to_usize(u32_mib_to_bytes(config.total_size_mib));
+                regions.push((addr, size));
+                Some(u64_to_usize(u32_mib_to_bytes(config.slot_size_mib)))
+            }
+            None => None,
+        };
+        let total = regions.iter().map(|&(_, size)| size as u64).sum::<u64>();
+        let file = File::open(&mem_backend.backend_path).map_err(StartMicrovmError::MemoryFile)?;
+        let len = file
+            .metadata()
+            .map_err(StartMicrovmError::MemoryFile)?
+            .len();
+        if len < total {
+            return Err(StartMicrovmError::MemoryFileSize(len, total));
+        }
+        let mut guest_memory = crate::vstate::memory::snapshot_file(
+            file,
+            &regions,
+            machine_config.track_dirty_pages,
+            machine_config.huge_pages,
+        )
+        .map_err(StartMicrovmError::GuestMemory)?;
+        let hotplug_region = hotplug.map(|slot_size| (guest_memory.pop().unwrap(), slot_size));
+        vm.register_dram_memory_regions(guest_memory)?;
+        if let Some((region, slot_size)) = hotplug_region {
+            vm.register_hotpluggable_memory_region(region, slot_size)?;
+        }
+        return Ok(PreparedVm {
+            vm,
+            vcpus,
+            uffd: None,
+            mem_backend_attached: false,
+        });
+    }
+
+    let share_memfd = mem_backend.backend_type == MemBackendType::SharedMemfd;
+    let (guest_memory, mut memfd_backing) = vm_resources
+        .allocate_guest_memory_backed(share_memfd)
+        .map_err(StartMicrovmError::GuestMemory)?;
+    vm.register_dram_memory_regions(guest_memory)?;
+    allocate_hotpluggable_memory(&mut vm, vm_resources, memfd_backing.as_mut())?;
+
+    let regions: Vec<&GuestRegionMmap> = vm
+        .guest_memory()
+        .iter()
+        .map(|region| &region.inner)
+        .collect();
+    let uffd = persist::uffd_for_guest_memory(
+        &mem_backend.backend_path,
+        regions.iter().copied(),
+        vm_resources.machine_config.huge_pages,
+        memfd_backing.as_ref().map(|backing| &*backing.file),
+    )
+    .map_err(StartMicrovmError::MemBackend)?;
+
+    Ok(PreparedVm {
+        vm,
+        vcpus,
+        uffd: Some(uffd),
+        mem_backend_attached: share_memfd,
+    })
+}
+
+/// Allocates and registers the hotpluggable region if memory hotplug is configured, returning its
+/// guest address. Done as soon as the VM exists so that every consumer of the `GuestMemoryMmap`
+/// sees the region. The address comes from a fresh allocator, so it is the same at boot and at
+/// prepare, and the one a snapshot of that boot records.
+fn allocate_hotpluggable_memory(
+    vm: &mut KvmVm,
+    vm_resources: &VmResources,
+    memfd_backing: Option<&mut MemfdBacking>,
+) -> Result<Option<GuestAddress>, StartMicrovmError> {
+    let Some(memory_hotplug) = &vm_resources.memory_hotplug else {
+        return Ok(None);
+    };
+    let addr = allocate_virtio_mem_address(vm, memory_hotplug.total_size_mib)?;
+    let hotplug_memory_region = vm_resources
+        .allocate_memory_region(
+            addr,
+            u64_to_usize(u32_mib_to_bytes(memory_hotplug.total_size_mib)),
+            memfd_backing,
+        )
+        .map_err(StartMicrovmError::GuestMemory)?;
+    vm.register_hotpluggable_memory_region(
+        hotplug_memory_region,
+        u64_to_usize(u32_mib_to_bytes(memory_hotplug.slot_size_mib)),
+    )?;
+    Ok(Some(addr))
+}
+
 /// Builds and starts a microVM based on the current Firecracker VmResources configuration.
 ///
 /// The built microVM and all the created vCPUs start off in the paused state.
@@ -185,23 +328,8 @@ pub fn build_microvm_for_boot(
 
     // Allocate memory as soon as possible to make hotpluggable memory available to all consumers,
     // before they clone the GuestMemoryMmap object
-    let virtio_mem_addr = if let Some(memory_hotplug) = &vm_resources.memory_hotplug {
-        let addr = allocate_virtio_mem_address(&vm, memory_hotplug.total_size_mib)?;
-        let hotplug_memory_region = vm_resources
-            .allocate_memory_region(
-                addr,
-                u64_to_usize(u32_mib_to_bytes(memory_hotplug.total_size_mib)),
-                memfd_backing.as_mut(),
-            )
-            .map_err(StartMicrovmError::GuestMemory)?;
-        vm.register_hotpluggable_memory_region(
-            hotplug_memory_region,
-            u64_to_usize(u32_mib_to_bytes(memory_hotplug.slot_size_mib)),
-        )?;
-        Some(addr)
-    } else {
-        None
-    };
+    let virtio_mem_addr =
+        allocate_hotpluggable_memory(&mut vm, vm_resources, memfd_backing.as_mut())?;
 
     // Hand guest memory to the memory backend, if one is configured. All regions are mapped and
     // registered with KVM at this point and no vCPU is running yet. The handshake is the UFFD
@@ -482,18 +610,37 @@ fn synchronize_tsc_offsets(vcpus: &[crate::Vcpu]) {
     }
 }
 
-/// Builds and starts a microVM based on the provided MicrovmState.
+/// The [`PreparedVm`] of a load without a prior `snapshot/prepare`: the VM and vCPUs are created
+/// now, and `guest_memory`, allocated from the snapshot's layout, is registered with the plug
+/// state the snapshot recorded.
+pub fn prepare_vm_from_snapshot(
+    microvm_state: &MicrovmState,
+    guest_memory: Vec<GuestRegionMmap>,
+    uffd: Option<Uffd>,
+    mem_backend_attached: bool,
+    vcpu_count: u8,
+) -> Result<PreparedVm, StartMicrovmError> {
+    let kvm = Kvm::new(microvm_state.kvm_state.kvm_cap_modifiers.clone())?;
+    let mut vm = KvmVm::new(kvm)?;
+    let vcpus = vm.create_vcpus(vcpu_count)?;
+    vm.restore_memory_regions(guest_memory, &microvm_state.vm_state.memory)?;
+    Ok(PreparedVm {
+        vm,
+        vcpus,
+        uffd,
+        mem_backend_attached,
+    })
+}
+
+/// Builds and starts a microVM based on the provided MicrovmState, on a [`PreparedVm`].
 ///
 /// An `Arc` reference of the built `Vmm` is also plugged in the `EventManager`, while another
 /// is returned.
-#[allow(clippy::too_many_arguments)]
 pub fn build_microvm_from_snapshot(
     instance_info: &InstanceInfo,
     event_manager: &mut EventManager,
     microvm_state: MicrovmState,
-    guest_memory: Vec<GuestRegionMmap>,
-    uffd: Option<Uffd>,
-    mem_backend_attached: bool,
+    prepared: PreparedVm,
     seccomp_filters: &BpfThreadMap,
     vm_resources: &mut VmResources,
     clock_realtime: bool,
@@ -501,18 +648,12 @@ pub fn build_microvm_from_snapshot(
     // Build Vmm.
     debug!("event_start: build microvm from snapshot");
 
-    let kvm = Kvm::new(microvm_state.kvm_state.kvm_cap_modifiers.clone())
-        .map_err(StartMicrovmError::Kvm)?;
-    // Set up KVM VM and register memory regions.
-    // Build custom CPU config if a custom template is provided.
-    let mut vm = KvmVm::new(kvm).map_err(StartMicrovmError::KvmVm)?;
-
-    let mut vcpus = vm
-        .create_vcpus(vm_resources.machine_config.vcpu_count)
-        .map_err(StartMicrovmError::KvmVm)?;
-
-    vm.restore_memory_regions(guest_memory, &microvm_state.vm_state.memory)
-        .map_err(StartMicrovmError::KvmVm)?;
+    let PreparedVm {
+        mut vm,
+        mut vcpus,
+        uffd,
+        mem_backend_attached,
+    } = prepared;
 
     #[cfg(target_arch = "x86_64")]
     {

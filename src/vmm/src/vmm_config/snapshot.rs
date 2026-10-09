@@ -120,8 +120,9 @@ impl SnapshotLoadHugePageConfig {
 pub struct LoadSnapshotParams {
     /// Path to the file that contains the microVM state to be loaded.
     pub snapshot_path: PathBuf,
-    /// Specifies guest memory backend configuration.
-    pub mem_backend: MemBackendConfig,
+    /// Specifies guest memory backend configuration. `None` when the guest memory and the KVM
+    /// VM were set up ahead of time by `PUT /snapshot/prepare`.
+    pub mem_backend: Option<MemBackendConfig>,
     /// Whether KVM dirty page tracking should be enabled, to space optimization
     /// of differential snapshots.
     pub track_dirty_pages: bool,
@@ -186,6 +187,15 @@ pub struct MemBackendConfig {
     pub backend_path: PathBuf,
     /// Specifies the guest memory backend type.
     pub backend_type: MemBackendType,
+}
+
+/// Body of `PUT /snapshot/prepare`: sets up guest memory and the KVM VM for a later
+/// `PUT /snapshot/load`, from the machine configuration already in place.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrepareLoadParams {
+    /// The memory backend (`Uffd` or `SharedMemfd`) guest memory is handed to.
+    pub mem_backend: MemBackendConfig,
 }
 
 /// The microVM state options.

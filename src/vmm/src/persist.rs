@@ -15,11 +15,12 @@ use std::sync::{Arc, Mutex};
 use crate::utils::Version;
 use serde::{Deserialize, Serialize};
 use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
+use vm_memory::GuestMemoryBackend;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::vcpu::get_manufacturer_id_from_host;
-use crate::builder::{self, BuildMicrovmFromSnapshotError};
+use crate::builder::{self, BuildMicrovmFromSnapshotError, PreparedVm, StartMicrovmError};
 use crate::cpu_config::templates::StaticCpuTemplate;
 #[cfg(target_arch = "x86_64")]
 use crate::cpu_config::x86_64::cpuid::CpuidTrait;
@@ -36,13 +37,17 @@ use crate::snapshot::Snapshot;
 use crate::utils::u64_to_usize;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
-use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
+use crate::vmm_config::machine_config::{
+    HugePageConfig, MachineConfig, MachineConfigError, MachineConfigUpdate,
+};
 use crate::vmm_config::snapshot::{
-    CreateSnapshotParams, LoadSnapshotParams, MemBackendType, SnapshotMemoryLayout, SnapshotType,
+    CreateSnapshotParams, LoadSnapshotParams, MemBackendType, SnapshotLoadHugePageConfig,
+    SnapshotMemoryLayout, SnapshotType,
 };
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
-    self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemfdBacking, MemoryError,
+    self, GuestMemoryExtension, GuestMemoryRegionState, GuestMemoryState, GuestRegionMmap,
+    GuestRegionType, MemfdBacking, MemoryError,
 };
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
@@ -400,6 +405,27 @@ pub enum RestoreFromSnapshotError {
     GuestMemory(#[from] RestoreFromSnapshotGuestMemoryError),
     /// Failed to build microVM from snapshot: {0}
     Build(#[from] BuildMicrovmFromSnapshotError),
+    /// Prepared VM: {0}
+    Prepared(#[from] PreparedVmError),
+}
+
+/// Errors of a load against (or without) a VM set up by `PUT /snapshot/prepare`.
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum PreparedVmError {
+    /// mem_backend is required without a prior PUT /snapshot/prepare
+    NoBackend,
+    /// mem_backend, track_dirty_pages and huge_pages are fixed by PUT /snapshot/prepare
+    ParamsFixed,
+    /// the snapshot has {0} vCPUs, the prepared VM {1}
+    VcpuCount(usize, usize),
+    /// the snapshot has {0} MiB of memory, the prepared VM {1} MiB
+    MemSize(u64, usize),
+    /// the snapshot uses {0:?} pages, the prepared VM {1:?}
+    HugePages(HugePageConfig, HugePageConfig),
+    /// the snapshot's KVM capability modifiers differ from the prepared VM's
+    KvmCapabilities,
+    /// the snapshot's memory layout differs from the prepared VM's
+    MemoryLayout,
 }
 /// Sub-Error type for [`restore_from_snapshot`] to contain either [`GuestMemoryFromFileError`] or
 /// [`GuestMemoryFromUffdError`] within [`RestoreFromSnapshotError`].
@@ -412,13 +438,21 @@ pub enum RestoreFromSnapshotGuestMemoryError {
 }
 
 /// Loads a Microvm snapshot producing a 'paused' Microvm.
+///
+/// `prepared` is the VM `PUT /snapshot/prepare` set up, if any: the snapshot is then checked
+/// against it instead of allocating memory and creating a VM here. It is taken only once the
+/// checks pass, so a [`RestoreFromSnapshotError::Prepared`] leaves the process as it was.
 pub fn restore_from_snapshot(
     instance_info: &InstanceInfo,
     event_manager: &mut EventManager,
     seccomp_filters: &BpfThreadMap,
     params: &LoadSnapshotParams,
     vm_resources: &mut VmResources,
+    prepared: &mut Option<PreparedVm>,
 ) -> Result<Arc<Mutex<Vmm>>, RestoreFromSnapshotError> {
+    if prepared.is_none() && params.mem_backend.is_none() {
+        return Err(PreparedVmError::NoBackend.into());
+    }
     let mut microvm_state = snapshot_state_from_file(&params.snapshot_path)?;
     for entry in &params.network_overrides {
         // Only the active transport carries virtio device state, so we look at whichever
@@ -462,14 +496,33 @@ pub fn restore_from_snapshot(
             .clone_from(&vsock_override.uds_path);
     }
 
-    let track_dirty_pages = params.track_dirty_pages;
-
     let vcpu_count = microvm_state
         .vcpu_states
         .len()
         .try_into()
         .map_err(|_| MachineConfigError::InvalidVcpuCount)
         .map_err(BuildMicrovmFromSnapshotError::VmUpdateConfig)?;
+
+    // With a prepared VM, memory size, page size and dirty tracking were fixed by the machine
+    // configuration it was built from; the snapshot has to agree with it.
+    let (track_dirty_pages, huge_pages) = match prepared.as_ref() {
+        Some(prepared) => {
+            check_prepared_vm(
+                prepared,
+                &microvm_state,
+                params,
+                &vm_resources.machine_config,
+            )?;
+            (
+                vm_resources.machine_config.track_dirty_pages,
+                vm_resources.machine_config.huge_pages,
+            )
+        }
+        None => (
+            params.track_dirty_pages,
+            params.huge_pages.resolve(microvm_state.vm_info.huge_pages),
+        ),
+    };
 
     // Due to questionable past API design decisions whether the restored VM
     // uses PCI is decided by the snapshot and not by the --enable-pci flag of
@@ -494,7 +547,7 @@ pub fn restore_from_snapshot(
             smt: Some(microvm_state.vm_info.smt),
             cpu_template: Some(microvm_state.vm_info.cpu_template),
             track_dirty_pages: Some(track_dirty_pages),
-            huge_pages: Some(params.huge_pages.resolve(microvm_state.vm_info.huge_pages)),
+            huge_pages: Some(huge_pages),
             mem_backend: None,
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
@@ -504,50 +557,130 @@ pub fn restore_from_snapshot(
     // Some sanity checks before building the microvm.
     snapshot_state_sanity_check(&microvm_state)?;
 
-    let mem_backend_path = &params.mem_backend.backend_path;
-    let mem_state = &microvm_state.vm_state.memory;
-
-    let (guest_memory, uffd) = match params.mem_backend.backend_type {
-        MemBackendType::File => {
-            if vm_resources.machine_config.huge_pages.is_hugetlbfs() {
-                return Err(RestoreFromSnapshotGuestMemoryError::File(
-                    GuestMemoryFromFileError::HugetlbfsSnapshot,
-                )
-                .into());
-            }
-            (
-                guest_memory_from_file(
-                    mem_backend_path,
+    let prepared = match prepared.take() {
+        Some(prepared) => {
+            apply_plug_state(&prepared, &microvm_state.vm_state.memory)
+                .map_err(StartMicrovmError::KvmVm)
+                .map_err(BuildMicrovmFromSnapshotError::CreateMicrovmAndVcpus)?;
+            prepared
+        }
+        None => {
+            let mem_backend = params.mem_backend.as_ref().expect("checked above");
+            let mem_state = &microvm_state.vm_state.memory;
+            let (guest_memory, uffd) = match mem_backend.backend_type {
+                MemBackendType::File => {
+                    if huge_pages.is_hugetlbfs() {
+                        return Err(RestoreFromSnapshotGuestMemoryError::File(
+                            GuestMemoryFromFileError::HugetlbfsSnapshot,
+                        )
+                        .into());
+                    }
+                    (
+                        guest_memory_from_file(
+                            &mem_backend.backend_path,
+                            mem_state,
+                            track_dirty_pages,
+                            huge_pages,
+                        )
+                        .map_err(RestoreFromSnapshotGuestMemoryError::File)?,
+                        None,
+                    )
+                }
+                MemBackendType::Uffd | MemBackendType::SharedMemfd => guest_memory_from_uffd(
+                    &mem_backend.backend_path,
                     mem_state,
                     track_dirty_pages,
-                    vm_resources.machine_config.huge_pages,
+                    huge_pages,
+                    mem_backend.backend_type == MemBackendType::SharedMemfd,
                 )
-                .map_err(RestoreFromSnapshotGuestMemoryError::File)?,
-                None,
+                .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
+            };
+            builder::prepare_vm_from_snapshot(
+                &microvm_state,
+                guest_memory,
+                uffd,
+                mem_backend.backend_type == MemBackendType::SharedMemfd,
+                vcpu_count,
             )
+            .map_err(BuildMicrovmFromSnapshotError::CreateMicrovmAndVcpus)?
         }
-        MemBackendType::Uffd | MemBackendType::SharedMemfd => guest_memory_from_uffd(
-            mem_backend_path,
-            mem_state,
-            track_dirty_pages,
-            vm_resources.machine_config.huge_pages,
-            params.mem_backend.backend_type == MemBackendType::SharedMemfd,
-        )
-        .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
     };
-    let mem_backend_attached = params.mem_backend.backend_type == MemBackendType::SharedMemfd;
     builder::build_microvm_from_snapshot(
         instance_info,
         event_manager,
         microvm_state,
-        guest_memory,
-        uffd,
-        mem_backend_attached,
+        prepared,
         seccomp_filters,
         vm_resources,
         params.clock_realtime,
     )
     .map_err(RestoreFromSnapshotError::Build)
+}
+
+/// Checks that `microvm_state` describes the microVM `prepared` was set up for, and that `params`
+/// does not try to change what the preparation fixed.
+fn check_prepared_vm(
+    prepared: &PreparedVm,
+    microvm_state: &MicrovmState,
+    params: &LoadSnapshotParams,
+    machine_config: &MachineConfig,
+) -> Result<(), PreparedVmError> {
+    if params.mem_backend.is_some()
+        || params.track_dirty_pages
+        || params.huge_pages != SnapshotLoadHugePageConfig::Snapshot
+    {
+        return Err(PreparedVmError::ParamsFixed);
+    }
+    let vcpus = microvm_state.vcpu_states.len();
+    if vcpus != prepared.vcpus.len() {
+        return Err(PreparedVmError::VcpuCount(vcpus, prepared.vcpus.len()));
+    }
+    let mem_size_mib = microvm_state.vm_info.mem_size_mib;
+    if mem_size_mib != machine_config.mem_size_mib as u64 {
+        return Err(PreparedVmError::MemSize(
+            mem_size_mib,
+            machine_config.mem_size_mib,
+        ));
+    }
+    if microvm_state.vm_info.huge_pages != machine_config.huge_pages {
+        return Err(PreparedVmError::HugePages(
+            microvm_state.vm_info.huge_pages,
+            machine_config.huge_pages,
+        ));
+    }
+    if microvm_state.kvm_state.kvm_cap_modifiers != prepared.vm.kvm().kvm_cap_modifiers {
+        return Err(PreparedVmError::KvmCapabilities);
+    }
+    // Same regions, same slots; the plug state is the snapshot's to set.
+    let layout = prepared.vm.guest_memory().describe();
+    let same = |a: &GuestMemoryRegionState, b: &GuestMemoryRegionState| {
+        a.base_address == b.base_address
+            && a.size == b.size
+            && a.region_type == b.region_type
+            && a.plugged.len() == b.plugged.len()
+    };
+    let regions = &microvm_state.vm_state.memory.regions;
+    if regions.len() != layout.regions.len()
+        || !regions.iter().zip(&layout.regions).all(|(a, b)| same(a, b))
+    {
+        return Err(PreparedVmError::MemoryLayout);
+    }
+    Ok(())
+}
+
+/// Plugs and unplugs the slots of the prepared VM's hotpluggable regions as the snapshot has them
+/// (DRAM has a single slot, always plugged, which `snapshot_state_sanity_check` verified).
+fn apply_plug_state(prepared: &PreparedVm, mem_state: &GuestMemoryState) -> Result<(), VmError> {
+    for (region, state) in prepared.vm.guest_memory().iter().zip(&mem_state.regions) {
+        if region.region_type != GuestRegionType::Hotpluggable {
+            continue;
+        }
+        for (index, &plugged) in state.plugged.iter().enumerate() {
+            let slot = region.slot_from + u32::try_from(index).expect("slot count fits u32");
+            region.update_slot(&prepared.vm, &region.mem_slot(slot), plugged)?;
+        }
+    }
+    Ok(())
 }
 
 /// Error type for [`snapshot_state_from_file`]
@@ -637,7 +770,24 @@ fn guest_memory_from_uffd(
             None,
         )
     };
-    let backend_mappings = uffd_mappings(guest_memory.iter(), huge_pages);
+    let uffd = uffd_for_guest_memory(
+        mem_uds_path,
+        guest_memory.iter(),
+        huge_pages,
+        memfd.as_deref(),
+    )?;
+    Ok((guest_memory, Some(uffd)))
+}
+
+/// Creates the userfaultfd, registers every region of guest memory with it and hands it to the
+/// handler at `mem_uds_path`, together with `memfd` when guest memory is backed by one.
+pub fn uffd_for_guest_memory<'a>(
+    mem_uds_path: &Path,
+    regions: impl Iterator<Item = &'a GuestRegionMmap> + Clone,
+    huge_pages: HugePageConfig,
+    memfd: Option<&File>,
+) -> Result<Uffd, GuestMemoryFromUffdError> {
+    let backend_mappings = uffd_mappings(regions.clone(), huge_pages);
 
     let mut uffd_builder = UffdBuilder::new();
 
@@ -654,7 +804,7 @@ fn guest_memory_from_uffd(
         .create()
         .map_err(GuestMemoryFromUffdError::Create)?;
 
-    for mem_region in guest_memory.iter() {
+    for mem_region in regions {
         uffd.register(mem_region.as_ptr().cast(), mem_region.size() as _)
             .map_err(GuestMemoryFromUffdError::Register)?;
     }
@@ -662,12 +812,12 @@ fn guest_memory_from_uffd(
     // The uffd always comes first, so that a handler written for the plain UFFD protocol (which
     // reads a single fd) keeps working; the memfd, when shared, comes last.
     let mut fds = vec![uffd.as_raw_fd()];
-    if let Some(memfd) = &memfd {
+    if let Some(memfd) = memfd {
         fds.push(memfd.as_raw_fd());
     }
     send_uffd_handshake(mem_uds_path, &backend_mappings, &fds)?;
 
-    Ok((guest_memory, Some(uffd)))
+    Ok(uffd)
 }
 
 /// Builds the handshake message for a UFFD handler / memory backend: one entry per region, in

@@ -8,23 +8,25 @@
 `SharedMemfd` is an advanced feature for users looking for a custom or
 high-performance snapshot solution.
 
-Some optimizations unlocked by `SharedMemfd` are:
+Some optimizations unlocked by `SharedMemfd` are, in order of gain:
 
-- VM post-copy: a VM can be resumed while the snapshot is being downloaded. The
-  memory can be faulted in on-demand or pre-fetched according to the userfaultfd
-  protocol
-- VM pre-copy: the guest memory can be copied in batches while the VM is still
-  running
-- Resuming or creating a snapshot can be implemented without using the disk as
-  an intermediary. All the guest memory is either copied via userfaultfd, or
-  read/written on the shared `memfd`
+1. VM post-copy: a VM can be resumed while the snapshot is being downloaded. The
+   memory can be faulted in on-demand or pre-fetched according to the
+   userfaultfd protocol
+1. VM pre-copy: the guest memory can be copied in batches while the VM is still
+   running
+1. Resuming or creating a snapshot can be implemented without using the disk as
+   an intermediary. All the guest memory is either copied via userfaultfd, or
+   read/written on the shared `memfd`
+1. For a live migration, `/snapshot/prepare` allows pre-initializing the
+   destination VM while the source VM is still running
 
-With these optimizations, the guest pause for a snapshot+restore drops by two
-orders of magnitude.\
+With these optimizations, the guest pause for a snapshot+restore drops by up to
+three orders of magnitude.\
 For illustrative purposes, on hugetlbfs, guest downtime goes from ~450 ms per
-GiB of resident memory to ~13 ms + 0.6 ms/GiB of guest memory (3.5 s → 18 ms
-for an 8 GiB guest): no memory is copied during the pause, which now only waits
-for the state save, the final dirty-page bitmap and Firecracker's restore.
+GiB of resident memory to ~10 ms regardless of VM size: no memory is copied
+during the pause, and all expensive operations are done either before a pause or
+after a resume.
 
 ## What it is
 
@@ -46,7 +48,7 @@ backend produces the memory part of snapshots. Nothing about snapshots adds to
 the fault-handling obligations: Firecracker tracks what it discards and reports
 it as zero pages, so the backend needs no page-level bookkeeping of its own.
 
-See read carefully the "Consistency" and "Limitations" sections below. 
+Read carefully the "Consistency" and "Limitations" sections below.
 
 ## The handshake
 
@@ -154,10 +156,10 @@ bitmaps, which pages of the memfd the backend should copy and the pages it
 should discard. There is no other protocol between Firecracker and the backend.
 
 Sharing memory this way has a cost: guest memory is a `MAP_SHARED` mapping; page
-faults on it are somewhat slower than on anonymous memory.
-Hugetlbfs mitigates the performance loss very effectively.
-Transparent huge pages depend on the host's `shmem_enabled` setting, and only
-partially mitigate the performance loss.
+faults on it are somewhat slower than on anonymous memory. Hugetlbfs mitigates
+the performance loss very effectively. Transparent huge pages depend on the
+host's `shmem_enabled` setting, and only partially mitigate the performance
+loss.
 
 ## API
 
@@ -200,6 +202,45 @@ backend serves page faults exactly as a UFFD handler does.
 
 The choice is per instance and is **not** recorded in the snapshot: a snapshot
 made with a memory backend restores fine with `File` or `Uffd`, and vice versa.
+
+### Setting up the microVM ahead of the restore: `PUT /snapshot/prepare`
+
+```json
+{
+  "mem_backend": {
+    "backend_type": "SharedMemfd",
+    "backend_path": "/run/backend.sock"
+  }
+}
+```
+
+Most of what `PUT /snapshot/load` does depends only on the microVM's shape, not
+on the snapshot: mapping guest memory, registering it with KVM, creating the VM
+and its vCPUs, and setting up a backend if applicable. Since `/snapshot/load` is
+in the hot path, `PUT /snapshot/prepare` lets you do that part ahead of time,
+to prepare a destination VM while the source VM is still running. The resume
+workflow is then something like:
+
+```
+PUT /machine-config   { ... }
+PUT /memory-hotplug   (if the snapshot has a hotpluggable region)
+PUT /snapshot/prepare {"mem_backend": {"backend_type": "SharedMemfd",
+                                       "backend_path": "/run/backend.sock"}}
+
+...
+
+PUT /snapshot/load    {"snapshot_path": "/path/vmstate", "resume_vm": true}
+```
+
+During `/snapshot/prepare`, the backend receives the handshake and can populate
+the memfd before the load.
+
+The load then checks the snapshot against the prepared microVM, vCPU count,
+memory size, page size, memory layout and KVM capability modifiers (from
+`cpu_template`), and rejects a mismatch without touching anything;
+`mem_backend`, `track_dirty_pages` and `huge_pages` are fixed by the preparation
+and must be left out of the load request. The machine configuration cannot
+change once a microVM is prepared, and a prepared microVM cannot be booted.
 
 ### `PUT /snapshot/create`
 
@@ -306,8 +347,8 @@ than 2 MiB, a chunk with a page in either set can be read whole from the memfd.
 This holds for chunks with pages in `pages_to_discard` too, but such a chunk
 must not simply be zero-filled: a freed huge page the guest partially rewrote
 has pages in `pages_to_copy` and pages in `pages_to_discard` in the same
-response. For all other configurations, the changes need to be applied on top
-of the previous version of the chunk.
+response. For all other configurations, the changes need to be applied on top of
+the previous version of the chunk.
 
 Sizes: a set costs at most 43 KiB per GiB of guest memory, base64 included,
 whatever the dirty pattern, so a response is at most 86 KiB per GiB. That is the
@@ -338,36 +379,77 @@ simple rules. These rules cannot be enforced by Firecracker.
   responses received before it: responses from before must not be applied to it
   or to anything derived from it
 - After the final `/snapshot/create`, the microVM must not be resumed until the
-  backend has copied every page in `pages_to_copy` out of the memfd.
+  backend has copied every page in `pages_to_copy` out of the memfd
+
+### Preparing the destination
+
+To resume from a snapshot as fast as possible, it's optionally possible to start
+your backend and prepare Firecracker while the source VM is running using
+`PUT /machine-config`, `PUT /memory-hotplug`, `PUT /cpu-config` and
+`PUT /snapshot/prepare`. The backend can start pre-populating guest memory into
+the memfd at this point.
+
+These APIs do most of the initialization work, and leave Firecracker in a state
+where `/snapshot/load` can resume a VM in a few milliseconds.
+
+### Workflows
 
 To produce a snapshot, with no pre-copy, the workflow is as follows:
 
+1. (optional) prepare the destination VM
 1. Pause the microVM
 1. Call `/snapshot/create` with `snapshot_type: Backend`
 1. Copy `pages_to_copy` into a file, zero `pages_to_discard`
-1. The microVM can be resumed here
+1. The microVM can be resumed here, or the file restored on the destination VM
 
 A backend that wants to shorten the pause can add pre-copy around that final
-call:
+call, so that only the pages that changed since the last round are copied while
+the guest is paused:
 
+1. (optional) prepare the destination VM
 1. Call `/snapshot/dirty-pages`
 1. Copy `pages_to_copy` into a file, zero `pages_to_discard`
-1. Repeat from step 1 until the changed set is small enough, or after a timeout
+1. Repeat from step 2 until the changed set is small enough, or after a timeout
    or iteration limit
 1. Pause the microVM
 1. Call `/snapshot/create` with `snapshot_type: Backend`
 1. Final copy of `pages_to_copy`, final zeroing of `pages_to_discard`
-1. The microVM can be resumed here
+1. The microVM can be resumed here, or the file restored on the destination VM
 
 Note: the pre-copy loop only makes progress with dirty tracking enabled. Without
 it, with just `mincore`, the changed set does not shrink between calls.
 
-## Example handler
+For a VM migration, it's also possible to shorten the pause time by deferring
+the final copy of `pages_to_copy` using a post-copy approach. The pause then no
+longer depends on how much the guest writes, or the size of the VM:
 
-The example handlers in
-[`src/firecracker/examples/uffd/`](../../src/firecracker/examples/uffd/) work as
-memory backends. They require minimal external orchestration to call Firecracker
-APIs, and tell the backend which pages to copy.
+1. Prepare the destination VM
+1. Run the pre-copy loop as above, copying each response into the target
+1. Pause the microVM
+1. Call `/snapshot/create` with `snapshot_type: Backend` on the source. The
+   response is the residual changes since the last round.
+1. Hand the `pages_to_copy` and `pages_to_discard` bitmaps to the destination's
+   backend, together with a way to reach the source's backend, which keeps the
+   source memfd and serves pages out of it on request.
+1. Call `PUT /snapshot/load` with the source VMM state file on the destination,
+   resume it. The guest now runs.\
+   A fault on a page of the residual's `pages_to_copy` is served by fetching it
+   from the source backend; a page of its `pages_to_discard` is served as zero
+   without a fetch; every other page comes from the target as before. In the
+   background, while no fault is waiting, the backend pulls the remaining
+   residual pages and writes them into the target, so that the target ends up a
+   complete snapshot of the final state
+1. Once nothing is pending, release the source: its microVM and backend can be
+   killed. Until then the source microVM must stay paused and its memfd intact
+
+## Example backend
+
+The example backends in
+[`src/firecracker/examples/uffd/`](../../src/firecracker/examples/uffd/)
+implement examples of both `Uffd` and `SharedMemfd` backends.
+
+They require a minimal external orchestration to call Firecracker APIs, and tell
+the backend which pages to copy.
 
 ## Limitations
 

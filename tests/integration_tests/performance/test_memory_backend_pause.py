@@ -110,14 +110,16 @@ def boot(
     return vm
 
 
-def prepare_destination(microvm_factory, src, lazy):
+def prepare_destination(microvm_factory, src, lazy, prepare=False):
     """Everything a restore needs that does not need the guest paused.
 
     The memory file is created at its final size in `src`'s chroot (Firecracker
     and the backend both write into an existing file of the right size without
     truncating it) and hardlinked into the destination chroot together with an
     empty `vmstate` (Firecracker's `O_TRUNC` write keeps the inode). The
-    destination Firecracker is spawned; for a lazy restore the handler too.
+    destination Firecracker is spawned; for a lazy restore the handler too. With
+    `prepare`, `PUT /snapshot/prepare` also sets up guest memory and the KVM VM
+    from `src`'s machine configuration, so that the load has less to do.
     """
     root = Path(src.chroot())
     mem = root / MEM
@@ -164,11 +166,31 @@ def prepare_destination(microvm_factory, src, lazy):
     if jailed.meta["rootfs_file"]:
         dest.rootfs_file = Path(jailed.meta["rootfs_file"])
         dest.distro = GuestDistro.from_rootfs(dest.rootfs_file)
+    dest.prepared = prepare
+    if prepare:
+        assert lazy, "only UFFD-served memory can be prepared"
+        dest.api.machine_config.put(
+            vcpu_count=src.vcpus_count,
+            mem_size_mib=src.mem_size_bytes // 2**20,
+            huge_pages=src.huge_pages,
+            track_dirty_pages=False,
+        )
+        dest.api.snapshot_prepare.put(
+            mem_backend={
+                "backend_type": "Uffd",
+                "backend_path": str(dest.uffd_handler.socket_path),
+            }
+        )
     return dest, jailed
 
 
 def load(dest, jailed, lazy):
     """`snapshot/load` on the prepared destination, paused."""
+    if dest.prepared:
+        dest.api.snapshot_load.put(
+            snapshot_path=f"/{jailed.vmstate.name}", resume_vm=False
+        )
+        return
     if lazy:
         mem_backend = {
             "backend_type": "Uffd",
@@ -197,7 +219,10 @@ def file_diff(vm, dest, jailed, lazy):
     _, pause_s = timed(vm.pause)
     _, create_s = timed(
         lambda: vm.api.snapshot_create.put(
-            mem_file_path=MEM, snapshot_path=VMSTATE, snapshot_type="Diff"
+            mem_file_path=MEM,
+            snapshot_path=VMSTATE,
+            snapshot_type="Diff",
+            sync_snapshot_files=False,
         )
     )
     # A Diff file is sparse: only the written pages are allocated.
@@ -219,7 +244,7 @@ def backend_final_layout(vm):
     _, pause_s = timed(vm.pause)
     response, create_s = timed(
         lambda: vm.api.snapshot_create.put(
-            snapshot_path=VMSTATE, snapshot_type="Backend"
+            snapshot_path=VMSTATE, snapshot_type="Backend", sync_snapshot_files=False
         )
     )
     memory = response.json()["memory"]
@@ -289,12 +314,19 @@ SCENARIOS = [
     ("memfd, no pre-copy (mincore, no tracking) → lazy", False, "lazy"),
     ("memfd, pre-copy → lazy, residual copied in pause", True, "precopy-lazy"),
     ("memfd, pre-copy → post-copy, residual fetched after", True, "precopy-postcopy"),
+    (
+        "memfd, pre-copy → post-copy, destination prepared",
+        True,
+        "precopy-postcopy-prepared",
+    ),
 ]
 
 
 def run_scenario(microvm_factory, guest_kernel, rootfs, scenario, huge_pages, mem_mib):
     """One measurement of one scenario."""
     _, track_dirty_pages, method = scenario
+    prepare = method.endswith("-prepared")
+    method = method.removesuffix("-prepared")
     backend = method != "diff"
     # Huge page snapshots can only be restored through UFFD.
     file_lazy = huge_pages != HugePagesConfig.NONE
@@ -313,7 +345,9 @@ def run_scenario(microvm_factory, guest_kernel, rootfs, scenario, huge_pages, me
         # destination can only be prepared once it exists at full size.
         memory, round_s = timed(lambda: vm.dirty_pages(copy_to=MEM))
         rounds.append((authoritative_bytes(memory), round_s))
-        dest, jailed = prepare_destination(microvm_factory, vm, lazy=True)
+        dest, jailed = prepare_destination(
+            microvm_factory, vm, lazy=True, prepare=prepare
+        )
         for _ in range(PRECOPY_ROUNDS - 1):
             memory, round_s = timed(lambda: vm.dirty_pages(copy_to=MEM))
             rounds.append((authoritative_bytes(memory), round_s))

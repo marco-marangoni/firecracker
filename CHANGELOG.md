@@ -41,6 +41,18 @@ and this project adheres to
   virtio-mem are reported in `pages_to_discard` rather than copied as zeros, for
   which Firecracker enables `KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2` where the host
   has it (Linux 5.2+). See [memory backend](docs/snapshotting/shared-memfd.md).
+- Added `PUT /snapshot/prepare`, which does the snapshot-independent part of a
+  `PUT /snapshot/load` ahead of it, from the machine configuration in place:
+  guest memory is set up (mapped from the memory file for `File`, which must
+  then exist at its full size) and registered with KVM, for `Uffd` and
+  `SharedMemfd` it is registered with a userfaultfd and the handshake with the
+  backend given in `mem_backend` is performed, and the VM and vCPUs are created.
+  The following `PUT /snapshot/load` names only the snapshot (`mem_backend`,
+  `track_dirty_pages` and `huge_pages` are fixed by the preparation), checks it
+  against the prepared microVM and rejects a mismatch with `400`. The machine
+  configuration cannot change once a microVM is prepared. A `PUT /snapshot/load`
+  without `mem_backend` or `mem_file_path` and without a prior prepare is now
+  rejected by the VMM rather than at parsing.
 
 ### Changed
 

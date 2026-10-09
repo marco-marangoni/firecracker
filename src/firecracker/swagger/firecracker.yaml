@@ -830,7 +830,9 @@ paths:
       description:
         Loads the microVM state from a snapshot.
         Only accepted on a fresh Firecracker process (before configuring
-        any resource other than the Logger and Metrics).
+        any resource other than the Logger and Metrics), or after
+        `PUT /snapshot/prepare`, in which case `mem_backend`,
+        `track_dirty_pages` and `huge_pages` must be left out.
       operationId: loadSnapshot
       parameters:
         - name: body
@@ -844,6 +846,43 @@ paths:
           description: Snapshot loaded
         400:
           description: Snapshot cannot be loaded due to bad input
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
+  /snapshot/prepare:
+    put:
+      summary: Sets up guest memory and the KVM VM for a coming snapshot load. Pre-boot only.
+      description:
+        Does the part of `PUT /snapshot/load` that does not depend on the
+        snapshot, ahead of it, from the machine configuration (`vcpu_count`,
+        `mem_size_mib`, `huge_pages`, `track_dirty_pages`, `cpu_template`)
+        and the memory hotplug configuration in place. Guest memory is set up
+        and registered with KVM, and the vCPUs are created. With a `Uffd` or
+        `SharedMemfd` backend, memory is registered with a userfaultfd, which
+        is handed to the backend (with the memfd, for `SharedMemfd`). With
+        `File`, the memory file is mapped; it must already exist at its full
+        size, and its content may be written until the load. The following
+        `PUT /snapshot/load` checks that the snapshot matches the prepared
+        microVM and applies its state. Only accepted once, before any
+        boot-specific resource is configured; the machine configuration cannot
+        change afterwards.
+      operationId: prepareSnapshotLoad
+      parameters:
+        - name: body
+          in: body
+          description: The memory backend to hand guest memory to.
+          required: true
+          schema:
+            $ref: "#/definitions/SnapshotPrepareParams"
+      responses:
+        204:
+          description: MicroVM prepared
+        400:
+          description: The microVM cannot be prepared due to bad input
           schema:
             $ref: "#/definitions/Error"
         default:
@@ -1857,7 +1896,9 @@ definitions:
     type: object
     description:
       Defines the configuration used for handling snapshot resume. Exactly one of
-      the two `mem_*` fields must be present in the body of the request.
+      the two `mem_*` fields must be present in the body of the request, unless
+      the microVM was prepared with `PUT /snapshot/prepare`, which fixed the
+      memory backend, `track_dirty_pages` and `huge_pages`.
     required:
       - snapshot_path
     properties:
@@ -1880,7 +1921,8 @@ definitions:
         description:
           Configuration for the backend that handles memory load. If this field
           is specified, `mem_file_path` is forbidden. Either `mem_backend` or
-          `mem_file_path` must be present at a time.
+          `mem_file_path` must be present at a time, except after
+          `PUT /snapshot/prepare`.
       snapshot_path:
         type: string
         description: Path to the file that contains the microVM state to be loaded.
@@ -1923,6 +1965,19 @@ definitions:
           memory backend. With UFFD, the effectiveness of transparent huge pages
           may be limited.
 
+  SnapshotPrepareParams:
+    type: object
+    description:
+      Defines what `PUT /snapshot/prepare` hands guest memory to. Everything
+      else comes from the machine configuration.
+    required:
+      - mem_backend
+    properties:
+      mem_backend:
+        $ref: "#/definitions/MemoryBackend"
+        description:
+          The memory backend of the coming `PUT /snapshot/load`. With `File`,
+          the memory file must exist at its full size when preparing.
 
   TokenBucket:
     type: object

@@ -1731,8 +1731,9 @@ def test_negative_snapshot_load_api(microvm_factory):
             mem_backend={"backend_type": "File", "backend_path": "bar"},
         )
 
-    # API request without `mem_backend` or `mem_file_path` should fail.
-    err_msg = "missing field: either `mem_backend` or " "`mem_file_path` is required"
+    # API request without `mem_backend` or `mem_file_path` is only valid after a
+    # `PUT /snapshot/prepare`.
+    err_msg = "mem_backend is required without a prior PUT /snapshot/prepare"
     with pytest.raises(RuntimeError, match=err_msg):
         vm.api.snapshot_load.put(snapshot_path="foo")
 

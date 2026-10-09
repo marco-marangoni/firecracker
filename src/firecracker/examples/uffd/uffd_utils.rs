@@ -478,7 +478,7 @@ impl PostCopy {
     /// Binds the state to a mapping whose faults are `fault_size` bytes (a multiple of the
     /// layout page: the backing page, 2 MiB on hugetlbfs).
     fn attach(&mut self, fault_size: u64) -> Result<(), String> {
-        if fault_size % self.page_size != 0 {
+        if !fault_size.is_multiple_of(self.page_size) {
             return Err(format!(
                 "layout page size {} does not divide the mapping's {fault_size}",
                 self.page_size
@@ -677,7 +677,7 @@ impl UffdHandler {
     /// `EAGAIN` (a `remove` event is pending; retry later).
     fn copy_into(&mut self, src: *const u8, dst: u64, len: usize) -> bool {
         unsafe {
-            match self.uffd.copy(src as *const _, dst as *mut _, len, true) {
+            match self.uffd.copy(src.cast(), dst as *mut _, len, true) {
                 // Make sure the UFFD copied some bytes.
                 Ok(value) => assert!(value > 0),
                 // Catch EAGAIN errors, which occur when a `remove` event lands in the UFFD

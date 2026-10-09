@@ -15,6 +15,7 @@ or not.
 
 import base64
 import filecmp
+import os
 import platform
 import shutil
 import struct
@@ -28,6 +29,7 @@ from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel
 from framework.microvm import Snapshot, SnapshotType
 from framework.utils import get_stable_rss_mem, make_guest_dirty_memory
 from framework.utils_hugepages import HugePagesConfig
+from framework.utils_uffd import spawn_pf_handler, uffd_handler
 from integration_tests.functional.test_balloon import wait_for_balloon_actual
 
 pytestmark = pin_guest_kernel(GUEST_KERNEL_DEFAULT)
@@ -552,6 +554,220 @@ def test_fault_all_handler_as_backend(uvm, microvm_factory):
     again = restored.snapshot_full(mem_path="mem_again")
     assert again.mem.stat().st_size == MEM_SIZE_MIB * 2**20
     restored.kill()
+
+
+@pytest.mark.parametrize("huge_pages", PAGE_CONFIGS)
+def test_prepare_then_load(uvm, microvm_factory, huge_pages):
+    """`PUT /snapshot/prepare` ahead of `PUT /snapshot/load`: the restored microVM works,
+    keeps its backend, and the diff it produces is the same as without preparation."""
+    vm = boot_with_mem_backend(uvm, huge_pages=huge_pages)
+    make_guest_dirty_memory(vm.ssh, amount_mib=32)
+    vm.ssh.check_output("echo hello > /tmp/marker")
+    snapshot = vm.snapshot_diff()
+    vm.kill()
+
+    restored = microvm_factory.build()
+    restored.memory_monitor = None
+    restored.spawn()
+    restored.restore_from_snapshot(
+        snapshot,
+        resume=True,
+        uffd_handler_name="on_demand",
+        mem_backend=True,
+        huge_pages=huge_pages,
+        prepare=True,
+    )
+    assert restored.ssh.check_output("cat /tmp/marker").stdout.strip() == "hello"
+    assert restored.mem_backend is not None
+    # The prepared memory is the backend's: a diff from it rebased onto the snapshot is the
+    # guest's memory, and restores.
+    make_guest_dirty_memory(restored.ssh, amount_mib=16)
+    restored.ssh.check_output("echo again > /tmp/marker")
+    diff = restored.snapshot_diff(mem_path="mem_diff")
+    check_layout(restored.last_snapshot_memory, MEM_SIZE_MIB * 2**20)
+    full = restored.snapshot_full(mem_path="mem_full", vmstate_path="vmstate_full")
+    restored.kill()
+    rebased = diff.rebase_snapshot(snapshot)
+    assert filecmp.cmp(rebased.mem, full.mem, shallow=False)
+
+    chained = microvm_factory.build_from_snapshot(rebased, **restore_kwargs(huge_pages))
+    chained.memory_monitor = None
+    assert chained.ssh.check_output("cat /tmp/marker").stdout.strip() == "again"
+    chained.kill()
+
+
+def test_prepare_then_load_with_hotplug(uvm, microvm_factory):
+    """A prepared VM with a hotpluggable region: the load plugs the slots the snapshot has
+    plugged and leaves the rest unplugged, and the hotplug region keeps working."""
+    vm = uvm
+    vm.memory_monitor = None
+    vm.spawn()
+    vm.basic_config(
+        vcpu_count=2,
+        mem_size_mib=MEM_SIZE_MIB,
+        track_dirty_pages=True,
+        boot_args=MEMHP_BOOTARGS,
+        mem_backend="on_demand",
+    )
+    hotplug = {"total_size_mib": 512, "slot_size_mib": 128, "block_size_mib": 2}
+    vm.api.memory_hotplug.put(**hotplug)
+    vm.add_net_iface()
+    vm.start()
+    vm.hotplug_memory(128)
+    vm.ssh.check_output("mount -o remount,size=200M -t tmpfs tmpfs /dev/shm")
+    vm.ssh.check_output("dd if=/dev/urandom of=/dev/shm/data bs=1M count=150")
+    checksum = vm.ssh.check_output("md5sum /dev/shm/data").stdout
+    snapshot = vm.snapshot_full()
+    vm.kill()
+
+    restored = microvm_factory.build()
+    restored.memory_monitor = None
+    restored.spawn()
+    restored.restore_from_snapshot(
+        snapshot,
+        resume=True,
+        uffd_handler_name="on_demand",
+        mem_backend=True,
+        prepare=True,
+        memory_hotplug=hotplug,
+    )
+    assert restored.api.memory_hotplug.get().json()["plugged_size_mib"] == 128
+    assert restored.ssh.check_output("md5sum /dev/shm/data").stdout == checksum
+    # The unplugged slots are reported zero, the plugged one is not.
+    restored.pause()
+    memory = restored.dirty_pages()
+    total_size = (MEM_SIZE_MIB + 512) * 2**20
+    check_layout(memory, total_size)
+    assert class_bytes_in(
+        memory, (MEM_SIZE_MIB + 128) * 2**20, (512 - 128) * 2**20
+    ) == (0, (512 - 128) * 2**20)
+    restored.resume()
+    restored.hotplug_memory(384)
+    restored.ssh.check_output("mount -o remount,size=400M -t tmpfs tmpfs /dev/shm")
+    restored.ssh.check_output("dd if=/dev/urandom of=/dev/shm/more bs=1M count=200")
+    restored.ssh.check_output("rm /dev/shm/more /dev/shm/data; sync")
+    restored.hotplug_memory(0)
+    restored.ssh.check_output("true")
+    restored.kill()
+
+
+def test_prepare_negative_api(uvm, microvm_factory, guest_kernel, rootfs):
+    """What `PUT /snapshot/prepare` and the load after it reject."""
+    vm = boot_with_mem_backend(uvm)
+    snapshot = vm.snapshot_full()
+    vm.kill()
+
+    # A prepared load must match the snapshot. A mismatch is rejected without harm; since the
+    # configuration is frozen, the process is then only good for a snapshot that does match.
+    dest = microvm_factory.build(guest_kernel, rootfs)
+    dest.memory_monitor = None
+    dest.spawn()
+    jailed = snapshot.copy_to_chroot(Path(dest.chroot()))
+    dest.uffd_handler = spawn_pf_handler(
+        dest,
+        uffd_handler("on_demand", binary_dir=dest.fc_binary_path.parent),
+        jailed,
+        mem_backend=True,
+    )
+    backend = {
+        "backend_type": "SharedMemfd",
+        "backend_path": str(dest.uffd_handler.socket_path),
+    }
+    vmstate = f"/{jailed.vmstate.name}"
+    # Without a backend and without preparation the load has nothing to work with.
+    with pytest.raises(RuntimeError, match="mem_backend is required"):
+        dest.api.snapshot_load.put(snapshot_path=vmstate)
+    # machine-config alone forbids a plain load, as before.
+    dest.api.machine_config.put(vcpu_count=1, mem_size_mib=MEM_SIZE_MIB)
+    with pytest.raises(RuntimeError, match="not allowed"):
+        dest.api.snapshot_load.put(mem_backend=backend, snapshot_path=vmstate)
+    # A File backend needs the memory file to exist at full size when preparing.
+    with pytest.raises(RuntimeError, match="Cannot open the memory file"):
+        dest.api.snapshot_prepare.put(
+            mem_backend={"backend_type": "File", "backend_path": "/missing"}
+        )
+    Path(dest.chroot(), "short").write_bytes(b"\0" * 4096)
+    with pytest.raises(RuntimeError, match="4096 bytes"):
+        dest.api.snapshot_prepare.put(
+            mem_backend={"backend_type": "File", "backend_path": "/short"}
+        )
+    dest.api.snapshot_prepare.put(mem_backend=backend)
+    with pytest.raises(RuntimeError, match="already prepared"):
+        dest.api.snapshot_prepare.put(mem_backend=backend)
+    with pytest.raises(RuntimeError, match="cannot change"):
+        dest.api.machine_config.put(vcpu_count=2, mem_size_mib=MEM_SIZE_MIB)
+    with pytest.raises(RuntimeError, match="fixed by"):
+        dest.api.snapshot_load.put(mem_backend=backend, snapshot_path=vmstate)
+    with pytest.raises(RuntimeError, match="fixed by"):
+        dest.api.snapshot_load.put(snapshot_path=vmstate, track_dirty_pages=True)
+    with pytest.raises(RuntimeError, match="fixed by"):
+        dest.api.snapshot_load.put(snapshot_path=vmstate, huge_pages="2M")
+    # The snapshot has two vCPUs: the prepared VM does not match.
+    with pytest.raises(RuntimeError, match="2 vCPUs, the prepared VM 1"):
+        dest.api.snapshot_load.put(snapshot_path=vmstate)
+    with pytest.raises(RuntimeError, match="already prepared"):
+        dest.api.actions.put(action_type="InstanceStart")
+    dest.kill()
+
+    # A boot-specific resource forbids preparing, as it forbids loading.
+    dest = microvm_factory.build(guest_kernel, rootfs)
+    dest.spawn()
+    dest.basic_config(vcpu_count=2, mem_size_mib=MEM_SIZE_MIB)
+    with pytest.raises(RuntimeError, match="not allowed"):
+        dest.api.snapshot_prepare.put(
+            mem_backend={"backend_type": "Uffd", "backend_path": "/x"}
+        )
+    dest.kill()
+
+    # Hugetlbfs memory cannot be restored from a file, prepared or not.
+    dest = microvm_factory.build(guest_kernel, rootfs)
+    dest.spawn()
+    dest.api.machine_config.put(
+        vcpu_count=2,
+        mem_size_mib=MEM_SIZE_MIB,
+        huge_pages=HugePagesConfig.HUGETLBFS_2MB,
+    )
+    with pytest.raises(RuntimeError, match="hugetlbfs"):
+        dest.api.snapshot_prepare.put(
+            mem_backend={"backend_type": "File", "backend_path": "/mem"}
+        )
+    dest.kill()
+
+
+def test_prepare_then_load_from_file(uvm, microvm_factory):
+    """`File` can be prepared as well: the (pre-sized) memory file is mapped at prepare
+    time and read on fault, so filling it between the prepare and the load, as an
+    orchestrator would during the pause, gives the guest the snapshot's memory."""
+    vm = boot_with_mem_backend(uvm)
+    make_guest_dirty_memory(vm.ssh, amount_mib=32)
+    vm.ssh.check_output("echo hello > /tmp/marker")
+    snapshot = vm.snapshot_full()
+    vm.kill()
+
+    dest = microvm_factory.build()
+    dest.memory_monitor = None
+    dest.spawn()
+    jailed = snapshot.copy_to_chroot(Path(dest.chroot()))
+    for disk in jailed.disks.values():
+        dest.create_jailed_resource(disk)
+    dest.disks = jailed.disks
+    dest.ssh_key = jailed.ssh_key
+    for iface in jailed.net_ifaces:
+        dest.add_net_iface(iface, api=False)
+    # An empty file of the right size stands in for the memory until the "pause".
+    mem = Path(dest.chroot()) / "mem_late"
+    mem.touch()
+    os.truncate(mem, MEM_SIZE_MIB * 2**20)
+    dest.api.machine_config.put(vcpu_count=2, mem_size_mib=MEM_SIZE_MIB)
+    dest.api.snapshot_prepare.put(
+        mem_backend={"backend_type": "File", "backend_path": "/mem_late"}
+    )
+    # The "pause": the snapshot's memory lands in the mapped file, written in place.
+    with open(jailed.mem, "rb") as src, open(mem, "r+b") as dst:
+        shutil.copyfileobj(src, dst)
+    dest.api.snapshot_load.put(snapshot_path=f"/{jailed.vmstate.name}", resume_vm=True)
+    assert dest.ssh.check_output("cat /tmp/marker").stdout.strip() == "hello"
+    dest.kill()
 
 
 def test_virtio_mem_unplugged_slots(uvm, microvm_factory):
