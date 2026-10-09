@@ -31,7 +31,7 @@ use crate::vmm_config::balloon::{
 use crate::vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
 use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, DriveError};
 use crate::vmm_config::entropy::{EntropyDeviceConfig, EntropyDeviceError};
-use crate::vmm_config::instance_info::InstanceInfo;
+use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
 use crate::vmm_config::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugConfigError, MemoryHotplugSizeUpdate,
@@ -716,7 +716,11 @@ impl<'a> PrebootApiController<'a> {
             return Err(PrepareLoadError::HugetlbfsFile);
         }
         let prepare_start_us = get_time_us(ClockType::Monotonic);
-        self.prepared_vm = Some(builder::prepare_vm(self.vm_resources, &params.mem_backend)?);
+        self.prepared_vm = Some(builder::prepare_vm(
+            self.vm_resources,
+            &params.mem_backend,
+            self.seccomp_filters,
+        )?);
         debug!(
             "'prepare load' VMM action took {} us.",
             get_time_us(ClockType::Monotonic) - prepare_start_us
@@ -973,6 +977,12 @@ impl RuntimeApiController {
 
     /// Pauses the microVM by pausing the vCPUs.
     ///
+    /// Whether the microVM is paused: `ApiServerAdapter::handle_request` then stops polling
+    /// the event loop and only serves API requests.
+    pub fn vm_paused(&self) -> bool {
+        self.vmm.lock().expect("Poisoned lock").instance_info.state == VmState::Paused
+    }
+
     /// Device emulation is not stopped here; `ApiServerAdapter::handle_request` stops
     /// polling the event loop once this returns `Ok`.
     pub fn pause(&mut self) -> Result<VmmData, VmmActionError> {
@@ -1040,6 +1050,9 @@ impl RuntimeApiController {
         let vm_info = VmInfo::from(&*locked_vmm);
         let create_start_us = get_time_us(ClockType::Monotonic);
 
+        if create_params.pause {
+            locked_vmm.pause_vm()?;
+        }
         let layout = create_snapshot(&mut locked_vmm, &vm_info, create_params)?;
 
         match create_params.snapshot_type {
@@ -1360,6 +1373,7 @@ mod tests {
                 snapshot_path: PathBuf::new(),
                 mem_file_path: Some(PathBuf::new()),
                 sync_snapshot_files: true,
+                pause: false,
             },
         )));
         #[cfg(target_arch = "x86_64")]

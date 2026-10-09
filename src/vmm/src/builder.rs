@@ -60,9 +60,10 @@ use crate::vstate::kvm::{Kvm, KvmError};
 use crate::vstate::memory::{GuestRegionMmap, MemfdBacking};
 #[cfg(target_arch = "aarch64")]
 use crate::vstate::resources::ResourceAllocator;
-use crate::vstate::vcpu::VcpuError;
+use crate::vstate::vcpu::{KvmVcpu, VcpuError, VcpuHandle};
 use crate::vstate::vm::{KvmVm, Vm, VmError};
 use crate::{EventManager, Vmm, VmmError};
+use kvm_ioctls::VcpuFd;
 use vm_memory::GuestMemoryBackend;
 
 /// Errors associated with starting the instance.
@@ -134,6 +135,8 @@ pub enum StartMicrovmError {
     VcpuFdCloneError(#[from] crate::vstate::vcpu::CopyKvmFdError),
     /// Error with the KvmVm object: {0}
     KvmVm(#[from] VmError),
+    /// Cannot start the vCPU threads: {0}
+    StartVcpus(#[from] crate::StartVcpusError),
 }
 
 /// It's convenient to automatically convert `linux_loader::cmdline::Error`s
@@ -151,13 +154,58 @@ impl std::convert::From<linux_loader::cmdline::Error> for StartMicrovmError {
 #[derive(Debug)]
 pub struct PreparedVm {
     /// The VM, with every memory region registered.
-    pub vm: KvmVm,
-    /// Its vCPUs, created but not configured.
-    pub vcpus: Vec<Vcpu>,
+    pub vm: KvmVmGuard,
+    /// Its vCPUs, created but not configured: `Some` when they still have to be moved to their
+    /// threads (a load without a prepare), `None` when `snapshot/prepare` already started the
+    /// threads, which wait paused for their state through `vm.vcpus_handles()`.
+    pub vcpus: Option<Vec<Vcpu>>,
     /// The userfaultfd guest memory is registered with, if a backend serves it.
     pub uffd: Option<Uffd>,
     /// Whether the backend holds the memfd guest memory is backed by.
     pub mem_backend_attached: bool,
+}
+
+impl PreparedVm {
+    /// The number of vCPUs, started or not.
+    pub fn vcpu_count(&self) -> usize {
+        match &self.vcpus {
+            Some(vcpus) => vcpus.len(),
+            None => self.vm.vcpus_handles().len(),
+        }
+    }
+}
+
+/// A [`KvmVm`] that is not a [`Vmm`]'s yet: dropping it (a failed load, a prepared VM never
+/// loaded) shuts its vCPU threads down first, which [`Vmm`]'s own `Drop` does later on.
+#[derive(Debug)]
+pub struct KvmVmGuard(Option<KvmVm>);
+
+impl KvmVmGuard {
+    fn into_inner(mut self) -> KvmVm {
+        self.0.take().expect("taken once")
+    }
+}
+
+impl std::ops::Deref for KvmVmGuard {
+    type Target = KvmVm;
+
+    fn deref(&self) -> &KvmVm {
+        self.0.as_ref().expect("taken once")
+    }
+}
+
+impl std::ops::DerefMut for KvmVmGuard {
+    fn deref_mut(&mut self) -> &mut KvmVm {
+        self.0.as_mut().expect("taken once")
+    }
+}
+
+impl Drop for KvmVmGuard {
+    fn drop(&mut self) {
+        if let Some(vm) = &self.0 {
+            vm.shutdown_vcpus();
+        }
+    }
 }
 
 /// `PUT /snapshot/prepare`: what a load would do before reading the snapshot, from the machine
@@ -166,24 +214,33 @@ pub struct PreparedVm {
 /// `Uffd` or `SharedMemfd` backend, memory is also registered with a UFFD, which is handed to
 /// the backend (plus the memfd, for `SharedMemfd`). With `File`, the memory file is mapped
 /// privately: it must already exist at its full size, but since pages are read from it on
-/// fault and nothing faults before the load, its content may be written until then. The load
-/// then checks the snapshot against what was prepared and applies the snapshot's plug state.
+/// fault and nothing faults before the load, its content may be written until then. The vCPU
+/// threads are started as well, paused, waiting for their state (their seccomp filter goes on
+/// once they have it: the state-setting ioctls are not in the vCPU filter, and the thread runs
+/// nothing but its event loop until then). The load then checks the snapshot against what was
+/// prepared and applies the snapshot's plug state.
 ///
 /// Registering memory with KVM is the dominant cost of a load on hosts that allocate per-page
-/// slot metadata eagerly (about 0.5 ms per GiB on 5.10); this takes it out of the pause.
+/// slot metadata eagerly (about 0.5 ms per GiB on 5.10); this takes it out of the pause, along
+/// with the thread creation.
 pub fn prepare_vm(
     vm_resources: &VmResources,
     mem_backend: &MemBackendConfig,
+    seccomp_filters: &BpfThreadMap,
 ) -> Result<PreparedVm, StartMicrovmError> {
     let cpu_template = vm_resources
         .machine_config
         .cpu_template
         .get_cpu_template()?;
     let kvm = Kvm::new(cpu_template.kvm_capabilities.clone())?;
-    let mut vm = KvmVm::new(kvm)?;
+    let mut vm = KvmVmGuard(Some(KvmVm::new(kvm)?));
     let vcpus = vm.create_vcpus(vm_resources.machine_config.vcpu_count)?;
+    let vcpu_filter = seccomp_filters
+        .get("vcpu")
+        .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vcpu".to_string()))?
+        .clone();
 
-    if mem_backend.backend_type == MemBackendType::File {
+    let (uffd, mem_backend_attached) = if mem_backend.backend_type == MemBackendType::File {
         // The layout a boot gives, and a snapshot of it records: the DRAM regions, then the
         // hotpluggable one, consecutive in the file.
         let machine_config = &vm_resources.machine_config;
@@ -219,39 +276,38 @@ pub fn prepare_vm(
         if let Some((region, slot_size)) = hotplug_region {
             vm.register_hotpluggable_memory_region(region, slot_size)?;
         }
-        return Ok(PreparedVm {
-            vm,
-            vcpus,
-            uffd: None,
-            mem_backend_attached: false,
-        });
-    }
+        (None, false)
+    } else {
+        let share_memfd = mem_backend.backend_type == MemBackendType::SharedMemfd;
+        let (guest_memory, mut memfd_backing) = vm_resources
+            .allocate_guest_memory_backed(share_memfd)
+            .map_err(StartMicrovmError::GuestMemory)?;
+        vm.register_dram_memory_regions(guest_memory)?;
+        allocate_hotpluggable_memory(&mut vm, vm_resources, memfd_backing.as_mut())?;
 
-    let share_memfd = mem_backend.backend_type == MemBackendType::SharedMemfd;
-    let (guest_memory, mut memfd_backing) = vm_resources
-        .allocate_guest_memory_backed(share_memfd)
-        .map_err(StartMicrovmError::GuestMemory)?;
-    vm.register_dram_memory_regions(guest_memory)?;
-    allocate_hotpluggable_memory(&mut vm, vm_resources, memfd_backing.as_mut())?;
+        let regions: Vec<&GuestRegionMmap> = vm
+            .guest_memory()
+            .iter()
+            .map(|region| &region.inner)
+            .collect();
+        let uffd = persist::uffd_for_guest_memory(
+            &mem_backend.backend_path,
+            regions.iter().copied(),
+            vm_resources.machine_config.huge_pages,
+            memfd_backing.as_ref().map(|backing| &*backing.file),
+        )
+        .map_err(StartMicrovmError::MemBackend)?;
+        (Some(uffd), share_memfd)
+    };
 
-    let regions: Vec<&GuestRegionMmap> = vm
-        .guest_memory()
-        .iter()
-        .map(|region| &region.inner)
-        .collect();
-    let uffd = persist::uffd_for_guest_memory(
-        &mem_backend.backend_path,
-        regions.iter().copied(),
-        vm_resources.machine_config.huge_pages,
-        memfd_backing.as_ref().map(|backing| &*backing.file),
-    )
-    .map_err(StartMicrovmError::MemBackend)?;
+    // Last, once nothing can fail any more: the threads wait, paused, for the load.
+    vm.start_vcpus_deferred_seccomp(vcpus, vcpu_filter)?;
 
     Ok(PreparedVm {
         vm,
-        vcpus,
-        uffd: Some(uffd),
-        mem_backend_attached: share_memfd,
+        vcpus: None,
+        uffd,
+        mem_backend_attached,
     })
 }
 
@@ -569,25 +625,28 @@ pub enum BuildMicrovmFromSnapshotError {
     StartVcpus(#[from] crate::StartVcpusError),
     /// Failed to restore vCPUs: {0}
     RestoreVcpus(#[from] VcpuError),
+    /// Failed to hand the vCPU threads their state: {0}
+    VcpuMessage(#[from] VmmError),
     /// Failed to restore devices: {0}
     RestoreDevices(#[from] DeviceManagerPersistError),
     /// clock_realtime is not supported on aarch64.
     UnsupportedClockRealtime,
 }
 
-/// Align restored TSC offsets before starting any vCPU threads.
+/// Align restored TSC offsets before any vCPU runs. `vcpu_fds` are the vCPUs' fds in index
+/// order (the vCPU threads, if started, are paused).
 #[cfg(target_arch = "x86_64")]
-fn synchronize_tsc_offsets(vcpus: &[crate::Vcpu]) {
-    let reference = vcpus
+fn synchronize_tsc_offsets(vcpu_fds: &[&VcpuFd]) {
+    let reference = vcpu_fds
         .first()
         .expect("TSC synchronization requires at least one vCPU");
     // KVM_VCPU_TSC_OFFSET is supported since Linux 5.16 (commit 828ca89628bf).
     // Probe the attribute to keep restore best-effort on older hosts.
-    if !reference.kvm_vcpu.supports_tsc_offset_attr() {
+    if !KvmVcpu::supports_tsc_offset_attr(reference) {
         crate::logger::debug!("KVM does not support TSC offset synchronization");
         return;
     }
-    let offset = match reference.kvm_vcpu.get_tsc_offset() {
+    let offset = match KvmVcpu::get_tsc_offset(reference) {
         Ok(offset) => offset,
         Err(err) => {
             crate::logger::warn!("Failed to read vCPU 0 TSC offset: {err}");
@@ -596,12 +655,9 @@ fn synchronize_tsc_offsets(vcpus: &[crate::Vcpu]) {
     };
 
     let mut synchronized = true;
-    for vcpu in vcpus {
-        if let Err(err) = vcpu.kvm_vcpu.set_tsc_offset(offset) {
-            crate::logger::warn!(
-                "Failed to synchronize vCPU {} TSC offset: {err}",
-                vcpu.kvm_vcpu.index
-            );
+    for (index, fd) in vcpu_fds.iter().enumerate() {
+        if let Err(err) = KvmVcpu::set_tsc_offset(fd, offset) {
+            crate::logger::warn!("Failed to synchronize vCPU {index} TSC offset: {err}");
             synchronized = false;
         }
     }
@@ -621,12 +677,12 @@ pub fn prepare_vm_from_snapshot(
     vcpu_count: u8,
 ) -> Result<PreparedVm, StartMicrovmError> {
     let kvm = Kvm::new(microvm_state.kvm_state.kvm_cap_modifiers.clone())?;
-    let mut vm = KvmVm::new(kvm)?;
+    let mut vm = KvmVmGuard(Some(KvmVm::new(kvm)?));
     let vcpus = vm.create_vcpus(vcpu_count)?;
     vm.restore_memory_regions(guest_memory, &microvm_state.vm_state.memory)?;
     Ok(PreparedVm {
         vm,
-        vcpus,
+        vcpus: Some(vcpus),
         uffd,
         mem_backend_attached,
     })
@@ -639,7 +695,7 @@ pub fn prepare_vm_from_snapshot(
 pub fn build_microvm_from_snapshot(
     instance_info: &InstanceInfo,
     event_manager: &mut EventManager,
-    microvm_state: MicrovmState,
+    mut microvm_state: MicrovmState,
     prepared: PreparedVm,
     seccomp_filters: &BpfThreadMap,
     vm_resources: &mut VmResources,
@@ -650,45 +706,84 @@ pub fn build_microvm_from_snapshot(
 
     let PreparedVm {
         mut vm,
-        mut vcpus,
+        vcpus,
         uffd,
         mem_backend_attached,
     } = prepared;
 
+    #[cfg(target_arch = "aarch64")]
+    let mpidrs = construct_kvm_mpidrs(&microvm_state.vcpu_states);
+    let vcpu_states = std::mem::take(&mut microvm_state.vcpu_states);
+
+    // The vCPUs' fds in index order, whether the vCPUs are still here or already on their
+    // (paused) threads, for the TSC ioctls below.
+    let mut handles = vm.vcpus_handles();
+    fn vcpu_fds<'a>(vcpus: &'a Option<Vec<Vcpu>>, handles: &'a [VcpuHandle]) -> Vec<&'a VcpuFd> {
+        match vcpus {
+            Some(vcpus) => vcpus.iter().map(|vcpu| &vcpu.kvm_vcpu.fd).collect(),
+            None => handles.iter().map(|handle| &handle.vcpu_fd).collect(),
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     {
         // Scale TSC to match, extract the TSC freq from the state if specified
-        if let Some(state_tsc) = microvm_state.vcpu_states[0].tsc_khz {
+        if let Some(state_tsc) = vcpu_states[0].tsc_khz {
             // Scale the TSC frequency for all VCPUs. If a TSC frequency is not specified in the
             // snapshot, by default it uses the host frequency.
-            if vcpus[0].kvm_vcpu.is_tsc_scaling_required(state_tsc)? {
-                for vcpu in &vcpus {
-                    vcpu.kvm_vcpu.set_tsc_khz(state_tsc)?;
+            let fds = vcpu_fds(&vcpus, &handles);
+            if KvmVcpu::is_tsc_scaling_required(fds[0], state_tsc)? {
+                for fd in &fds {
+                    KvmVcpu::set_tsc_khz(fd, state_tsc)?;
                 }
             }
         }
     }
 
-    // Restore vcpus kvm state.
-    for (vcpu, state) in vcpus.iter_mut().zip(microvm_state.vcpu_states.iter()) {
-        vcpu.kvm_vcpu
-            .restore_state(state)
-            .map_err(VcpuError::VcpuResponse)
-            .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)?;
+    // Restore vcpus kvm state: here, or on the vCPU threads if they are already running.
+    match &vcpus {
+        Some(vcpus) => {
+            for (vcpu, state) in vcpus.iter().zip(vcpu_states.iter()) {
+                vcpu.kvm_vcpu
+                    .restore_state(state)
+                    .map_err(VcpuError::VcpuResponse)
+                    .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)?;
+            }
+        }
+        None => {
+            for (handle, state) in handles.iter_mut().zip(vcpu_states) {
+                handle
+                    .send_event(crate::VcpuEvent::RestoreState(Box::new(state)))
+                    .map_err(|_| VmmError::VcpuMessage)?;
+            }
+            for handle in handles.iter() {
+                match handle
+                    .response_receiver()
+                    .recv_timeout(crate::RECV_TIMEOUT_SEC)
+                {
+                    Ok(crate::VcpuResponse::RestoredState) => {}
+                    Ok(crate::VcpuResponse::Error(err)) => {
+                        return Err(BuildMicrovmFromSnapshotError::RestoreVcpus(err));
+                    }
+                    _ => return Err(VmmError::VcpuMessage.into()),
+                }
+            }
+        }
     }
 
     // Restoring TSC MSRs separately can leave different offsets on each vCPU.
     // Preserve vCPU0's restored timeline while preventing time from going backwards
     // when the guest migrates between vCPUs.
     #[cfg(target_arch = "x86_64")]
-    synchronize_tsc_offsets(&vcpus);
+    synchronize_tsc_offsets(&vcpu_fds(&vcpus, &handles));
+    drop(handles);
+    let mut vcpus = vcpus;
 
     #[cfg(target_arch = "aarch64")]
     {
         if clock_realtime {
             return Err(BuildMicrovmFromSnapshotError::UnsupportedClockRealtime);
         }
-        let mpidrs = construct_kvm_mpidrs(&microvm_state.vcpu_states);
         // Restore kvm vm state.
         vm.restore_state(&mpidrs, &microvm_state.vm_state)?;
     }
@@ -702,7 +797,8 @@ pub fn build_microvm_from_snapshot(
 
     vm.set_uffd(uffd);
 
-    let kvm_vm = Arc::new(vm);
+    // From here on the `Vmm` owns the VM and its `Drop` shuts the vCPUs down.
+    let kvm_vm = Arc::new(vm.into_inner());
     let vm = Vm::Kvm(kvm_vm.clone());
 
     // Restore devices states.
@@ -731,14 +827,17 @@ pub fn build_microvm_from_snapshot(
         mem_backend_attached,
     };
 
-    // Move vcpus to their own threads and start their state machine in the 'Paused' state.
-    kvm_vm.start_vcpus(
-        vcpus,
-        seccomp_filters
-            .get("vcpu")
-            .ok_or(BuildMicrovmFromSnapshotError::MissingVcpuSeccompFilters)?
-            .clone(),
-    )?;
+    // Move vcpus to their own threads and start their state machine in the 'Paused' state,
+    // unless `snapshot/prepare` did so already.
+    if let Some(vcpus) = vcpus.take() {
+        kvm_vm.start_vcpus(
+            vcpus,
+            seccomp_filters
+                .get("vcpu")
+                .ok_or(BuildMicrovmFromSnapshotError::MissingVcpuSeccompFilters)?
+                .clone(),
+        )?;
+    }
 
     let vmm = Arc::new(Mutex::new(vmm));
     vmm.lock().unwrap().instance_info.state = VmState::Paused;
@@ -1044,7 +1143,7 @@ pub(crate) mod tests {
             let count = u8::try_from(offsets.len()).unwrap();
             let mut source_vm = setup_vm_with_memory(0x1000);
             let source_vcpus = source_vm.create_vcpus(count).unwrap();
-            if !source_vcpus[0].kvm_vcpu.supports_tsc_offset_attr() {
+            if !KvmVcpu::supports_tsc_offset_attr(&source_vcpus[0].kvm_vcpu.fd) {
                 eprintln!("Skipping TSC offset synchronization: KVM attribute unavailable");
                 return;
             }
@@ -1059,19 +1158,20 @@ pub(crate) mod tests {
             for ((vcpu, state), &offset) in vcpus.iter().zip(&states).zip(offsets) {
                 vcpu.kvm_vcpu.restore_state(state).unwrap();
                 // Establish exact offsets without depending on KVM's MSR-write heuristics.
-                vcpu.kvm_vcpu.set_tsc_offset(offset).unwrap();
-                assert_eq!(vcpu.kvm_vcpu.get_tsc_offset().unwrap(), offset);
+                KvmVcpu::set_tsc_offset(&vcpu.kvm_vcpu.fd, offset).unwrap();
+                assert_eq!(KvmVcpu::get_tsc_offset(&vcpu.kvm_vcpu.fd).unwrap(), offset);
             }
 
-            synchronize_tsc_offsets(&vcpus);
-            for vcpu in &vcpus {
-                assert_eq!(vcpu.kvm_vcpu.get_tsc_offset().unwrap(), offsets[0]);
+            let fds: Vec<_> = vcpus.iter().map(|vcpu| &vcpu.kvm_vcpu.fd).collect();
+            synchronize_tsc_offsets(&fds);
+            for fd in &fds {
+                assert_eq!(KvmVcpu::get_tsc_offset(fd).unwrap(), offsets[0]);
             }
 
             // The subsequent VM clock restore must preserve the synchronized offsets.
             vm.restore_state(&vm_state, false).unwrap();
-            for vcpu in &vcpus {
-                assert_eq!(vcpu.kvm_vcpu.get_tsc_offset().unwrap(), offsets[0]);
+            for fd in &fds {
+                assert_eq!(KvmVcpu::get_tsc_offset(fd).unwrap(), offsets[0]);
             }
         }
     }

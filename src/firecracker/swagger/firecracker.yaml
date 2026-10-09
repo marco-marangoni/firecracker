@@ -1861,6 +1861,13 @@ definitions:
           in the host page cache, so same-host reads still see the full
           contents. Block device backing files are always fsync'd regardless of
           this setting.
+      pause:
+        type: boolean
+        default: false
+        description:
+          "Pause the microVM first, as `PATCH /vm` with `state: Paused` would,
+          saving a round trip. The microVM stays paused afterwards. No effect
+          if it is paused already."
 
   NetworkOverride:
     type: object

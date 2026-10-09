@@ -1284,6 +1284,51 @@ def test_negative_api(uvm, microvm_factory, guest_kernel, rootfs):
     backed.ssh.check_output("true")
 
 
+def test_create_with_pause(uvm, microvm_factory):
+    """`snapshot/create` with `pause: true` pauses the microVM itself and leaves it paused;
+    the snapshot restores; on a paused microVM the flag is a no-op."""
+    vm = boot_with_mem_backend(uvm)
+    vm.ssh.check_output("echo hello > /tmp/marker")
+    assert vm.state == "Running"
+    response = vm.api.snapshot_create.put(
+        snapshot_path="vmstate", snapshot_type="Backend", pause=True
+    )
+    assert vm.state == "Paused"
+    memory = response.json()["memory"]
+    check_layout(memory, MEM_SIZE_MIB * 2**20)
+    # The flag on a paused microVM is a no-op; the dirty state was consumed by the first call.
+    again = vm.api.snapshot_create.put(
+        snapshot_path="vmstate_again", snapshot_type="Backend", pause=True
+    )
+    assert authoritative_bytes(again.json()["memory"]) < 2 * 2**20
+    assert vm.state == "Paused"
+    vm.mem_backend.copy(memory, "/mem")
+    vm.mem_backend.copy(again.json()["memory"], "/mem")
+    vm.resume()
+    assert vm.state == "Running"
+    vm.ssh.check_output("true")
+
+    snapshot = Snapshot(
+        vmstate=Path(vm.chroot()) / "vmstate",
+        mem=Path(vm.chroot()) / "mem",
+        disks=vm.disks,
+        net_ifaces=[x["iface"] for x in vm.iface.values()],
+        ssh_key=vm.ssh_key,
+        snapshot_type=SnapshotType.DIFF,
+        meta={
+            "kernel_file": str(vm.guest_kernel.vmlinux),
+            "rootfs_file": str(vm.rootfs_file),
+            "vcpus_count": vm.vcpus_count,
+            "mem_size_mib": MEM_SIZE_MIB,
+        },
+    )
+    vm.kill()
+    restored = microvm_factory.build_from_snapshot(snapshot)
+    restored.memory_monitor = None
+    assert restored.ssh.check_output("cat /tmp/marker").stdout.strip() == "hello"
+    restored.kill()
+
+
 @pytest.mark.parametrize("snapshot_type", [SnapshotType.FULL, SnapshotType.DIFF])
 def test_snapshot_types_with_backend(uvm, snapshot_type):
     """The file has the full size either way: a Full is written by Firecracker (204, no

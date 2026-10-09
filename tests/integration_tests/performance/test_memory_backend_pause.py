@@ -216,13 +216,15 @@ def resume(dest, row):
 def file_diff(vm, dest, jailed, lazy):
     """Firecracker writes the resident pages (mincore, no dirty tracking); the
     destination maps the file (4K) or serves it through UFFD (hugetlbfs)."""
-    _, pause_s = timed(vm.pause)
+    # `pause: true` folds the pause into the create: one round trip less.
+    pause_s = 0.0
     _, create_s = timed(
         lambda: vm.api.snapshot_create.put(
             mem_file_path=MEM,
             snapshot_path=VMSTATE,
             snapshot_type="Diff",
             sync_snapshot_files=False,
+            pause=True,
         )
     )
     # A Diff file is sparse: only the written pages are allocated.
@@ -240,11 +242,15 @@ def file_diff(vm, dest, jailed, lazy):
 
 
 def backend_final_layout(vm):
-    """Pause and take the `Backend` snapshot: state + final layout, no memory."""
-    _, pause_s = timed(vm.pause)
+    """Pause and take the `Backend` snapshot in one call (`pause: true`): state +
+    final layout, no memory."""
+    pause_s = 0.0
     response, create_s = timed(
         lambda: vm.api.snapshot_create.put(
-            snapshot_path=VMSTATE, snapshot_type="Backend", sync_snapshot_files=False
+            snapshot_path=VMSTATE,
+            snapshot_type="Backend",
+            sync_snapshot_files=False,
+            pause=True,
         )
     )
     memory = response.json()["memory"]
@@ -404,8 +410,8 @@ def test_pause_measurements(microvm_factory, guest_kernel, rootfs, huge_pages, m
     print()
     print(
         f"{VCPUS} vCPUs, {mem_mib} MiB, {huge_pages}, {mem_mib - headroom_mib(mem_mib)} MiB touched, 64 MiB "
-        f"rewritten continuously; destination spawned before the pause; medians of "
-        f"{ITERATIONS}; ms"
+        f"rewritten continuously; destination spawned before the pause; the pause is part "
+        f"of snapshot/create (`pause: true`); medians of {ITERATIONS}; ms"
     )
     print()
     print(

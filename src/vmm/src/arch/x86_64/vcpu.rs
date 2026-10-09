@@ -403,19 +403,23 @@ impl KvmVcpu {
         Ok(res)
     }
 
-    /// Whether KVM supports directly accessing this vCPU's TSC offset.
-    pub fn supports_tsc_offset_attr(&self) -> bool {
+    /// Whether KVM supports directly accessing the TSC offset of the vCPU behind `fd`.
+    ///
+    /// The TSC functions take the fd rather than `self` so that a restore can drive them from
+    /// the VMM thread through the `VcpuHandle`'s copy of the fd, when the vCPU already runs on
+    /// its own thread (`snapshot/prepare`).
+    pub fn supports_tsc_offset_attr(fd: &VcpuFd) -> bool {
         let attr = kvm_device_attr {
             group: KVM_VCPU_TSC_CTRL,
             attr: u64::from(KVM_VCPU_TSC_OFFSET),
             ..Default::default()
         };
         // SAFETY: The vCPU fd and attribute are valid, and HAS_DEVICE_ATTR ignores addr.
-        unsafe { ioctl_with_ref(&self.fd, ioctls::KVM_HAS_DEVICE_ATTR(), &attr) == 0 }
+        unsafe { ioctl_with_ref(fd, ioctls::KVM_HAS_DEVICE_ATTR(), &attr) == 0 }
     }
 
-    /// Read this vCPU's TSC offset relative to the host TSC.
-    pub fn get_tsc_offset(&self) -> Result<i64, errno::Error> {
+    /// Read the TSC offset of the vCPU behind `fd`, relative to the host TSC.
+    pub fn get_tsc_offset(fd: &VcpuFd) -> Result<i64, errno::Error> {
         let mut offset = 0_i64;
         let attr = kvm_device_attr {
             group: KVM_VCPU_TSC_CTRL,
@@ -424,15 +428,15 @@ impl KvmVcpu {
             ..Default::default()
         };
         // SAFETY: The attribute points to a writable i64 that lives through the ioctl.
-        let ret = unsafe { ioctl_with_ref(&self.fd, ioctls::KVM_GET_DEVICE_ATTR(), &attr) };
+        let ret = unsafe { ioctl_with_ref(fd, ioctls::KVM_GET_DEVICE_ATTR(), &attr) };
         if ret != 0 {
             return Err(errno::Error::last());
         }
         Ok(offset)
     }
 
-    /// Set this vCPU's TSC offset while the vCPU is not running.
-    pub fn set_tsc_offset(&self, offset: i64) -> Result<(), errno::Error> {
+    /// Set the TSC offset of the vCPU behind `fd` while it is not running.
+    pub fn set_tsc_offset(fd: &VcpuFd, offset: i64) -> Result<(), errno::Error> {
         let attr = kvm_device_attr {
             group: KVM_VCPU_TSC_CTRL,
             attr: u64::from(KVM_VCPU_TSC_OFFSET),
@@ -440,7 +444,7 @@ impl KvmVcpu {
             ..Default::default()
         };
         // SAFETY: The attribute points to a readable i64 that lives through the ioctl.
-        let ret = unsafe { ioctl_with_ref(&self.fd, ioctls::KVM_SET_DEVICE_ATTR(), &attr) };
+        let ret = unsafe { ioctl_with_ref(fd, ioctls::KVM_SET_DEVICE_ATTR(), &attr) };
         if ret != 0 {
             return Err(errno::Error::last());
         }
@@ -715,26 +719,26 @@ impl KvmVcpu {
         Ok(CpuConfiguration { cpuid, msrs })
     }
 
-    /// Checks whether the TSC needs scaling when restoring a snapshot.
+    /// Checks whether the TSC of the vCPU behind `fd` needs scaling when restoring a snapshot.
     ///
     /// # Errors
     ///
-    /// When
-    pub fn is_tsc_scaling_required(&self, state_tsc_freq: u32) -> Result<bool, GetTscError> {
+    /// When [`kvm_ioctls::VcpuFd::get_tsc_khz`] errors.
+    pub fn is_tsc_scaling_required(fd: &VcpuFd, state_tsc_freq: u32) -> Result<bool, GetTscError> {
         // Compare the current TSC freq to the one found
         // in the state. If they are different, we need to
         // scale the TSC to the freq found in the state.
         // We accept values within a tolerance of 250 parts
         // per million because it is common for TSC frequency
         // to differ due to calibration at boot time.
-        let diff = (i64::from(self.get_tsc_khz()?) - i64::from(state_tsc_freq)).abs();
+        let diff = (i64::from(fd.get_tsc_khz()?) - i64::from(state_tsc_freq)).abs();
         // Cannot overflow since u32::MAX * 250 < i64::MAX
         Ok(diff > i64::from(state_tsc_freq) * TSC_KHZ_TOL_NUMERATOR / TSC_KHZ_TOL_DENOMINATOR)
     }
 
-    /// Scale the TSC frequency of this vCPU to the one provided as a parameter.
-    pub fn set_tsc_khz(&self, tsc_freq: u32) -> Result<(), SetTscError> {
-        self.fd.set_tsc_khz(tsc_freq).map_err(SetTscError)
+    /// Scale the TSC frequency of the vCPU behind `fd` to the one provided as a parameter.
+    pub fn set_tsc_khz(fd: &VcpuFd, tsc_freq: u32) -> Result<(), SetTscError> {
+        fd.set_tsc_khz(tsc_freq).map_err(SetTscError)
     }
 
     /// Use provided state to populate KVM internal state.
@@ -847,7 +851,7 @@ impl Peripherals {
 }
 
 /// Structure holding VCPU kvm state.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct VcpuState {
     /// CpuId.
     pub cpuid: CpuId,
@@ -1185,11 +1189,7 @@ mod tests {
                         / u32::try_from(TSC_KHZ_TOL_DENOMINATOR).unwrap()
                         / 2,
             );
-            assert!(
-                !vcpu
-                    .is_tsc_scaling_required(state.tsc_khz.unwrap())
-                    .unwrap()
-            );
+            assert!(!KvmVcpu::is_tsc_scaling_required(&vcpu.fd, state.tsc_khz.unwrap()).unwrap());
         }
 
         {
@@ -1201,16 +1201,13 @@ mod tests {
                         / u32::try_from(TSC_KHZ_TOL_DENOMINATOR).unwrap()
                         * 2,
             );
-            assert!(
-                vcpu.is_tsc_scaling_required(state.tsc_khz.unwrap())
-                    .unwrap()
-            );
+            assert!(KvmVcpu::is_tsc_scaling_required(&vcpu.fd, state.tsc_khz.unwrap()).unwrap());
         }
 
         {
             // Try a large frequency (30GHz) in the state and check it doesn't
             // overflow
-            assert!(vcpu.is_tsc_scaling_required(30_000_000).unwrap());
+            assert!(KvmVcpu::is_tsc_scaling_required(&vcpu.fd, 30_000_000).unwrap());
         }
     }
 
@@ -1226,14 +1223,14 @@ mod tests {
         );
 
         if vm.kvm().fd.check_extension(Cap::TscControl) {
-            vcpu.set_tsc_khz(state.tsc_khz.unwrap()).unwrap();
+            KvmVcpu::set_tsc_khz(&vcpu.fd, state.tsc_khz.unwrap()).unwrap();
             if vm.kvm().fd.check_extension(Cap::GetTscKhz) {
                 assert_eq!(vcpu.get_tsc_khz().ok(), state.tsc_khz);
             } else {
                 vcpu.get_tsc_khz().unwrap_err();
             }
         } else {
-            vcpu.set_tsc_khz(state.tsc_khz.unwrap()).unwrap_err();
+            KvmVcpu::set_tsc_khz(&vcpu.fd, state.tsc_khz.unwrap()).unwrap_err();
         }
     }
 

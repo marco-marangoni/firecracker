@@ -95,16 +95,16 @@ impl ApiServerAdapter {
 
     fn handle_request(&mut self, event_manager: &mut EventManager) {
         if let Some(api_request) = self.request.take() {
-            let request_is_pause = *api_request == VmmAction::Pause;
             self._handle_request(*api_request, event_manager);
 
-            // If the latest req is a pause request, temporarily switch to a mode where we
-            // do blocking `recv`s on the `from_api` receiver in a loop, until we get
-            // unpaused. The device emulation is implicitly paused since we do not
+            // If the latest req left the microVM paused (a `Pause`, or a `snapshot/create`
+            // with `pause: true`), temporarily switch to a mode where we do blocking
+            // `recv`s on the `from_api` receiver in a loop, until a request leaves it
+            // running again. The device emulation is implicitly paused since we do not
             // return to `run_microvm` and hence `event_manager.run()` is not called
             // again: device fds (virtqueue notifications, tap, rate limiters, timers)
             // are not polled until we break out of this loop on `Resume`.
-            if request_is_pause {
+            if self.controller.vm_paused() {
                 // INVARIANT: while paused, nothing but API request handling runs on this
                 // thread, so no code path in Firecracker reads or writes guest memory or
                 // virtqueues between two API requests. Memory backends (`SharedMemfd`, see
@@ -118,9 +118,8 @@ impl ApiServerAdapter {
                 // request still goes through).
                 loop {
                     let req = self.from_api.recv().expect("Error receiving API request.");
-                    let req_is_resume = *req == VmmAction::Resume;
                     self._handle_request(*req, event_manager);
-                    if req_is_resume {
+                    if !self.controller.vm_paused() {
                         break;
                     }
                 }

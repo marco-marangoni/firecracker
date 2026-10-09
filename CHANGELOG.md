@@ -52,7 +52,12 @@ and this project adheres to
   against the prepared microVM and rejects a mismatch with `400`. The machine
   configuration cannot change once a microVM is prepared. A `PUT /snapshot/load`
   without `mem_backend` or `mem_file_path` and without a prior prepare is now
-  rejected by the VMM rather than at parsing.
+  rejected by the VMM rather than at parsing. The prepared microVM's vCPU
+  threads are started (and seccomp-filtered) at prepare time as well; the load
+  hands them their state.
+- Added `pause` to `PUT /snapshot/create`: when `true`, the microVM is paused
+  first, as `PATCH /vm` with `state: Paused` would, saving the round trip. It
+  stays paused afterwards.
 
 ### Changed
 

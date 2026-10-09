@@ -105,6 +105,10 @@ pub struct Vcpu {
     response_receiver: Option<Receiver<VcpuResponse>>,
     /// The transmitting end of the responses channel owned by the vcpu side.
     response_sender: Sender<VcpuResponse>,
+    /// The thread's seccomp filter while its installation is deferred (see
+    /// [`Vcpu::start_threaded`]): installed once the vCPU has received its state, or at the
+    /// latest before it first runs.
+    pending_seccomp_filter: Option<Arc<BpfProgram>>,
 }
 
 /// States of the vCPU thread's run loop.
@@ -152,6 +156,7 @@ impl Vcpu {
             #[cfg(feature = "gdb")]
             gdb_event: None,
             kvm_vcpu,
+            pending_seccomp_filter: None,
         })
     }
 
@@ -179,11 +184,18 @@ impl Vcpu {
 
     /// Moves the vcpu to its own thread and constructs a VcpuHandle.
     /// The handle can be used to control the remote vcpu.
+    ///
+    /// The thread installs `seccomp_filter` first thing, unless `defer_seccomp`: then the
+    /// thread waits unfiltered for a [`VcpuEvent::RestoreState`] (a `snapshot/prepare` starts
+    /// the threads before the snapshot exists), restores the state with ioctls the vCPU filter
+    /// does not allow, and installs the filter right after. Either way it is in place before the
+    /// vCPU first runs, and the thread executes nothing but its event loop until then.
     pub fn start_threaded(
         mut self,
         vm: &KvmVm,
         seccomp_filter: Arc<BpfProgram>,
         barrier: Arc<Barrier>,
+        defer_seccomp: bool,
     ) -> Result<VcpuHandle, StartThreadedError> {
         let event_sender = self.event_sender.take().expect("vCPU already started");
         let response_receiver = self.response_receiver.take().unwrap();
@@ -193,11 +205,15 @@ impl Vcpu {
         let vcpu_thread = thread::Builder::new()
             .name(format!("fc_vcpu {}", self.kvm_vcpu.index))
             .spawn(move || {
-                let filter = &*seccomp_filter;
                 self.register_kick_signal_handler();
                 // Synchronization to make sure thread local data is initialized.
                 barrier.wait();
-                self.run(filter);
+                if defer_seccomp {
+                    self.pending_seccomp_filter = Some(seccomp_filter);
+                    self.run(&[]);
+                } else {
+                    self.run(&seccomp_filter);
+                }
             })
             .map_err(StartThreadedError::Spawn)?;
 
@@ -215,15 +231,7 @@ impl Vcpu {
     /// Note that the state of the VCPU and associated VM must be setup first for this to do
     /// anything useful.
     pub fn run(&mut self, seccomp_filter: BpfProgramRef) {
-        // Load seccomp filters for this vCPU thread.
-        // Execution panics if filters cannot be loaded, use --no-seccomp if skipping filters
-        // altogether is the desired behaviour.
-        if let Err(err) = crate::seccomp::apply_filter(seccomp_filter) {
-            panic!(
-                "Failed to set the requested seccomp filters on vCPU {}: Error: {}",
-                self.kvm_vcpu.index, err
-            );
-        }
+        self.install_seccomp_filter(seccomp_filter);
 
         // Start running the machine state in the `Paused` state.
         let mut state = VcpuRunState::Paused;
@@ -233,6 +241,24 @@ impl Vcpu {
                 VcpuRunState::Paused => self.paused(),
                 VcpuRunState::Finished => break,
             };
+        }
+    }
+
+    /// Loads seccomp filters for this vCPU thread. Execution panics if filters cannot be loaded,
+    /// use --no-seccomp if skipping filters altogether is the desired behaviour.
+    fn install_seccomp_filter(&self, seccomp_filter: BpfProgramRef) {
+        if let Err(err) = crate::seccomp::apply_filter(seccomp_filter) {
+            panic!(
+                "Failed to set the requested seccomp filters on vCPU {}: Error: {}",
+                self.kvm_vcpu.index, err
+            );
+        }
+    }
+
+    /// Installs the deferred seccomp filter, if any is still pending.
+    fn install_pending_seccomp_filter(&mut self) {
+        if let Some(filter) = self.pending_seccomp_filter.take() {
+            self.install_seccomp_filter(&filter);
         }
     }
 
@@ -285,8 +311,8 @@ impl Vcpu {
                     .send(VcpuResponse::Resumed)
                     .expect("vcpu channel unexpectedly closed");
             }
-            // SaveState cannot be performed on a running Vcpu.
-            Ok(VcpuEvent::SaveState) => {
+            // SaveState and RestoreState cannot be performed on a running Vcpu.
+            Ok(VcpuEvent::SaveState | VcpuEvent::RestoreState(_)) => {
                 self.response_sender
                     .send(VcpuResponse::NotAllowed(String::from(
                         "save/restore unavailable while running",
@@ -319,6 +345,8 @@ impl Vcpu {
         match self.event_receiver.recv() {
             // Paused ---- Resume ----> Running
             Ok(VcpuEvent::Resume) => {
+                // Never run guest code unfiltered.
+                self.install_pending_seccomp_filter();
                 if self.kvm_vcpu.fd.get_kvm_run().immediate_exit == 1u8 {
                     warn!(
                         "Received a VcpuEvent::Resume message with immediate_exit enabled. \
@@ -353,6 +381,19 @@ impl Vcpu {
                             .expect("vcpu channel unexpectedly closed");
                     });
 
+                VcpuRunState::Paused
+            }
+            Ok(VcpuEvent::RestoreState(state)) => {
+                let response = match self.kvm_vcpu.restore_state(&state) {
+                    Ok(()) => VcpuResponse::RestoredState,
+                    Err(err) => VcpuResponse::Error(VcpuError::VcpuResponse(err)),
+                };
+                self.response_sender
+                    .send(response)
+                    .expect("vcpu channel unexpectedly closed");
+                // The state is in; the filter goes on now, overlapping with the rest of the
+                // load on the VMM thread, which only waited for the response.
+                self.install_pending_seccomp_filter();
                 VcpuRunState::Paused
             }
             Ok(VcpuEvent::DumpCpuConfig) => {
@@ -540,6 +581,9 @@ pub enum VcpuEvent {
     Resume,
     /// Event to save the state of a paused Vcpu.
     SaveState,
+    /// Event to restore a saved state into a paused Vcpu (a `snapshot/load` onto a vCPU whose
+    /// thread `snapshot/prepare` started ahead of time).
+    RestoreState(Box<VcpuState>),
     /// Event to dump CPU configuration of a paused Vcpu.
     DumpCpuConfig,
 }
@@ -558,6 +602,8 @@ pub enum VcpuResponse {
     Resumed,
     /// Vcpu state is saved.
     SavedState(Box<VcpuState>),
+    /// Vcpu state is restored.
+    RestoredState,
     /// Vcpu is in the state where CPU config is dumped.
     DumpedCpuConfig(Box<CpuConfiguration>),
 }
@@ -570,6 +616,7 @@ impl fmt::Debug for VcpuResponse {
             Resumed => write!(f, "VcpuResponse::Resumed"),
             Exited(code) => write!(f, "VcpuResponse::Exited({:?})", code),
             SavedState(_) => write!(f, "VcpuResponse::SavedState"),
+            RestoredState => write!(f, "VcpuResponse::RestoredState"),
             Error(err) => write!(f, "VcpuResponse::Error({:?})", err),
             NotAllowed(reason) => write!(f, "VcpuResponse::NotAllowed({})", reason),
             DumpedCpuConfig(_) => write!(f, "VcpuResponse::DumpedCpuConfig"),
@@ -841,11 +888,11 @@ pub(crate) mod tests {
             use crate::VcpuResponse::*;
             // Guard match with no wildcard to make sure we catch new enum variants.
             match self {
-                Paused | Resumed | Exited(_) => (),
+                Paused | Resumed | RestoredState | Exited(_) => (),
                 Error(_) | NotAllowed(_) | SavedState(_) | DumpedCpuConfig(_) => (),
             };
             match (self, other) {
-                (Paused, Paused) | (Resumed, Resumed) => true,
+                (Paused, Paused) | (Resumed, Resumed) | (RestoredState, RestoredState) => true,
                 (Exited(code), Exited(other_code)) => code == other_code,
                 (NotAllowed(_), NotAllowed(_))
                 | (SavedState(_), SavedState(_))
@@ -952,6 +999,7 @@ pub(crate) mod tests {
                 &vm,
                 seccomp_filters.remove("vcpu").unwrap(),
                 barrier.clone(),
+                false,
             )
             .expect("failed to start vcpu");
         // Wait for vCPUs to initialize their TLS before moving forward.
@@ -1108,14 +1156,27 @@ pub(crate) mod tests {
         vcpu_handle
             .send_event(VcpuEvent::SaveState)
             .expect("failed to send event to vcpu");
-        match vcpu_handle
+        let state = match vcpu_handle
             .response_receiver()
             .recv_timeout(RECV_TIMEOUT_SEC)
             .expect("did not receive event response from vcpu")
         {
-            VcpuResponse::SavedState(_) => {}
+            VcpuResponse::SavedState(state) => state,
             _ => panic!("unexpected response"),
         };
+
+        // The state goes back in while paused, and not while running.
+        queue_event_expect_response(
+            &mut vcpu_handle,
+            VcpuEvent::RestoreState(state.clone()),
+            VcpuResponse::RestoredState,
+        );
+        queue_event_expect_response(&mut vcpu_handle, VcpuEvent::Resume, VcpuResponse::Resumed);
+        queue_event_expect_response(
+            &mut vcpu_handle,
+            VcpuEvent::RestoreState(state),
+            VcpuResponse::NotAllowed(String::new()),
+        );
 
         vcpu_handle.send_event(VcpuEvent::Finish).unwrap();
     }

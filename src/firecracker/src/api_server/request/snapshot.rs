@@ -157,6 +157,7 @@ mod tests {
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: Some(PathBuf::from("bar")),
             sync_snapshot_files: true,
+            pause: false,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -174,6 +175,24 @@ mod tests {
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: Some(PathBuf::from("bar")),
             sync_snapshot_files: false,
+            pause: false,
+        };
+        assert_eq!(
+            vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
+            VmmAction::CreateSnapshot(expected_config)
+        );
+
+        let body = r#"{
+            "snapshot_type": "Backend",
+            "snapshot_path": "foo",
+            "pause": true
+        }"#;
+        let expected_config = CreateSnapshotParams {
+            snapshot_type: SnapshotType::Backend,
+            snapshot_path: PathBuf::from("foo"),
+            mem_file_path: None,
+            sync_snapshot_files: true,
+            pause: true,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -189,6 +208,7 @@ mod tests {
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: Some(PathBuf::from("bar")),
             sync_snapshot_files: true,
+            pause: false,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),

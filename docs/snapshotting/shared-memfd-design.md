@@ -376,6 +376,18 @@ post-copy residual is all the handler serves after the resume. Measured on the
 `snapshot/load` 17 ms → 4 ms, total pause of a pre-copy + post-copy transfer 23
 ms → 13 ms, of which `snapshot/create` is 5 ms.
 
+Two more pieces of the pause moved out afterwards. The vCPU threads are spawned
+and seccomp-filtered at prepare time rather than at the end of the load (about
+0.3 ms per thread): the load then hands each thread its state with a
+`VcpuEvent::RestoreState` message, handled in the thread's paused state like
+`SaveState`, and does the TSC scaling and offset synchronisation through the
+`VcpuHandle`'s copy of the vCPU fd. And `PUT /snapshot/create` takes a `pause`
+flag that pauses the microVM first, saving the round trip of a separate
+`PATCH /vm`; `ApiServerAdapter` decides whether to stop polling the event loop
+from the microVM's state after each request rather than from the request being a
+`Pause`, so the invariant that nothing touches guest memory between API requests
+while paused holds for this path too.
+
 ### 7. `PUT /snapshot/dirty-pages` and `snapshot/create` with `Backend`
 
 *(Revised. The response format changed from a dirty bitmap plus an `unplugged`
