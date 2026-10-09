@@ -6,7 +6,7 @@ use vmm::logger::{IncMetric, METRICS};
 use vmm::rpc_interface::VmmAction;
 use vmm::vmm_config::snapshot::{
     CreateSnapshotParams, LoadSnapshotConfig, LoadSnapshotParams, MemBackendConfig, MemBackendType,
-    Vm, VmState,
+    PrepareLoadParams, Vm, VmState,
 };
 
 use super::super::parsed_request::{ParsedRequest, RequestError};
@@ -15,9 +15,6 @@ use super::super::request::{Body, Method, StatusCode};
 /// Deprecation message for the `mem_file_path` field.
 const LOAD_DEPRECATION_MESSAGE: &str =
     "PUT /snapshot/load: mem_file_path and enable_diff_snapshots fields are deprecated.";
-/// None of the `mem_backend` or `mem_file_path` fields has been specified.
-pub const MISSING_FIELD: &str =
-    "missing field: either `mem_backend` or `mem_file_path` is required";
 /// Both the `mem_backend` and `mem_file_path` fields have been specified.
 /// Only specifying one of them is allowed.
 pub const TOO_MANY_FIELDS: &str =
@@ -31,6 +28,7 @@ pub(crate) fn parse_put_snapshot(
         Some(request_type) => match request_type {
             "create" => parse_put_snapshot_create(body),
             "load" => parse_put_snapshot_load(body),
+            "prepare" => parse_put_snapshot_prepare(body),
             "dirty-pages" => parse_put_snapshot_dirty_pages(body),
             _ => Err(RequestError::InvalidPathMethod(
                 format!("/snapshot/{}", request_type),
@@ -60,6 +58,11 @@ fn parse_put_snapshot_create(body: &Body) -> Result<ParsedRequest, RequestError>
     )))
 }
 
+fn parse_put_snapshot_prepare(body: &Body) -> Result<ParsedRequest, RequestError> {
+    let params = serde_json::from_slice::<PrepareLoadParams>(body.raw())?;
+    Ok(ParsedRequest::new_sync(VmmAction::PrepareLoad(params)))
+}
+
 /// `PUT /snapshot/dirty-pages`: no parameters. An empty body or an empty JSON object is
 /// accepted, so that fields can be added later without breaking clients that send `{}`.
 fn parse_put_snapshot_dirty_pages(body: &Body) -> Result<ParsedRequest, RequestError> {
@@ -76,20 +79,12 @@ fn parse_put_snapshot_dirty_pages(body: &Body) -> Result<ParsedRequest, RequestE
 fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
     let snapshot_config = serde_json::from_slice::<LoadSnapshotConfig>(body.raw())?;
 
-    match (&snapshot_config.mem_backend, &snapshot_config.mem_file_path) {
-        // Ensure `mem_file_path` and `mem_backend` fields are not present at the same time.
-        (Some(_), Some(_)) => {
-            return Err(RequestError::SerdeJson(serde_json::Error::custom(
-                TOO_MANY_FIELDS,
-            )));
-        }
-        // Ensure that one of `mem_file_path` or `mem_backend` fields is always specified.
-        (None, None) => {
-            return Err(RequestError::SerdeJson(serde_json::Error::custom(
-                MISSING_FIELD,
-            )));
-        }
-        _ => {}
+    // Ensure `mem_file_path` and `mem_backend` fields are not present at the same time. Neither
+    // is fine: the memory backend was then given to `PUT /snapshot/prepare`.
+    if snapshot_config.mem_backend.is_some() && snapshot_config.mem_file_path.is_some() {
+        return Err(RequestError::SerdeJson(serde_json::Error::custom(
+            TOO_MANY_FIELDS,
+        )));
     }
 
     // Check for the presence of deprecated `mem_file_path` field and create
@@ -104,17 +99,14 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
 
     // If `mem_file_path` is specified instead of `mem_backend`, we construct the
     // `MemBackendConfig` object from the path specified, with `File` as backend type.
-    let mem_backend = match snapshot_config.mem_backend {
-        Some(backend_cfg) => backend_cfg,
-        None => {
-            MemBackendConfig {
-                // This is safe to unwrap() because we ensure above that one of the two:
-                // either `mem_file_path` or `mem_backend` field is always specified.
-                backend_path: snapshot_config.mem_file_path.unwrap(),
+    let mem_backend = snapshot_config.mem_backend.or_else(|| {
+        snapshot_config
+            .mem_file_path
+            .map(|backend_path| MemBackendConfig {
+                backend_path,
                 backend_type: MemBackendType::File,
-            }
-        }
-    };
+            })
+    });
 
     let snapshot_params = LoadSnapshotParams {
         snapshot_path: snapshot_config.snapshot_path,
@@ -219,10 +211,10 @@ mod tests {
         }"#;
         let expected_config = LoadSnapshotParams {
             snapshot_path: PathBuf::from("foo"),
-            mem_backend: MemBackendConfig {
+            mem_backend: Some(MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
-            },
+            }),
             track_dirty_pages: false,
             resume_vm: false,
             network_overrides: vec![],
@@ -252,10 +244,10 @@ mod tests {
         }"#;
         let expected_config = LoadSnapshotParams {
             snapshot_path: PathBuf::from("foo"),
-            mem_backend: MemBackendConfig {
+            mem_backend: Some(MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
-            },
+            }),
             track_dirty_pages: true,
             resume_vm: false,
             network_overrides: vec![],
@@ -286,10 +278,10 @@ mod tests {
         }"#;
         let expected_config = LoadSnapshotParams {
             snapshot_path: PathBuf::from("foo"),
-            mem_backend: MemBackendConfig {
+            mem_backend: Some(MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::Uffd,
-            },
+            }),
             track_dirty_pages: false,
             resume_vm: true,
             network_overrides: vec![],
@@ -325,10 +317,10 @@ mod tests {
         }"#;
         let expected_config = LoadSnapshotParams {
             snapshot_path: PathBuf::from("foo"),
-            mem_backend: MemBackendConfig {
+            mem_backend: Some(MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::Uffd,
-            },
+            }),
             track_dirty_pages: false,
             resume_vm: true,
             network_overrides: vec![NetworkOverride {
@@ -358,10 +350,10 @@ mod tests {
         }"#;
         let expected_config = LoadSnapshotParams {
             snapshot_path: PathBuf::from("foo"),
-            mem_backend: MemBackendConfig {
+            mem_backend: Some(MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
-            },
+            }),
             track_dirty_pages: false,
             resume_vm: true,
             network_overrides: vec![],
@@ -439,16 +431,22 @@ mod tests {
                 .to_string()
         );
 
+        // Neither `mem_file_path` nor `mem_backend`: the load of a prepared VM.
         let body = r#"{
             "snapshot_path": "foo"
         }"#;
         assert_eq!(
-            parse_put_snapshot(&Body::new(body), Some("load"))
-                .err()
-                .unwrap()
-                .to_string(),
-            RequestError::SerdeJson(serde_json::Error::custom(MISSING_FIELD.to_string()))
-                .to_string()
+            vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("load")).unwrap()),
+            VmmAction::LoadSnapshot(LoadSnapshotParams {
+                snapshot_path: PathBuf::from("foo"),
+                mem_backend: None,
+                track_dirty_pages: false,
+                resume_vm: false,
+                network_overrides: vec![],
+                vsock_override: None,
+                clock_realtime: false,
+                huge_pages: SnapshotLoadHugePageConfig::Snapshot,
+            })
         );
 
         let body = r#"{
@@ -467,6 +465,34 @@ mod tests {
         );
         parse_put_snapshot(&Body::new(body), Some("invalid")).unwrap_err();
         parse_put_snapshot(&Body::new(body), None).unwrap_err();
+    }
+
+    #[test]
+    fn test_parse_put_snapshot_prepare() {
+        use std::path::PathBuf;
+
+        let body = r#"{
+            "mem_backend": {
+                "backend_path": "bar",
+                "backend_type": "SharedMemfd"
+            }
+        }"#;
+        assert_eq!(
+            vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("prepare")).unwrap()),
+            VmmAction::PrepareLoad(PrepareLoadParams {
+                mem_backend: MemBackendConfig {
+                    backend_path: PathBuf::from("bar"),
+                    backend_type: MemBackendType::SharedMemfd,
+                },
+            })
+        );
+        // The backend is mandatory, and nothing else is accepted.
+        parse_put_snapshot(&Body::new("{}"), Some("prepare")).unwrap_err();
+        let body = r#"{
+            "mem_backend": { "backend_path": "bar", "backend_type": "Uffd" },
+            "snapshot_path": "foo"
+        }"#;
+        parse_put_snapshot(&Body::new(body), Some("prepare")).unwrap_err();
     }
 
     #[test]

@@ -379,10 +379,10 @@ fn verify_load_snapshot(
     preboot_api_controller
         .handle_preboot_request(VmmAction::LoadSnapshot(LoadSnapshotParams {
             snapshot_path: snapshot_file.as_path().to_path_buf(),
-            mem_backend: MemBackendConfig {
+            mem_backend: Some(MemBackendConfig {
                 backend_path: memory_file.as_path().to_path_buf(),
                 backend_type: MemBackendType::File,
-            },
+            }),
             track_dirty_pages: false,
             resume_vm: true,
             network_overrides: vec![],
@@ -451,10 +451,10 @@ fn test_load_snapshot_rejects_hugetlbfs_with_file_backend() {
     let error = preboot_api_controller
         .handle_preboot_request(VmmAction::LoadSnapshot(LoadSnapshotParams {
             snapshot_path: snapshot_file.as_path().to_path_buf(),
-            mem_backend: MemBackendConfig {
+            mem_backend: Some(MemBackendConfig {
                 backend_path: memory_file.as_path().to_path_buf(),
                 backend_type: MemBackendType::File,
-            },
+            }),
             track_dirty_pages: false,
             resume_vm: false,
             network_overrides: vec![],
@@ -524,10 +524,10 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
     // Load snapshot should no longer be allowed.
     let req = VmmAction::LoadSnapshot(LoadSnapshotParams {
         snapshot_path: snapshot_file.as_path().to_path_buf(),
-        mem_backend: MemBackendConfig {
+        mem_backend: Some(MemBackendConfig {
             backend_path: memory_file.as_path().to_path_buf(),
             backend_type: MemBackendType::File,
-        },
+        }),
         track_dirty_pages: false,
         resume_vm: false,
         network_overrides: vec![],

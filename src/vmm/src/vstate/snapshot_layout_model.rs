@@ -541,9 +541,7 @@ impl State {
         // 3. Classify. An unplugged slot has no KVM log to read and reads as zero: zero whole.
         let layout = Layout {
             authoritative: std::array::from_fn(|p| !self.pages[p].unplugged && dirty[p]),
-            zero: std::array::from_fn(|p| {
-                self.pages[p].unplugged || (discarded[p] && !dirty[p])
-            }),
+            zero: std::array::from_fn(|p| self.pages[p].unplugged || (discarded[p] && !dirty[p])),
         };
         // 4 and 5. As in `snapshot_ordered`.
         self.arm_rings();

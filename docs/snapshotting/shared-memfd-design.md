@@ -328,6 +328,54 @@ is a memfd that is shared with the peer), in the style of `File` and `Uffd`,
 rather than after the peer's role; an earlier draft called it `MemoryBackend`,
 which read awkwardly inside `mem_backend`.
 
+#### `PUT /snapshot/prepare`: the snapshot-independent half of a load, early
+
+Profiling a 16 GiB hugetlbfs `snapshot/load` on a 5.10 host (strace of the
+destination process) put 13 of its 15 ms in two `KVM_SET_USER_MEMORY_REGION`
+calls: KVM allocates and zeroes per-4K-page slot metadata eagerly on that kernel
+(rmap, page-track array: 40 MiB for 16 GiB, 0.5 ms/GiB in isolation). None of
+the load's inputs to that point depend on the snapshot: the region layout is
+`arch_memory_regions(mem_size_mib)` (plus the hotpluggable region at the address
+a fresh allocator gives it), and `huge_pages`, `track_dirty_pages`, the vCPU
+count and the CPU template's KVM capability modifiers are machine configuration
+the orchestrator knows before the pause. `build_microvm_from_snapshot` already
+touched the snapshot only after creating the VM, the vCPUs and the memslots.
+
+So the load is split in two. `PUT /snapshot/prepare` (`builder::prepare_vm`)
+allocates guest memory exactly as a boot would (`allocate_guest_memory_backed`,
+memfd for `SharedMemfd`, anonymous for `Uffd`, a private mapping of the memory
+file for `File`; the hotpluggable region if `memory_hotplug` is configured),
+creates the VM and vCPUs, registers every DRAM slot with KVM and, for the two
+UFFD backends, registers memory with a userfaultfd and performs the handshake.
+The result, a `PreparedVm`, waits in the `PrebootApiController`.
+`PUT /snapshot/load` without `mem_backend` consumes it: `check_prepared_vm`
+compares the snapshot's vCPU count, `mem_size_mib`, `huge_pages`, KVM capability
+modifiers and memory layout (regions, sizes, types, slot counts) with the
+prepared VM and rejects a mismatch with a 400 that, unlike other load failures,
+is not fatal to the process, since nothing was done yet; `apply_plug_state` then
+plugs the hotpluggable slots the snapshot has plugged (`update_slot`, the
+virtio-mem path); the rest of the load is unchanged. Without a prior prepare,
+the load builds the same `PreparedVm` itself (`prepare_vm_from_snapshot`) and
+nothing changes.
+
+Decisions: a mismatch is rejected rather than reconciled, and the machine
+configuration is frozen once a VM is prepared (changing it would be silently
+ignored); `machine-config` no longer forbids a later `snapshot/load` on its own,
+only a load *without* a prepare, which would silently override it as before.
+`File` can be prepared too, against a memory file that exists at its full size
+but is still empty: the mapping is private and pages are read from the file on
+fault, nothing faults before the load, and even a page faulted read-only sees
+later writes to the file until the guest writes it, so the orchestrator can fill
+the file during the pause as it would without a prepare. `mem_backend`,
+`track_dirty_pages` and `huge_pages` in the load request are rejected after a
+prepare rather than compared, so that there is one place a value comes from. The
+handshake moving to prepare time is what lets a backend populate the
+destination's memfd during the pre-copy: pages present in it never fault, so the
+post-copy residual is all the handler serves after the resume. Measured on the
+16 GiB hugetlbfs pause benchmark (`test_memory_backend_pause.py`):
+`snapshot/load` 17 ms → 4 ms, total pause of a pre-copy + post-copy transfer 23
+ms → 13 ms, of which `snapshot/create` is 5 ms.
+
 ### 7. `PUT /snapshot/dirty-pages` and `snapshot/create` with `Backend`
 
 *(Revised. The response format changed from a dirty bitmap plus an `unplugged`

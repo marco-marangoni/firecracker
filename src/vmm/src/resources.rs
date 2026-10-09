@@ -525,7 +525,7 @@ impl VmResources {
     }
 
     /// [`Self::allocate_guest_memory`] with the memfd decision made by the caller.
-    fn allocate_guest_memory_backed(
+    pub(crate) fn allocate_guest_memory_backed(
         &self,
         memfd: bool,
     ) -> Result<(Vec<GuestRegionMmap>, Option<MemfdBacking>), MemoryError> {
