@@ -326,8 +326,9 @@ def test_precopy_dirty_pages(uvm, huge_pages):
     """
     Pre-copy: copy dirty pages repeatedly while the guest runs, then pause
     and copy the final `Diff` set. The result must equal a `Full` taken right
-    after. This exercises the virtio-net `prepare_dirty_tracking_reset` hook,
-    since ssh traffic flows during the passes.
+    after. The ssh traffic flowing during the passes exercises the marking of
+    RX buffers after they are written: a buffer parsed before a pass and filled
+    after it must land in a later set.
     """
     vm = boot_with_mem_backend(uvm, huge_pages=huge_pages)
     make_guest_dirty_memory(vm.ssh, amount_mib=16)

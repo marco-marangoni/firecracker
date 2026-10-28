@@ -21,21 +21,23 @@
 //!   (discarded by the balloon or virtio-mem, or a booted microVM). What the guest sees is
 //!   derived from this: the memfd content if present, the base or zero if a hole.
 //! - the **marks**: KVM's dirty log (set by guest writes, read-and-reset when the layout is
-//!   computed) and Firecracker's bitmap (set by device writes, discards and unplugs, reset after
-//!   `mincore`). A device may mark a page *ahead* of writing it (virtqueue rings, virtio-net RX
-//!   buffers); such a page is **armed**, and an unmarked write to it may follow.
+//!   computed), Firecracker's bitmap (set by device writes right after they land, by discards and
+//!   by unplugs; reset after `mincore`) and the **queue record**: a used ring write goes through a
+//!   `GuestMemorySliceMut`, which records the page in the queue's own `DirtyPages` and reports it
+//!   to the bitmap only at the next `commit_dirty`. Every consumption of the dirty state commits
+//!   first. Nothing marks a page ahead of writing it.
 //! - the **backend's file**: the previous memory file, into which the backend merges each diff.
 //!   For a restored microVM it starts as the base; for a booted one, as zeros.
 //!
 //! Operations: a guest write (faults the page in if it is a hole, then writes and marks in KVM's
-//! log), a device marking ahead, a device write to an armed page (not marked, by definition), a
-//! discard (punches the page to a zero hole and marks it), a discard of a page that cannot be
-//! punched on its own (a partially covered hugetlbfs page: `discard_range` writes zeros to it
-//! instead, which faults it in; whether the write happens is one of the two bugs below), unplug
-//! and plug of a virtio-mem page, and the snapshot itself: read the
-//! marks, read residency (a guest write may race between the two and between the second and the
-//! reset, modelling `incremental` on a running guest), classify, reset, re-arm the virtqueue
-//! pages, and have the backend apply the layout.
+//! log), a device write marked right after it (`IoVecBufferMut`, block completions), a used ring
+//! write (recorded by the queue, committed later), a commit, a discard (punches the page to a
+//! zero hole and marks it), a discard of a page that cannot be punched on its own (a partially
+//! covered hugetlbfs page: `discard_range` writes zeros to it instead, which faults it in;
+//! whether the write happens is the bug below), unplug and plug of a virtio-mem page, and the
+//! snapshot itself: commit the queue records, read the marks, read residency (a guest or device
+//! write may race between the two and between the second and the end of the request, modelling
+//! `incremental` on a running guest), classify, reset, and have the backend apply the layout.
 //!
 //! The backend applies a returned layout whenever it gets to it, not inside the API call: layouts
 //! queue up ([`State::pending`]) and are applied oldest first, while the guest keeps writing.
@@ -63,22 +65,27 @@
 //! After a snapshot of a paused guest, once the backend has applied every layout it was handed,
 //! `file[p] == guest[p]` for every page. The proof is inductive over the invariant `I`: *once the
 //! backend has applied every layout it holds, in order, a page whose file content differs from
-//! what the guest sees is marked*, together with the structural lemma `L`: *a marked hole is a zero hole* (and an
-//! armed page is marked, and an unplugged page is an unarmed zero hole). `I ∧ L` holds in both initial states, is preserved by every operation
-//! including a racy snapshot, and together with the classification implies the property for a
-//! paused snapshot: a dirty resident page gets the memfd content, which is what the guest sees; a
-//! dirty hole is a zero hole by `L`, so writing zero is right; a clean page is already right by
-//! `I`.
+//! what the guest sees is marked*, together with the structural lemma `L`: *a marked hole is a
+//! zero hole* (and an unplugged page is a zero hole). `I ∧ L` holds in both initial states, is
+//! preserved by every operation including a racy snapshot, and together with the classification
+//! implies the property for a paused snapshot: a dirty resident page gets the memfd content,
+//! which is what the guest sees; a dirty hole is a zero hole by `L`, so writing zero is right; a
+//! clean page is already right by `I`.
 //!
-//! `L` is exactly what the two fixes found during development buy: faulting in a page when it is
-//! marked ahead of a write ([`FAULT_IN_ON_MARK`]), without which a restored virtqueue page that
-//! was marked but not yet written would be a marked *base* hole, reported zero; and never marking
-//! a page a discard left untouched ([`DISCARD_ZEROES_UNPUNCHABLE_EDGES`]: `discard_range` writes
-//! zeros to the partial huge pages it cannot free, so every page it marks is a zero hole or
-//! resident zeros), without which a partially covered huge page would be a marked base hole too.
-//! The order of the two reads
-//! ([`RESIDENCY_AFTER_DIRTY`]) is what makes a racy `incremental` pass preserve `I`. The
-//! `should_panic` harnesses show that dropping any of the three breaks the proof.
+//! `L` holds because every mark follows the write it records: a page marked after a write is
+//! resident, and a discard marks only pages it punched (zero holes) or zero-wrote
+//! ([`DISCARD_ZEROES_UNPUNCHABLE_EDGES`]: `discard_range` writes zeros to the partial huge pages
+//! it cannot free), without which a partially covered huge page would be a marked *base* hole,
+//! reported zero while the guest reads the base. (An earlier Firecracker marked virtqueue rings
+//! and RX buffers *ahead* of writing them, and `L` then needed every such mark to fault the page
+//! in; marking after the write made that go away.) The order of the two reads
+//! ([`RESIDENCY_AFTER_DIRTY`]) is what makes a racy `incremental` pass preserve `I`, and the
+//! queue record counts as a mark for `I`, which is why a queue may not be let go of before it is
+//! committed. Device writes race with the request too, once device emulation leaves the VMM
+//! thread ([`Race`]); they are harmless because every one of them marks after it lands and
+//! Firecracker's bitmap is swapped out when it is read ([`CONSUME_WITH_SWAP`]), so a mark set
+//! during the request is in the next set. The `should_panic` harnesses show that dropping any of
+//! these breaks the proof.
 //!
 //! # Without `mincore`
 //!
@@ -110,16 +117,18 @@ use roaring::RoaringBitmap;
 /// operations are per page and the invariant is per page).
 pub const PAGES: usize = 4;
 
-/// Fix 1: a device that marks a page dirty ahead of writing it faults the page in first
-/// (`fault_in_marked_range`).
-pub const FAULT_IN_ON_MARK: bool = true;
-/// Fix 2: a discard writes zeros to the pages it cannot free (the partial huge pages at either
+/// Fix 1: a discard writes zeros to the pages it cannot free (the partial huge pages at either
 /// end of a hugetlbfs range), so that the whole range it marks reads as zero. Without it such a
 /// page would be marked while still holding its old content, a base hole if never populated.
 pub const DISCARD_ZEROES_UNPUNCHABLE_EDGES: bool = true;
-/// Rule 3: residency is read after the dirty state, never before, so that a page written between
+/// Rule 2: residency is read after the dirty state, never before, so that a page written between
 /// the two reads is seen as resident (and reported in the next set) rather than as a dirty hole.
 pub const RESIDENCY_AFTER_DIRTY: bool = true;
+/// Rule 3: Firecracker's bitmap is consumed with a swap (`get_and_reset`, a per-word atomic
+/// exchange) at the time it is read, never read first and cleared later. A device write that
+/// lands and marks between the read and a later clear would otherwise be lost for good
+/// (`without_swap_a_racing_device_write_is_lost`); with the swap its mark is in the next set.
+pub const CONSUME_WITH_SWAP: bool = true;
 /// Rule 4 (for the classification without `mincore`): the discard record holds only backing
 /// pages that were punched. A page `discard_range` zero-writes instead (the partial huge page at
 /// either end of a hugetlbfs range) is recorded as a write in Firecracker's bitmap, not as a
@@ -176,10 +185,9 @@ pub struct Page {
     /// backend that keeps old content in discarded ranges still gives
     /// ([`State::file_matches_guest_reads`]); not something Firecracker observes.
     pub guest_discarded: bool,
-    /// Marked ahead of a write by a device; an unmarked write may follow.
-    pub armed: bool,
-    /// A virtqueue page: re-marked (and faulted in) after every snapshot.
-    pub ring: bool,
+    /// Written by Firecracker through a virtqueue's `GuestMemorySliceMut` and recorded in that
+    /// queue's `DirtyPages`, not yet reported to Firecracker's bitmap by `commit_dirty`.
+    pub queue_recorded: bool,
     /// An unplugged virtio-mem page: inaccessible to the guest, reads as zero.
     pub unplugged: bool,
 }
@@ -220,16 +228,39 @@ pub struct Layout {
     pub zero: [bool; PAGES],
 }
 
-/// Guest writes that may race with an `incremental` request on a running guest: one between
-/// reading the dirty state and reading residency, one between residency and the reset of
-/// Firecracker's bitmap. Device writes cannot race: they run on the thread that computes the
-/// layout. `None` is a paused guest.
+/// Who writes a page during a `dirty-pages` request on a running guest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Writer {
+    /// A vCPU: KVM logs the write.
+    Guest,
+    /// A device marking right after the write (`IoVecBufferMut`, block completions): an I/O
+    /// thread, or a completion landing on the VMM thread between two steps of the request.
+    DeviceMarked,
+    /// A device writing a used ring element: recorded by its queue, committed later.
+    DeviceQueue,
+}
+
+/// One write that may race with a `dirty-pages` request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RacyWrite {
+    /// Who writes.
+    pub writer: Writer,
+    /// The page written.
+    pub page: usize,
+    /// The value written.
+    pub value: u8,
+}
+
+/// Writes that may race with a `dirty-pages` request on a running guest: one between reading
+/// the dirty state and reading residency, one between residency and the end of the request.
+/// Guest writes race today; device writes do once device emulation leaves the VMM thread, and
+/// the proof covers them already. `None` is a paused guest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Race {
-    /// A guest write between the dirty state and residency being read.
-    pub after_dirty: Option<(usize, u8)>,
-    /// A guest write between residency being read and the marks being reset.
-    pub after_resident: Option<(usize, u8)>,
+    /// A write between the dirty state and residency being read.
+    pub after_dirty: Option<RacyWrite>,
+    /// A write between residency being read and the request completing.
+    pub after_resident: Option<RacyWrite>,
 }
 
 impl Page {
@@ -250,9 +281,10 @@ impl Page {
         matches!(self.memfd, Memfd::Present(_))
     }
 
-    /// Whether the page is dirty in KVM's log, Firecracker's bitmap, or the discard bitmap.
+    /// Whether the page is dirty in KVM's log, Firecracker's bitmap, a queue's record, or the
+    /// discard bitmap.
     pub fn marked(&self) -> bool {
-        self.kvm_marked || self.fc_marked || self.discarded_block
+        self.kvm_marked || self.fc_marked || self.queue_recorded || self.discarded_block
     }
 
     /// A read or write through Firecracker's mapping of a hole: the page becomes present with
@@ -292,20 +324,19 @@ impl State {
 
     /// A microVM restored from a base snapshot through the backend: every page is a hole the
     /// handler serves from the base, and the backend's file is the base.
-    pub fn restored(base: [u8; PAGES], ring: [bool; PAGES], huge: bool) -> Self {
-        let mut s = Self::booted(ring, huge);
+    pub fn restored(base: [u8; PAGES], huge: bool) -> Self {
+        let mut s = Self::booted(huge);
         for (p, page) in s.pages.iter_mut().enumerate() {
             page.memfd = Memfd::Hole(HoleReads::Base);
             page.base = base[p];
             page.file = base[p];
         }
-        s.arm_rings();
         s
     }
 
     /// A booted microVM: zero holes, no base, an empty (zero) file.
-    pub fn booted(ring: [bool; PAGES], huge: bool) -> Self {
-        let mut s = Self {
+    pub fn booted(huge: bool) -> Self {
+        Self {
             pending: [None; MAX_PENDING],
             huge,
             dirty_tracking: true,
@@ -317,33 +348,9 @@ impl State {
                 fc_marked: false,
                 discarded_block: false,
                 guest_discarded: false,
-                armed: false,
-                ring: false,
+                queue_recorded: false,
                 unplugged: false,
             }; PAGES],
-        };
-        for (p, page) in s.pages.iter_mut().enumerate() {
-            page.ring = ring[p];
-        }
-        s.arm_rings();
-        s
-    }
-
-    /// `mark_virtio_queue_memory_dirty` (at activation and after every snapshot) and the RX
-    /// buffer marking in `IoVecBufferMut`: mark ahead of writing.
-    fn mark_ahead(&mut self, p: usize) {
-        self.pages[p].fc_marked = true;
-        self.pages[p].armed = true;
-        if FAULT_IN_ON_MARK {
-            self.fault_in(p);
-        }
-    }
-
-    fn arm_rings(&mut self) {
-        for p in 0..PAGES {
-            if self.pages[p].ring && !self.pages[p].unplugged {
-                self.mark_ahead(p);
-            }
         }
     }
 
@@ -358,25 +365,8 @@ impl State {
         self.pages[p].guest_discarded = false;
     }
 
-    /// A device marks page `p` dirty before it writes it (virtqueue ring, RX buffer).
-    pub fn device_mark_ahead(&mut self, p: usize) {
-        if self.pages[p].unplugged {
-            return;
-        }
-        self.mark_ahead(p);
-    }
-
-    /// A device writes `v` to the armed page `p` through a raw pointer: no mark.
-    pub fn device_write_armed(&mut self, p: usize, v: u8) {
-        if !self.pages[p].armed || self.pages[p].unplugged {
-            return;
-        }
-        self.fault_in(p);
-        self.pages[p].memfd = Memfd::Present(v);
-        self.pages[p].guest_discarded = false;
-    }
-
-    /// A device writes `v` to page `p` and marks it afterwards (block I/O completion).
+    /// A device writes `v` to page `p` and marks it right after (`IoVecBufferMut` writes and
+    /// `readv` from the tap, block completions).
     pub fn device_write_then_mark(&mut self, p: usize, v: u8) {
         if self.pages[p].unplugged {
             return;
@@ -385,6 +375,43 @@ impl State {
         self.pages[p].memfd = Memfd::Present(v);
         self.pages[p].fc_marked = true;
         self.pages[p].guest_discarded = false;
+    }
+
+    /// A device writes `v` to the used ring page `p` through its `GuestMemorySliceMut`: the write
+    /// is recorded in the queue's `DirtyPages`, and reaches Firecracker's bitmap at the next
+    /// [`Self::commit_dirty`].
+    pub fn device_write_queue(&mut self, p: usize, v: u8) {
+        if self.pages[p].unplugged {
+            return;
+        }
+        self.fault_in(p);
+        self.pages[p].memfd = Memfd::Present(v);
+        self.pages[p].queue_recorded = true;
+        self.pages[p].guest_discarded = false;
+    }
+
+    /// `commit_dirty`: every queue reports the pages it recorded to Firecracker's bitmap. Run
+    /// before the dirty state is consumed, and before a queue is dropped or replaced.
+    pub fn commit_dirty(&mut self) {
+        for page in &mut self.pages {
+            page.fc_marked |= page.queue_recorded;
+            page.queue_recorded = false;
+        }
+    }
+
+    /// A queue let go of without `commit_dirty`: its record is lost. This is what the slice's
+    /// `Drop` asserts against; `forgetting_uncommitted_writes_breaks` shows why.
+    pub fn forget_uncommitted(&mut self, p: usize) {
+        self.pages[p].queue_recorded = false;
+    }
+
+    /// A write racing with a `dirty-pages` request, by whoever [`RacyWrite::writer`] says.
+    fn racy_write(&mut self, write: RacyWrite) {
+        match write.writer {
+            Writer::Guest => self.guest_write(write.page, write.value),
+            Writer::DeviceMarked => self.device_write_then_mark(write.page, write.value),
+            Writer::DeviceQueue => self.device_write_queue(write.page, write.value),
+        }
     }
 
     /// The balloon or free page reporting releases the backing page containing `p`:
@@ -453,7 +480,6 @@ impl State {
                 if s.same_backing_page(p, q) {
                     s.pages[q].kvm_marked = false;
                     s.pages[q].fc_marked = false;
-                    s.pages[q].armed = false;
                 }
             }
         };
@@ -481,7 +507,6 @@ impl State {
                 page.memfd = Memfd::Hole(HoleReads::Zero);
                 page.discarded_block = true;
                 page.guest_discarded = true;
-                page.armed = false;
                 page.unplugged = true;
             }
         }
@@ -500,8 +525,8 @@ impl State {
     }
 
     /// `snapshot_layout`: the dirty state, residency, classification and reset, with the backend
-    /// applying the result to its file. `race` injects guest writes at the two points where a
-    /// running guest can interleave.
+    /// applying the result to its file. `race` injects writes at the two points where a running
+    /// guest or a device can interleave.
     pub fn snapshot(&mut self, race: Race) -> Layout {
         self.snapshot_ordered(race, RESIDENCY_AFTER_DIRTY)
     }
@@ -510,24 +535,24 @@ impl State {
     /// record and not dirty (and every unplugged page), leave the rest. Per page, on either
     /// backing: a punched huge page the guest partially rewrote has copy pages and zero pages in
     /// the same layout, and the memfd (faulted back in whole, zero-filled where not written)
-    /// agrees with both. Both records are read and reset in turn; `race.after_dirty` is a guest
-    /// write between the two reads, `race.after_resident` one after the second. Without dirty
-    /// tracking there is no dirty record, and this is [`Self::snapshot`].
+    /// agrees with both. Both records are read and reset in turn; `race.after_dirty` is a write
+    /// between the two reads, `race.after_resident` one after the second. Without dirty tracking
+    /// there is no dirty record, and this is [`Self::snapshot`].
     pub fn snapshot_without_mincore(&mut self, race: Race) -> Layout {
         if !self.dirty_tracking {
             return self.snapshot(race);
         }
-        // 1. The dirty record: KVM's log and Firecracker's bitmap, read and reset together (a
-        //    device that marked ahead has its buffers returned first: nothing stays armed).
+        // 1. The dirty record: the queue records committed, then KVM's log and Firecracker's
+        //    bitmap, read and reset together.
+        self.commit_dirty();
         let mut dirty = [false; PAGES];
         for (page, dirty) in self.pages.iter_mut().zip(&mut dirty) {
             *dirty = page.kvm_marked || page.fc_marked;
             page.kvm_marked = false;
             page.fc_marked = false;
-            page.armed = false;
         }
-        if let Some((p, v)) = race.after_dirty {
-            self.guest_write(p, v);
+        if let Some(write) = race.after_dirty {
+            self.racy_write(write);
         }
         // 2. The discard record, read and reset.
         let mut discarded = [false; PAGES];
@@ -535,16 +560,15 @@ impl State {
             *discarded = page.discarded_block;
             page.discarded_block = false;
         }
-        if let Some((p, v)) = race.after_resident {
-            self.guest_write(p, v);
+        if let Some(write) = race.after_resident {
+            self.racy_write(write);
         }
         // 3. Classify. An unplugged slot has no KVM log to read and reads as zero: zero whole.
         let layout = Layout {
             authoritative: std::array::from_fn(|p| !self.pages[p].unplugged && dirty[p]),
             zero: std::array::from_fn(|p| self.pages[p].unplugged || (discarded[p] && !dirty[p])),
         };
-        // 4 and 5. As in `snapshot_ordered`.
-        self.arm_rings();
+        // 4. As in `snapshot_ordered`.
         if self.pending[MAX_PENDING - 1].is_some() {
             self.apply_oldest();
         }
@@ -554,6 +578,14 @@ impl State {
     }
 
     fn read_dirty(&mut self) -> [bool; PAGES] {
+        self.read_dirty_consumed(CONSUME_WITH_SWAP)
+    }
+
+    /// [`Self::read_dirty`] with the consumption of Firecracker's bitmap as a parameter: swapped
+    /// out as it is read, or read now and cleared by the caller later.
+    fn read_dirty_consumed(&mut self, swap: bool) -> [bool; PAGES] {
+        // The queues report what they wrote before anything is read.
+        self.commit_dirty();
         if !self.dirty_tracking {
             // No KVM log and no device bitmap, but the discard bitmap is kept regardless (it does
             // not need `track_dirty_pages`). So a changed page shows up only via `mincore`
@@ -566,13 +598,16 @@ impl State {
             }
             return dirty;
         }
-        // KVM's log (which resets it) ORed with Firecracker's bitmap and the discard bitmap;
-        // unplugged pages are dirty.
+        // KVM's log (which resets it) ORed with Firecracker's bitmap (swapped out, if so
+        // consumed) and the discard bitmap; unplugged pages are dirty.
         let mut dirty = [false; PAGES];
         for (page, dirty) in self.pages.iter_mut().zip(&mut dirty) {
             *dirty = page.marked() || page.unplugged;
             page.kvm_marked = false;
             page.discarded_block = false;
+            if swap {
+                page.fc_marked = false;
+            }
         }
         dirty
     }
@@ -597,11 +632,6 @@ impl State {
             authoritative: std::array::from_fn(|p| dirty[p] && resident[p] && !zero[p]),
             zero,
         };
-        for page in &mut self.pages {
-            page.fc_marked = false;
-            page.armed = false;
-        }
-        self.arm_rings();
         if self.pending[MAX_PENDING - 1].is_some() {
             self.apply_oldest();
         }
@@ -613,39 +643,50 @@ impl State {
     /// [`Self::snapshot`] with the order of the two reads as a parameter, to show that the order
     /// matters.
     pub fn snapshot_ordered(&mut self, race: Race, residency_after_dirty: bool) -> Layout {
+        self.snapshot_consumed(race, residency_after_dirty, CONSUME_WITH_SWAP)
+    }
+
+    /// [`Self::snapshot_ordered`] with the consumption of Firecracker's bitmap as a parameter
+    /// too: swapped out when read (`swap`), or read first and cleared after classifying, as a
+    /// single-threaded implementation could get away with.
+    pub fn snapshot_consumed(
+        &mut self,
+        race: Race,
+        residency_after_dirty: bool,
+        swap: bool,
+    ) -> Layout {
         // 1 and 2. The dirty state and residency, in one order or the other, with a possible
-        //    guest write in between.
+        //    write in between.
         let (dirty, resident) = if residency_after_dirty {
-            let dirty = self.read_dirty();
-            if let Some((p, v)) = race.after_dirty {
-                self.guest_write(p, v);
+            let dirty = self.read_dirty_consumed(swap);
+            if let Some(write) = race.after_dirty {
+                self.racy_write(write);
             }
             (dirty, self.read_resident())
         } else {
             let resident = self.read_resident();
-            if let Some((p, v)) = race.after_dirty {
-                self.guest_write(p, v);
+            if let Some(write) = race.after_dirty {
+                self.racy_write(write);
             }
-            (self.read_dirty(), resident)
+            (self.read_dirty_consumed(swap), resident)
         };
-        if let Some((p, v)) = race.after_resident {
-            self.guest_write(p, v);
+        if let Some(write) = race.after_resident {
+            self.racy_write(write);
         }
-        // 3. Classify and reset Firecracker's bitmap. A device that marked ahead has its
-        //    unwritten buffers returned to the guest before the reset
-        //    (`prepare_dirty_tracking_reset`, `prepare_save`): nothing stays armed.
+        // 3. Classify. (The queue records were committed by `read_dirty`, so nothing
+        //    Firecracker wrote is left unmarked; the discard record is reset there too, and so is
+        //    Firecracker's bitmap when it is swapped out; otherwise it is cleared only now, and a
+        //    mark set since it was read goes with it.)
         let layout = Layout {
             authoritative: std::array::from_fn(|p| dirty[p] && resident[p]),
             zero: std::array::from_fn(|p| dirty[p] && !resident[p]),
         };
-        for page in &mut self.pages {
-            page.fc_marked = false;
-            page.armed = false;
+        if !swap {
+            for page in &mut self.pages {
+                page.fc_marked = false;
+            }
         }
-        // (`discard_marked` is reset inside `read_dirty`, which runs before this.)
-        // 4. Virtqueue pages are marked again so that they are part of the next diff.
-        self.arm_rings();
-        // 5. The layout is handed to the backend, which applies it later (`apply_oldest`). If it
+        // 4. The layout is handed to the backend, which applies it later (`apply_oldest`). If it
         //    already holds `MAX_PENDING` layouts it applies the oldest first; the model is about
         //    order, not queue depth.
         if self.pending[MAX_PENDING - 1].is_some() {
@@ -659,25 +700,26 @@ impl State {
     /// Everything Firecracker can know about page `p` when asked for a snapshot: the dirty state,
     /// `mincore`, the device and virtio-mem bookkeeping. Not what a hole would read as: that is in
     /// the backend's snapshot file and its fault handler's history, which Firecracker never sees.
-    pub fn observable(&self, p: usize) -> (bool, bool, bool, bool, bool, bool, bool) {
+    pub fn observable(&self, p: usize) -> (bool, bool, bool, bool, bool, bool) {
         let page = &self.pages[p];
         (
             page.kvm_marked,
             page.fc_marked,
+            page.queue_recorded,
             page.discarded_block,
             page.resident(),
             page.unplugged,
-            page.armed,
-            page.ring,
         )
     }
 
     /// Firecracker's `Full` with a backend attached, which is a `Full` without one: `dump` reads
     /// every page through Firecracker's mapping, faulting in every hole (the handler serves the
-    /// base, the kernel serves zeros), and resets the dirty state. The file is Firecracker's,
+    /// base, the kernel serves zeros), and resets the dirty state (the queue records are committed
+    /// first, as for a `Diff`). The file is Firecracker's,
     /// not the backend's; the model writes it to `file` to ask what the backend may still do with
     /// the responses it has not applied (`keep_pending`).
     pub fn firecracker_full(&mut self, keep_pending: bool) {
+        self.commit_dirty();
         for p in 0..PAGES {
             if !self.pages[p].unplugged {
                 self.fault_in(p);
@@ -689,9 +731,7 @@ impl State {
             page.fc_marked = false;
             page.discarded_block = false;
             page.guest_discarded = false;
-            page.armed = false;
         }
-        self.arm_rings();
         if !keep_pending {
             self.pending = [None; MAX_PENDING];
         }
@@ -881,8 +921,8 @@ impl State {
     }
 
     /// `L`: a marked hole reads as zero (a marked page is in the memfd or zero: the property
-    /// Firecracker promises the backend); an armed page is marked; an unplugged page is a zero
-    /// hole and not armed (unplugging discards the slot and nothing writes it afterwards); a
+    /// Firecracker promises the backend); an unplugged page is a zero hole (unplugging discards
+    /// the slot and nothing writes it afterwards); a
     /// page a pending layout classifies is not a base hole (it was resident or a zero hole when
     /// classified, and only a discard or an unplug makes a hole of it afterwards, a zero one);
     /// and `D`: a page in the discard record that no write marked since reads as zero (it was
@@ -892,10 +932,13 @@ impl State {
         (0..PAGES).all(|p| {
             let page = &self.pages[p];
             (page.resident() || !page.marked() || page.memfd == Memfd::Hole(HoleReads::Zero))
-                && (!page.armed || page.fc_marked)
-                && (!page.unplugged || (page.memfd == Memfd::Hole(HoleReads::Zero) && !page.armed))
+                && (!page.unplugged || page.memfd == Memfd::Hole(HoleReads::Zero))
                 && (!self.pending_covers(p) || page.memfd != Memfd::Hole(HoleReads::Base))
-                && (!page.discarded_block || page.kvm_marked || page.fc_marked || page.guest() == 0)
+                && (!page.discarded_block
+                    || page.kvm_marked
+                    || page.fc_marked
+                    || page.queue_recorded
+                    || page.guest() == 0)
         }) && self.backing_pages_are_uniform()
     }
 
@@ -992,8 +1035,7 @@ mod verification {
             fc_marked: kani::any(),
             discarded_block: kani::any(),
             guest_discarded: kani::any(),
-            armed: kani::any(),
-            ring: kani::any(),
+            queue_recorded: kani::any(),
             unplugged: kani::any(),
         }
     }
@@ -1040,18 +1082,26 @@ mod verification {
         p
     }
 
+    fn any_racy_write() -> Option<RacyWrite> {
+        if !kani::any::<bool>() {
+            return None;
+        }
+        let writer = match kani::any::<u8>() % 3 {
+            0 => Writer::Guest,
+            1 => Writer::DeviceMarked,
+            _ => Writer::DeviceQueue,
+        };
+        Some(RacyWrite {
+            writer,
+            page: any_index(),
+            value: kani::any(),
+        })
+    }
+
     fn any_race() -> Race {
         Race {
-            after_dirty: if kani::any() {
-                Some((any_index(), kani::any()))
-            } else {
-                None
-            },
-            after_resident: if kani::any() {
-                Some((any_index(), kani::any()))
-            } else {
-                None
-            },
+            after_dirty: any_racy_write(),
+            after_resident: any_racy_write(),
         }
     }
 
@@ -1060,8 +1110,8 @@ mod verification {
         let p = any_index();
         match kani::any::<u8>() % 13 {
             0 => s.guest_write(p, kani::any()),
-            1 => s.device_mark_ahead(p),
-            2 => s.device_write_armed(p, kani::any()),
+            1 => s.device_write_queue(p, kani::any()),
+            2 => s.commit_dirty(),
             3 => s.device_write_then_mark(p, kani::any()),
             4 => s.discard(p),
             5 => s.discard_edge(p),
@@ -1084,11 +1134,10 @@ mod verification {
     /// Base case: both initial states satisfy `I ∧ L`, for either backing page size.
     #[kani::proof]
     fn initial_states_satisfy_invariant() {
-        let ring: [bool; PAGES] = kani::any();
         let huge: bool = kani::any();
-        let s = State::restored(kani::any(), ring, huge);
+        let s = State::restored(kani::any(), huge);
         assert!(s.invariant() && s.lemma());
-        let s = State::booted(ring, huge);
+        let s = State::booted(huge);
         assert!(s.invariant() && s.lemma());
     }
 
@@ -1217,7 +1266,7 @@ mod verification {
     #[kani::unwind(5)]
     #[kani::should_panic]
     fn chunked_zero_fill_breaks() {
-        let mut s = State::booted([false; PAGES], true);
+        let mut s = State::booted(true);
         s.guest_write(0, kani::any());
         s.snapshot(Race::default());
         s.apply_all();
@@ -1240,7 +1289,7 @@ mod verification {
     fn recording_edges_as_discards_breaks_without_mincore() {
         let base: [u8; PAGES] = kani::any();
         kani::assume(base[0] != 0);
-        let mut s = State::restored(base, [false; PAGES], true);
+        let mut s = State::restored(base, true);
         for p in 0..PAGES {
             s.pages[p].file = s.pages[p].base;
         }
@@ -1313,7 +1362,7 @@ mod verification {
     fn dirty_tracking_off_without_discard_bitmap_breaks_after_discard() {
         let base: [u8; PAGES] = kani::any();
         kani::assume(base[0] != 0);
-        let mut s = State::restored(base, [false; PAGES], false);
+        let mut s = State::restored(base, false);
         s.dirty_tracking = false;
         for p in 0..PAGES {
             s.pages[p].file = s.pages[p].base;
@@ -1337,7 +1386,7 @@ mod verification {
     #[kani::unwind(5)]
     fn dirty_tracking_off_with_discard_bitmap_is_correct() {
         let base: [u8; PAGES] = kani::any();
-        let mut s = State::restored(base, kani::any(), kani::any());
+        let mut s = State::restored(base, kani::any());
         s.dirty_tracking = false;
         for p in 0..PAGES {
             s.pages[p].file = s.pages[p].base;
@@ -1346,8 +1395,8 @@ mod verification {
             let p = any_index();
             match kani::any::<u8>() % 5 {
                 0 => s.guest_write(p, kani::any()),
-                1 => s.device_mark_ahead(p),
-                2 => s.device_write_armed(p, kani::any()),
+                1 => s.device_write_queue(p, kani::any()),
+                2 => s.device_write_then_mark(p, kani::any()),
                 3 => s.discard(p),
                 _ => s.unplug(p),
             }
@@ -1368,7 +1417,7 @@ mod verification {
     #[kani::unwind(5)]
     fn hugetlbfs_two_bitmaps_classification_is_correct() {
         let base: [u8; PAGES] = kani::any();
-        let mut s = State::restored(base, kani::any(), true);
+        let mut s = State::restored(base, true);
         s.dirty_tracking = kani::any();
         for p in 0..PAGES {
             s.pages[p].file = s.pages[p].base;
@@ -1377,8 +1426,8 @@ mod verification {
             let p = any_index();
             match kani::any::<u8>() % 6 {
                 0 => s.guest_write(p, kani::any()),
-                1 => s.device_mark_ahead(p),
-                2 => s.device_write_armed(p, kani::any()),
+                1 => s.device_write_queue(p, kani::any()),
+                2 => s.device_write_then_mark(p, kani::any()),
                 3 => s.discard(p),
                 4 => s.unplug(p),
                 _ => s.plug(p),
@@ -1401,7 +1450,7 @@ mod verification {
     #[kani::unwind(5)]
     fn hugetlbfs_zeroing_whole_discarded_block_is_also_correct() {
         let base: [u8; PAGES] = kani::any();
-        let mut s = State::restored(base, kani::any(), true);
+        let mut s = State::restored(base, true);
         s.dirty_tracking = kani::any();
         for p in 0..PAGES {
             s.pages[p].file = s.pages[p].base;
@@ -1410,7 +1459,7 @@ mod verification {
             let p = any_index();
             match kani::any::<u8>() % 5 {
                 0 => s.guest_write(p, kani::any()),
-                1 => s.device_write_armed(p, kani::any()),
+                1 => s.device_write_queue(p, kani::any()),
                 2 => s.discard(p),
                 3 => s.unplug(p),
                 _ => s.plug(p),
@@ -1432,7 +1481,7 @@ mod verification {
     #[kani::unwind(5)]
     fn keeping_discarded_content_is_invisible_to_the_guest() {
         let base: [u8; PAGES] = kani::any();
-        let mut s = State::restored(base, kani::any(), kani::any());
+        let mut s = State::restored(base, kani::any());
         s.dirty_tracking = kani::any();
         for p in 0..PAGES {
             s.pages[p].file = s.pages[p].base;
@@ -1441,8 +1490,8 @@ mod verification {
             let p = any_index();
             match kani::any::<u8>() % 6 {
                 0 => s.guest_write(p, kani::any()),
-                1 => s.device_mark_ahead(p),
-                2 => s.device_write_armed(p, kani::any()),
+                1 => s.device_write_queue(p, kani::any()),
+                2 => s.device_write_then_mark(p, kani::any()),
                 3 => s.discard(p),
                 4 => s.unplug(p),
                 _ => s.plug(p),
@@ -1462,7 +1511,7 @@ mod verification {
     #[kani::should_panic]
     fn keeping_discarded_content_differs_from_guest_memory() {
         let base: [u8; PAGES] = kani::any();
-        let mut s = State::restored(base, [false; PAGES], false);
+        let mut s = State::restored(base, false);
         for p in 0..PAGES {
             s.pages[p].file = s.pages[p].base;
         }
@@ -1502,10 +1551,9 @@ mod verification {
     #[kani::unwind(5)]
     fn firecracker_cannot_tell_base_holes_from_zero_holes() {
         let base: [u8; PAGES] = kani::any();
-        let ring: [bool; PAGES] = kani::any();
-        kani::assume(base[0] != 0 && !ring[0]);
-        let a = State::restored(base, ring, false);
-        let mut b = State::restored(base, ring, false);
+        kani::assume(base[0] != 0);
+        let a = State::restored(base, false);
+        let mut b = State::restored(base, false);
         b.guest_write(0, kani::any());
         b.discard(0);
         b.snapshot(Race::default());
@@ -1579,19 +1627,18 @@ mod verification {
         assert!(s.invariant());
     }
 
-    /// Without faulting in on mark-ahead, a restored virtqueue page that was marked but not yet
-    /// written is a marked base hole: classified zero, while the guest reads the base.
+    /// A queue let go of without `commit_dirty` loses the record of a used ring write: the file
+    /// is wrong on that page and nothing marks it any more.
     #[kani::proof]
     #[kani::unwind(5)]
     #[kani::should_panic]
-    fn without_fault_in_on_mark_the_invariant_breaks() {
+    fn forgetting_uncommitted_writes_breaks() {
         let mut s = any_state();
         let p = any_index();
-        // The buggy operation, inlined: mark ahead without faulting in.
         kani::assume(!s.pages[p].unplugged);
-        s.pages[p].fc_marked = true;
-        s.pages[p].armed = true;
-        assert!(s.lemma());
+        s.device_write_queue(p, kani::any());
+        s.forget_uncommitted(p);
+        assert!(s.invariant());
     }
 
     /// Without zero-writing the unpunchable edges, a partially covered huge page is marked but
@@ -1616,10 +1663,36 @@ mod verification {
     fn without_residency_after_dirty_the_invariant_breaks() {
         let mut s = any_state();
         let race = Race {
-            after_dirty: Some((any_index(), kani::any())),
+            after_dirty: Some(RacyWrite {
+                writer: Writer::Guest,
+                page: any_index(),
+                value: kani::any(),
+            }),
             after_resident: None,
         };
         s.snapshot_ordered(race, false);
+        assert!(s.invariant());
+    }
+
+    /// Reading Firecracker's bitmap first and clearing it after classifying is only sound while
+    /// no device can write in between. A device write (marked, or recorded and committed by a
+    /// later request) landing between the read and the clear is wiped with the clear: in neither
+    /// this set nor the next, and the page is unmarked. The swap (`get_and_reset`) is what makes
+    /// device writes at the race points harmless, as `operations_preserve_invariant` proves.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    #[kani::should_panic]
+    fn without_swap_a_racing_device_write_is_lost() {
+        let mut s = any_state();
+        let race = Race {
+            after_dirty: Some(RacyWrite {
+                writer: Writer::DeviceMarked,
+                page: any_index(),
+                value: kani::any(),
+            }),
+            after_resident: None,
+        };
+        s.snapshot_consumed(race, true, false);
         assert!(s.invariant());
     }
 }
@@ -1644,15 +1717,27 @@ mod tests {
         fn byte(&mut self) -> u8 {
             (self.next() & 0xff) as u8
         }
-        fn bools(&mut self) -> [bool; PAGES] {
-            std::array::from_fn(|_| self.next() & 1 == 1)
+        fn racy_write(&mut self) -> Option<RacyWrite> {
+            if self.next() & 1 == 0 {
+                return None;
+            }
+            let writer = match self.next() % 3 {
+                0 => Writer::Guest,
+                1 => Writer::DeviceMarked,
+                _ => Writer::DeviceQueue,
+            };
+            Some(RacyWrite {
+                writer,
+                page: self.page(),
+                value: self.byte(),
+            })
         }
         fn step(&mut self, s: &mut State) {
             let p = self.page();
             match self.next() % 12 {
                 0 => s.guest_write(p, self.byte()),
-                1 => s.device_mark_ahead(p),
-                2 => s.device_write_armed(p, self.byte()),
+                1 => s.device_write_queue(p, self.byte()),
+                2 => s.commit_dirty(),
                 3 => s.device_write_then_mark(p, self.byte()),
                 4 => s.discard(p),
                 5 => s.discard_edge(p),
@@ -1664,8 +1749,8 @@ mod tests {
                 9 => s.discard_clearing_marks(p, (self.next() & 1 == 1).then(|| self.byte()), true),
                 kind => {
                     let race = Race {
-                        after_dirty: (self.next() & 1 == 1).then(|| (self.page(), self.byte())),
-                        after_resident: (self.next() & 1 == 1).then(|| (self.page(), self.byte())),
+                        after_dirty: self.racy_write(),
+                        after_resident: self.racy_write(),
                     };
                     if kind == 10 {
                         s.snapshot_without_mincore(race);
@@ -1684,12 +1769,11 @@ mod tests {
     fn test_random_walks_keep_file_consistent() {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
         for round in 0..2000 {
-            let ring = rng.bools();
             let huge = round % 4 >= 2;
             let mut s = if round % 2 == 0 {
-                State::restored(std::array::from_fn(|_| rng.byte()), ring, huge)
+                State::restored(std::array::from_fn(|_| rng.byte()), huge)
             } else {
-                State::booted(ring, huge)
+                State::booted(huge)
             };
             assert!(s.invariant() && s.lemma());
             for _ in 0..(rng.next() % 12) {
@@ -1717,7 +1801,7 @@ mod tests {
     /// zeroes the neighbour; recorded as a write, it does not.
     #[test]
     fn test_edge_recording_without_mincore() {
-        let mut s = State::restored([9; PAGES], [false; PAGES], true);
+        let mut s = State::restored([9; PAGES], true);
         for p in 0..PAGES {
             s.pages[p].file = s.pages[p].base;
         }
@@ -1729,7 +1813,7 @@ mod tests {
         s.apply_all();
         assert!(!s.file_matches_guest());
 
-        let mut s = State::restored([9; PAGES], [false; PAGES], true);
+        let mut s = State::restored([9; PAGES], true);
         for p in 0..PAGES {
             s.pages[p].file = s.pages[p].base;
         }
@@ -1742,30 +1826,27 @@ mod tests {
         assert_eq!(s.pages[0].file, 9);
     }
 
-    /// The two bugs the model encodes, reproduced on the scenarios that found them.
+    /// The bugs the model encodes, reproduced on the scenarios that found them.
     #[test]
-    fn test_known_bugs_are_caught_by_the_lemma() {
-        // A restored virtqueue page: marked at activation, not written before the snapshot.
-        let mut s = State::restored([7; PAGES], [false; PAGES], false);
-        s.pages[0].fc_marked = true; // mark without the fault-in
-        assert!(!s.lemma());
-        // What the layout would have done: the page is a dirty hole, so "zero".
-        let mut buggy = s;
-        buggy.pages[0].file = 0;
-        assert_ne!(buggy.pages[0].file, buggy.pages[0].guest());
-        // With the fault-in, the mark is safe.
-        let mut s = State::restored([7; PAGES], [false; PAGES], false);
-        s.device_mark_ahead(0);
-        assert!(s.lemma());
+    fn test_known_bugs_are_caught() {
+        // A used ring page written and its queue let go of without `commit_dirty`: the file is
+        // wrong and nothing records it. Committed, the write is in the next layout.
+        let mut s = State::restored([7; PAGES], false);
+        s.device_write_queue(0, 3);
+        assert!(s.invariant() && s.lemma());
+        s.forget_uncommitted(0);
+        assert!(!s.invariant());
+        let mut s = State::restored([7; PAGES], false);
+        s.device_write_queue(0, 3);
         s.snapshot(Race::default());
         s.apply_all();
         assert!(s.file_matches_guest());
 
         // A partial hugetlbfs discard on a never-populated restored page.
-        let mut s = State::restored([9; PAGES], [false; PAGES], true);
+        let mut s = State::restored([9; PAGES], true);
         s.pages[1].fc_marked = true; // marked though neither punched nor zero-written
         assert!(!s.lemma());
-        let mut s = State::restored([9; PAGES], [false; PAGES], true);
+        let mut s = State::restored([9; PAGES], true);
         s.discard_edge(1);
         assert!(s.lemma());
         assert_eq!(s.pages[1].guest(), 0);
@@ -1783,7 +1864,7 @@ mod tests {
             let discarded: [bool; PAGES] = std::array::from_fn(|p| bits >> (PAGES + p) & 1 == 1);
             let unplugged: [bool; PAGES] =
                 std::array::from_fn(|p| bits >> (2 * PAGES + p) & 1 == 1);
-            let mut s = State::booted([false; PAGES], false);
+            let mut s = State::booted(false);
             for p in 0..PAGES {
                 s.pages[p].kvm_marked = dirty[p];
                 s.pages[p].discarded_block = discarded[p];

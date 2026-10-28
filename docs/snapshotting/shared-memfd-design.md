@@ -46,17 +46,28 @@ it constitute a snapshot. Copying bytes is the peer's job.
 - `create_snapshot` (`src/vmm/src/persist.rs`) runs, in order: `save_state`
   (every device's `prepare_save`; virtio-block drains in-flight io_uring
   requests and `fsync`s, virtio-net returns parsed-but-unfilled RX buffers to
-  the queue so they are parsed and marked again later), vmstate to file, then
-  `snapshot_memory_to_file`. For `Diff` that is `KvmVm::get_dirty_bitmap`
-  (`KVM_GET_DIRTY_LOG`, which clears KVM's log; `mincore` when
-  `track_dirty_pages` is off) followed by `dump_dirty`, which writes every page
-  dirty in either the KVM bitmap or Firecracker's own `AtomicBitmap` (device
-  writes) at host-page (4 KiB) granularity and resets Firecracker's bitmap; on
-  failure the KVM bitmap is folded back (`store_dirty_bitmap`) so no dirty
-  information is lost. For `Full` it is `dump` followed by a reset of both
-  bitmaps. Last, `mark_virtio_queue_memory_dirty` marks every activated device's
-  queue pages dirty so that they are part of the *next* diff, because queue
-  accesses at runtime do not go through the bitmap.
+  the queue so they are parsed again after restore), vmstate to file,
+  `DeviceManager::commit_dirty` (below), then `snapshot_memory_to_file`. For
+  `Diff` that is `KvmVm::get_dirty_bitmap` (`KVM_GET_DIRTY_LOG`, which clears
+  KVM's log; `mincore` when `track_dirty_pages` is off) followed by
+  `dump_dirty`, which writes every page dirty in either the KVM bitmap or
+  Firecracker's own `AtomicBitmap` (device writes) at host-page (4 KiB)
+  granularity and resets Firecracker's bitmap; on failure the KVM bitmap is
+  folded back (`store_dirty_bitmap`) so no dirty information is lost. For `Full`
+  it is `dump` followed by a reset of both bitmaps.
+- **Firecracker marks a page dirty only after writing it.** `IoVecBufferMut`
+  marks the bytes a write or a tap `readv` filled, right after the call returns
+  (`mark_dirty_host`, from the `iovec`s' host addresses); the block engines mark
+  the prefix a read actually filled; `discard_range` marks what it punched. The
+  one indirection is the virtqueue used ring: it is written through a
+  `GuestMemorySliceMut`, which records the pages it wrote in a per-queue
+  `DirtyPages` word instead of touching the shared bitmap on every element (the
+  bitmap words of all the queues in a VM share a cache line), and
+  `DeviceManager::commit_dirty` folds those records into the bitmap before every
+  consumption of the dirty state, before a queue is replaced or dropped, and
+  when the `Vmm` is dropped. A tracked slice dropped with uncommitted pages is a
+  bug and panics. Nothing is marked ahead of a write, and resolving a slice
+  marks nothing.
 - **`Paused` freezes the whole VMM, not just the vCPUs.** `Vmm::pause_vm` only
   parks the vCPU threads, but in the `firecracker` binary
   `ApiServerAdapter::handle_request`
@@ -496,8 +507,8 @@ Procedure, on the VMM thread, inside the API loop (for the pre-copy step
 1. for the finalize step, `save_state` and write vmstate to `snapshot_path`
    (this runs `prepare_save`: block drain, net RX buffer reset) — first, so a
    failure consumes no tracking state;
-1. `prepare_dirty_tracking_reset` (return device-marked, unwritten RX buffers
-   before the dirty state is read), for the running-guest case;
+1. `DeviceManager::commit_dirty`: every queue reports the used ring pages it
+   wrote since the last commit to Firecracker's bitmap;
 1. read the dirty state: `KVM_GET_DIRTY_LOG` per plugged slot, immediately
    followed by `KVM_CLEAR_DIRTY_LOG` of what was read (or `mincore`, when
    tracking is off), ORed a word at a time with Firecracker's bitmap, taken
@@ -507,40 +518,34 @@ Procedure, on the VMM thread, inside the API loop (for the pre-copy step
    dirty runs of every plugged slot and classify
    (`SnapshotMemoryLayout::classify`: `dirty & resident`, `dirty - resident`);
    both `optimize()` to pick run containers; then clear the discard record;
-1. `mark_virtio_queue_memory_dirty`, as today, so queue pages are in the next
-   diff;
 1. serialise: Roaring portable format then base64 per set, and return the body.
 
 #### Reading and resetting the dirty state without losing a mark
 
-There is no atomic read-and-reset step, and none is needed, because the two
-sources of marks are consumed in two different ways that each cannot lose a
-write; this is also exactly how `dump_dirty` has always consumed them.
+There is no single atomic read-and-reset of "the dirty state", and none is
+needed, because each source of marks is consumed in a way that cannot lose a
+write; this is also how `dump_dirty` consumes them.
 
 - *KVM's log* is read with `KVM_GET_DIRTY_LOG`, which the kernel implements as
   an atomic fetch-and-clear per slot. vCPUs run concurrently with a
   `dirty-pages` request; a page written after the fetch is in the next log.
   Nothing on Firecracker's side resets this log separately for a `Diff`.
 
-- *Firecracker's `AtomicBitmap`* is read in step 4 and cleared in step 6, which
-  is not atomic. It does not need to be, because every writer of that bitmap
-  runs on the VMM thread, the thread that is executing the request: block I/O
-  completions (`mark_dirty_mem_and_unwrap`), virtio-net RX buffer parsing
-  (`IoVecBufferMut`), balloon and virtio-mem discards (`discard_range`), and
-  `mark_virtio_queue_memory_dirty` itself. An API request is handled between two
-  iterations of the event loop, so no device handler can interleave with steps
-  4–6. The guest can only make KVM's log dirty, never this bitmap.
+- *Firecracker's `AtomicBitmap`* is consumed with `get_and_reset`, a per-word
+  atomic exchange: a mark set after the exchange belongs to the next set,
+  exactly as with KVM's log. Every mark in it follows the write it records
+  (block completions, `IoVecBufferMut` writes and tap reads via
+  `mark_dirty_host`, `discard_range`, the queue commits), so "mark at t₁,
+  consume at t₂, write at t₃" cannot happen: a write either landed before its
+  mark was taken, and is in this set, or its mark lands after, and it is in the
+  next one. The guest can only make KVM's log dirty, never this bitmap.
 
-  The one writer that is not on the VMM thread is device activation: a vCPU
-  thread handling the guest's `DRIVER_OK` write calls `Queue::initialize`, which
-  marks (and faults in) the rings, while holding the device's mutex, and sets
-  the device activated before releasing it. If that lands between steps 4 and 6
-  the marks are cleared, but step 7 locks each device in turn and re-marks the
-  rings of every device that is activated at that moment, so it either waits for
-  the activation to finish and re-marks, or runs before it and leaves the
-  activation's own marks intact. The same race exists for `dump_dirty` today and
-  is closed the same way; the model in `snapshot_layout_model.rs` has it as
-  "rings are re-armed after every consumption".
+- *The queue records* (the `DirtyPages` of each used ring's
+  `GuestMemorySliceMut`) are per queue and updated only by the thread that owns
+  the queue; step 3 folds them into the bitmap under each device's lock before
+  step 4 takes the bitmap. A used ring element written after its queue was
+  committed is in that queue's record and reaches the bitmap at the next commit,
+  that is, the next set.
 
 What *is* racy with a running guest is the guest's own writes between reading
 KVM's log and reading `mincore`, and between `mincore` and the reset, which is
@@ -552,36 +557,16 @@ interleavings.
 
 #### What changes when device I/O leaves the VMM thread
 
-The argument above leans on one fact about today's Firecracker: every writer of
-Firecracker's dirty bitmap runs on the thread that consumes it. Moving device
-emulation to I/O threads removes that fact, and the design has to stop relying
-on it rather than re-derive it per device. Four changes, in order of weight:
+An earlier revision of this design leaned on every writer of Firecracker's dirty
+bitmap running on the thread that consumes it, and listed four changes needed
+before device emulation could move to I/O threads. Three of them are now how
+Firecracker works, with or without a backend, and are described above:
+Firecracker's bitmap is consumed with an atomic swap (this branch); every write
+is marked after it lands, never only before, so there is no "return the parsed
+RX buffers before the reset" hook and no fault-in on mark any more (a page
+marked after a write is resident); and the used ring records its own writes and
+commits them (both on `main`). The one that remains:
 
-1. **Consume Firecracker's bitmap with an atomic swap.** `AtomicBitmap` already
-   has `get_and_reset()` (a per-word atomic exchange). Step 4 becomes "swap each
-   region's bitmap out and build the dirty set from the swapped words", and step
-   6 disappears: a mark set after the swap belongs to the next set, exactly as
-   with `KVM_GET_DIRTY_LOG`. The fold-back on error (`store_dirty_bitmap`) must
-   then OR back both KVM's words and the swapped words. `dump_dirty` has the
-   same read-then-reset and should get the same change.
-1. **Mark after writing, never only before.** With a swap, "mark at t₁, consume
-   at t₂, write at t₃" loses the write for good, and with a net I/O thread an RX
-   buffer can be parsed between `prepare_dirty_tracking_reset` and the swap and
-   filled afterwards. The fix is for `IoVecBufferMut` to mark the written range
-   after the tap read (it holds the slices; this costs nothing). That makes the
-   invariant a local property of each write with no ordering argument, makes
-   `prepare_dirty_tracking_reset` unnecessary, and makes `fault_in_marked_range`
-   unnecessary for RX buffers (a page marked after a write is resident). The
-   same change is an improvement to the single-threaded code and should not wait
-   for I/O threads.
-1. **Virtqueue rings.** The used ring is written through a raw pointer without a
-   mark; the re-mark of every activated device's rings after each consumption
-   covers it, with or without I/O threads, because the re-mark is unconditional
-   and happens after the swap. The fault-in at activation stays necessary (the
-   `should_panic` harness in `snapshot_layout_model.rs` shows what breaks
-   without it). The cleaner end state is for `Queue::add_used` to mark after
-   writing, after which rings are ordinary pages and both the re-mark and the
-   activation race described above go away.
 1. **Make the pause invariant explicit.** `Paused` today means "vCPUs stopped
    and the VMM thread parked in the paused API loop", which is what lets the
    backend copy after `snapshot/create` with nothing writing guest memory. With
@@ -596,47 +581,44 @@ on it rather than re-derive it per device. Four changes, in order of weight:
 Discards are already in the right shape (`discard_range` punches, then marks:
 after the swap the mark lands in the next set, which zeroes the page; before it,
 the page is a dirty hole in this set), and the `mincore`-after-dirty rule is
-unaffected. The Kani model should gain device operations at the race points
-(today only guest writes race), consumption as a swap, and the two variants of
-item 2; the expectation is that mark-after-write proves and mark-ahead with a
-concurrent device does not, which would be the formal reason for the change.
+unaffected. The Kani model already lets device writes, marked or queue-recorded,
+race with the request at the same two points as guest writes (`Race`), and the
+proof goes through: every write marks after it lands and the bitmap is swapped
+out when read, so a mark set during the request is in the next set.
+`without_swap_a_racing_device_write_is_lost` shows the read-then-clear
+consumption breaking under the same race, which is the formal reason for the
+swap.
 
 #### Invariant: dirty ⇒ memfd authoritative or zero
 
 The two-bitmap format only works if a dirty page's content is never somewhere
-else than the memfd. Everything that marks a page dirty *after* writing it
-satisfies that trivially: KVM's log, block completions
-(`mark_dirty_mem_and_unwrap`), `discard_range`. Two paths mark *before* writing,
-because the write happens through a raw pointer that has lost its `vm-memory`
-context: `GuestMemorySlice::new` (virtqueue rings, at activation and at every
-`mark_virtio_queue_memory_dirty`) and `IoVecBufferMut::load_descriptor_chain`
-(virtio-net RX buffers, marked when parsed, filled when a frame arrives). After
-a UFFD restore such a page can be marked while still a hole in the memfd, its
-content only in the backend's snapshot file; it would be reported
-`dirty ∧ ¬resident`, "zero", and the backend would zero a page the guest sees as
-content. This was the case the first version of the design worked around by
-making the backend track what it had populated (§14).
+else than the memfd. Every path that marks a page dirty marks it *after* writing
+it: KVM's log on the fault, block completions, `IoVecBufferMut` right after the
+write or the tap `readv` (`mark_dirty_host`), `discard_range` after the punch,
+the used ring's `DirtyPages` record after each element. A page marked after a
+write is resident, with the written content, so the invariant is a local
+property of each write and needs no ordering argument.
 
-Both paths now fault the range in right after marking it
-(`fault_in_marked_range`: one volatile read per page). Through a UFFD mapping
-that brings the snapshot content into the memfd; on a booted microVM it maps a
-zero page for never-touched memory and is a plain load otherwise; on hugetlbfs
-it installs Firecracker's huge PTE, which is what `mincore` reports there. The
-cost is bounded by the ring sizes plus the RX buffers in flight, a few dozen
-pages per device. The RX case is not a race: the tap write happens strictly
-after the parse, so at the time of the read the page is either already the
-guest's content or a hole that must become content before it is written. A unit
-test punches a range, marks it through `GuestMemorySlice::new`, and checks
-`mincore` reports it resident (`test_fault_in_marked_range`).
+It was not always so. Until recently two paths marked *before* writing, because
+the write happened through a raw pointer that had lost its `vm-memory` context:
+`GuestMemorySlice::new` marked the virtqueue rings at activation and after every
+snapshot, and `IoVecBufferMut` marked a whole RX descriptor chain when it parsed
+it, before any frame was written into it. After a UFFD restore such a page could
+be marked while still a hole in the memfd, its content only in the backend's
+snapshot file; it would be reported `dirty ∧ ¬resident`, "zero", and the backend
+would zero a page the guest sees as content. The first version of this design
+worked around it by making the backend track what it had populated (§14), a
+later one by faulting the range in right after marking it. Marking after the
+write removed both the hazard and the workaround.
 
 Two more properties the comment on the tracking task lists, and where they hold:
 
 - *A write is eventually marked dirty, or its page is permanently dirty.* KVM
-  marks on the fault after each reset; block marks on completion; the RX buffer
-  is marked at parse time and re-marked after a reset by
-  `prepare_dirty_tracking_reset` (§8); the rings are re-marked after every
-  consumption by `mark_virtio_queue_memory_dirty`. Nothing writes guest memory
-  outside those paths except vhost-user backends (the pre-existing gap).
+  marks on the fault after each reset; block marks on completion;
+  `IoVecBufferMut` marks after each write; the used ring records each element
+  and `commit_dirty` folds the record into the bitmap before every consumption
+  (a slice dropped with an uncommitted record panics). Nothing writes guest
+  memory outside those paths except vhost-user backends (the pre-existing gap).
 - *`mincore` is taken after the dirty bitmaps.* A page written between the two
   reads is dirty in the next set and resident now: reported authoritative
   (correct, the memfd holds it) rather than zero. The other order could report a
@@ -873,17 +855,13 @@ added later.
 Semantics:
 
 - Callable in `Running` or `Paused`. Consuming: the same computation as steps
-  4–6 of §7, followed by `mark_virtio_queue_memory_dirty`.
-- Before resetting, Firecracker calls a new
-  `VirtioDevice::prepare_dirty_tracking_reset` hook on every activated device.
-  virtio-net marks RX buffers dirty when it *parses* them
-  (`IoVecBufferMut::load_descriptor_chain`), not when a frame is later written
-  into them; a buffer parsed before a reset and filled after it would otherwise
-  never show up in a later set. The hook does for virtio-net what `prepare_save`
-  does (return parsed, unfilled descriptors to the queue) without the
-  snapshot-only side effects of `prepare_save` on other devices (vsock
-  connection reset, block drain and `fsync`). Any future device that marks
-  memory dirty ahead of writing must implement it.
+  3–5 of §7 (commit the queue records, read and reset the dirty state,
+  classify).
+- Needs no device hook. Every write Firecracker makes to guest memory is marked
+  after it lands (§7, "Invariant"), so a buffer parsed before a reset and filled
+  after it is simply in the next set. (An earlier revision returned the parsed
+  RX buffers to the queue before the reset, because virtio-net then marked them
+  when it parsed them.)
 - Gives no atomicity with respect to concurrent guest or device writes: a page
   can be modified after the set was computed and before the peer copies it. It
   is then dirty again and will be in the next set. This is the intended use:
@@ -1235,8 +1213,10 @@ implementations are driven from identical inputs:
   backend attached or not (`snapshot/create` is unchanged), checked before
   anything is written
   (`persist::tests::test_create_snapshot_params_validation`).
-- The invariant: marking a range through `GuestMemorySlice::new` faults it in
-  (`test_fault_in_marked_range`).
+- The invariant: a used ring write is recorded by its queue and reaches the
+  bitmap at `commit_dirty`, which `create_snapshot` and `dirty_pages` run first
+  (`memory_slice::tests::test_guest_memory_slice_mut_dirty_tracking`,
+  `test_dirty_pages_after_full_snapshot`).
 - The memfd offset of every region equals the offset `dump` writes it at, with
   and without a hotplug region.
 
@@ -1270,8 +1250,8 @@ finalizing `snapshot/create Backend` at `t1`; `rebase` is the existing
    rebased result restores with a healthy guest. (`test_diff_chain_restores`)
 1. Pre-copy: while running a workload, issue several `snapshot/dirty-pages`
    requests and copy each set; pause; a finalizing `snapshot/create Backend`;
-   copy. The result must equal a `Full` taken right after. Exercises the
-   `prepare_dirty_tracking_reset` hook under ssh traffic.
+   copy. The result must equal a `Full` taken right after. Exercises
+   mark-after-write of the RX buffers under ssh traffic.
    (`test_precopy_dirty_pages`, `test_dirty_pages_are_consumed`)
 1. Pause invariant: pause a VM with a backend, take `M_full`, inject tap traffic
    (ssh connection attempts) for a few seconds, take another `M_full` while
@@ -1373,21 +1353,20 @@ user can see.
 1. *(no API)* Dirty marking of discards: `discard_range` marks the whole range
    after freeing and zero-writing it (the discard mechanics themselves landed on
    `main` in #6237); unit tests for the marks on memfd and hugetlbfs memfd.
-1. *(no API)* Fault-in on mark-ahead: `fault_in_marked_range` after
-   `GuestMemorySlice::new` and in `IoVecBufferMut::append_descriptor_chain`;
-   unit test. (Superseded for RX buffers by the first item of the next list.)
 1. *(no API)* Layout computation: `GuestMemorySlot::for_each_dirty_batch` as the
    single definition of "which pages a diff contains", shared with `dump_dirty`;
    `mincore_resident`; `SnapshotMemoryLayout::classify` as the single definition
    of the three classes; the Roaring serde adapter; property-style identity
    tests against `dump_dirty` over random bitmaps and residency, including
    fold-back on error; the `roaring` dependency.
-1. *(no API)* The Kani model `vstate/snapshot_layout_model.rs`: twenty-three
-   harnesses (base case, inductive step, paused and racy-then-paused
-   correctness, three rule checks, three backend-misuse checks, chunked
-   application on hugetlbfs, the five `Full` results above, the four
-   dirty-tracking / two-bitmap results, and the two discard-keep-old results),
-   over 4 KiB and huge-page backing, run by `test_kani.py`.
+1. *(no API)* The Kani model `vstate/snapshot_layout_model.rs`: thirty-two
+   harnesses (base case, inductive step, paused and racy-then-paused correctness
+   in both classifications with guest and device writes at the race points, the
+   rule checks including the uncommitted queue record and the read-then-clear
+   consumption, the backend-misuse checks, chunked application on hugetlbfs, the
+   `Full` results above, the dirty-tracking / two-bitmap results, the
+   discard-record results and the discard-keep-old results), over 4 KiB and
+   huge-page backing, run by `test_kani.py`.
 1. Handshake and boot: `send_uffd_handshake(&[RawFd])`, `uffd_mappings`,
    `MachineConfig.mem_backend` (only `SharedMemfd`), handshake in
    `build_microvm_for_boot` after all regions are registered with KVM,
@@ -1402,9 +1381,6 @@ user can see.
    `Full`/`Diff`) for the finalize step, writing vmstate and no guest memory;
    `KvmVm::snapshot_memory_layout`, `VmmData::SnapshotMemory`, 200 body;
    `Full`/`Diff` `snapshot/create` unchanged from upstream; swagger.
-1. `VirtioDevice::prepare_dirty_tracking_reset` with the virtio-net
-   implementation, driven by `Vmm::dirty_pages`; swagger. (The hook goes away
-   with mark-after-write, next list.)
 1. Example handlers: `Handshake` with all fds, `fstat`-based fd classification,
    optional memory file, `copy_pages` from the two Roaring sets, control socket,
    unit tests.
@@ -1412,16 +1388,20 @@ user can see.
    document, `snapshot-support.md`,
    `handling-page-faults-on-snapshot-resume.md`, `ballooning.md`, CHANGELOG.
 
+**Landed on `main` independently of the branch**
+
+1. Mark after writing everywhere: `IoVecBufferMut` marks the bytes a write or a
+   tap `readv` filled (`mark_dirty_host`), the block engines mark the prefix a
+   read filled, the used ring records its writes per queue and
+   `DeviceManager::commit_dirty` folds them into the bitmap before every
+   consumption. This replaced the branch's `prepare_dirty_tracking_reset` hook,
+   the re-mark of the rings after every consumption and `fault_in_marked_range`,
+   all three dropped on rebase; the Kani model models the used ring's deferred
+   commit instead of mark-ahead. (The branch already consumed Firecracker's
+   bitmap with `get_and_reset()`, in both `snapshot_layout` and `dump_dirty`.)
+
 **Next, before leaving developer preview**
 
-1. *(no API)* Mark after writing in `IoVecBufferMut` (§7, "What changes when
-   device I/O leaves the VMM thread", item 2); then remove
-   `prepare_dirty_tracking_reset` and the RX-buffer call to
-   `fault_in_marked_range`. Extend the Kani model with device operations at the
-   race points and a `should_panic` harness for mark-ahead under concurrency.
-1. *(no API)* Consume Firecracker's bitmap with `get_and_reset()` in both
-   `snapshot_layout` and `dump_dirty`; fold back the swapped words on error.
-   Model consumption as a swap in Kani.
 1. Metrics: `mem_backend.*` (§11).
 1. aarch64 run of the integration tests.
 1. Decide whether Firecracker's own `Diff` keeps writing zero pages for
@@ -1464,11 +1444,11 @@ user can see.
   ones the fourth, and Roaring replaced both after measuring (§7). The
   authoritative set is a superset of the modified resident pages, not promised
   to be exact.
-- Firecracker upholds "dirty ⇒ memfd authoritative or zero" by faulting in every
-  range it marks dirty ahead of writing it (`fault_in_marked_range`), and takes
-  `mincore` after reading the dirty state. `discard_range` leaves every page of
-  a discarded range reading as zero (freed, or zero-written where a huge page
-  cannot be freed) before marking it.
+- Firecracker upholds "dirty ⇒ memfd authoritative or zero" by marking a page
+  dirty only after writing it (a page marked after a write is resident), and
+  takes `mincore` after reading the dirty state. `discard_range` leaves every
+  page of a discarded range reading as zero (freed, or zero-written where a huge
+  page cannot be freed) before marking it.
 - `snapshot/create` is unchanged from upstream, backend or not; the backend
 - `Full`/`Diff` `snapshot/create` is unchanged from upstream, backend or not;
   the backend workflow uses two existing-style endpoints:
@@ -1588,11 +1568,13 @@ document:
   every scenario measured (§7), at the cost of one dependency.
 - "Dirty ⇒ memfd authoritative" did not hold for pages marked ahead of a write
   (virtqueue rings, RX buffers) after a UFFD restore. Faulting those ranges in
-  when they are marked (`fault_in_marked_range`) made it hold, and made the
+  when they were marked (`fault_in_marked_range`) made it hold, and made the
   backend's `PopulatedPages` unnecessary: that record was "memfd is
   authoritative here", fed by the handler's own populates and by `remove`
   events; residency now covers the former and the dirty mark `discard_range`
-  leaves covers the latter, from the other end of the same events.
+  leaves covers the latter, from the other end of the same events. Marking after
+  the write, which `main` adopted since, then made the fault-in itself
+  unnecessary: there is no longer any page marked before it is written.
 - The third version had the backend produce `Full` snapshots from a layout that
   needed a persistent `discarded` bitmap in Firecracker (a `Full` cannot use the
   consumed dirty state, and residency cannot tell a released hole from a
