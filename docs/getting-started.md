@@ -379,7 +379,10 @@ Only a single set of credentials is supported. `devtool` cannot fetch multiple
 private repos which rely on different credentials.
 
 `tools/devtool build` builds in `debug` to build release binaries pass
-`--release` e.g. `tools/devtool build --release`
+`--release` e.g. `tools/devtool build --release`. Release binaries are
+profile-guided optimized: `devtool` first builds instrumented binaries and runs
+a boot/snapshot/restore workload against them, which needs KVM and the CI guest
+artifacts. Pass `--no-pgo` to skip that step.
 
 Documentation on `devtool` can be seen with `tools/devtool --help`.
 

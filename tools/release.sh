@@ -64,6 +64,7 @@ function get-firecracker-version {
 LIBC=musl
 PROFILE=dev
 MAKE_RELEASE=
+PGO=
 
 #### Option parsing
 
@@ -76,6 +77,10 @@ $0 - Build Firecracker
    --profile PROFILE  - Build with the specified Rust profile (default: dev)
    --libc [musl|gnu]  - Build with the specified libc (default: musl)
    --make-release     - Make release artifacts
+   --pgo-instrument   - Only build PGO-instrumented binaries under
+                        build/pgo/instrumented
+   --pgo-use DIR      - Build with the PGO profiles (*.profraw) the training
+                        workload collected under DIR
 EOF
           exit 0
       ;;
@@ -90,6 +95,15 @@ EOF
     --make-release)
       MAKE_RELEASE=true
       shift 1
+      ;;
+    --pgo-instrument)
+      PGO=instrument
+      shift 1
+      ;;
+    --pgo-use)
+      PGO=use
+      PGO_PROFRAW_DIR="$2"
+      shift 2
       ;;
     *)
       echo "Unknown option $1"
@@ -131,7 +145,59 @@ if [ "$LIBC" == "gnu" ]; then
     ARTIFACTS=(firecracker seccompiler-bin rebase-snap cpu-template-helper snapshot-editor)
 fi
 
-say "Building version=$VERSION, profile=$PROFILE, target=$CARGO_TARGET, Rust toolchain=${RUST_TOOLCHAIN}..."
+# # # # Profile-guided optimization
+#
+# Release binaries are built in three steps: an instrumented Firecracker
+# (--pgo-instrument), the training workload in
+# tests/integration_tests/build/test_pgo_training.py, which boots, snapshots
+# and restores microVMs with it and collects the profiles, and the final build
+# (--pgo-use), which feeds the merged profile to rustc. The profile moves
+# never-executed code out of the pages Firecracker touches at runtime, which
+# shrinks the resident part of the binary.
+PGO_DIR=build/pgo
+PGO_INSTRUMENTED_DIR=$PGO_DIR/instrumented
+PGO_PROFILE=$PGO_DIR/firecracker.profdata
+
+if [ -n "$PGO" ] && [ "$PROFILE" != "release" ]; then
+    die "--pgo-instrument/--pgo-use require --profile release"
+fi
+
+if [ "$PGO" = "instrument" ]; then
+    say "Building PGO-instrumented Firecracker..."
+    rm -rf "$PGO_DIR"
+    mkdir -p "$PGO_INSTRUMENTED_DIR"
+    # Same package selection as the final build below: cargo folds it into
+    # the crate hash that mangled symbol names carry, and the profile is keyed
+    # by those names. Building `-p firecracker` alone would produce a profile
+    # that matches nothing in a `--workspace` build.
+    # The profile is written to /pgo inside the jail when the process exits.
+    CARGO_TARGET_DIR=$PGO_DIR/target RUSTFLAGS="-Cprofile-generate=/pgo" \
+        cargo build --target "$CARGO_TARGET" --release --workspace --bins --examples
+    # The training workload needs the jailer and compiles its own seccomp filter.
+    for file in firecracker jailer seccompiler-bin; do
+        cp "$PGO_DIR/target/$CARGO_TARGET/release/$file" "$PGO_INSTRUMENTED_DIR/"
+    done
+    say "Instrumented binaries placed under $PGO_INSTRUMENTED_DIR"
+    exit 0
+fi
+
+if [ "$PGO" = "use" ]; then
+    profraws=("$PGO_PROFRAW_DIR"/*.profraw)
+    if [ ! -e "${profraws[0]}" ]; then
+        die "No PGO profiles under $PGO_PROFRAW_DIR. Run the training workload first."
+    fi
+    host_triple=$(rustc -vV | awk '/^host:/ { print $2 }')
+    llvm_profdata="$(rustc --print sysroot)/lib/rustlib/$host_triple/bin/llvm-profdata"
+    mkdir -p "$PGO_DIR"
+    say "Merging ${#profraws[@]} PGO profiles into $PGO_PROFILE..."
+    "$llvm_profdata" merge -o "$PGO_PROFILE" "${profraws[@]}"
+    # cold-count=0 sends only never-executed functions to .text.unlikely;
+    # the default threshold also demotes rarely-run code that every microVM
+    # still touches once.
+    export RUSTFLAGS="-Cprofile-use=$PWD/$PGO_PROFILE -Cllvm-args=-profile-summary-cold-count=0"
+fi
+
+say "Building version=$VERSION, profile=$PROFILE, target=$CARGO_TARGET, Rust toolchain=${RUST_TOOLCHAIN}, PGO=${PGO:-off}..."
 # shellcheck disable=SC2086
 cargo build --target "$CARGO_TARGET" $CARGO_OPTS --workspace --bins --examples
 

@@ -44,6 +44,13 @@ and this project adheres to
 
 ### Changed
 
+- Release binaries are now built with profile-guided optimization. The release
+  build runs a boot/snapshot/restore workload against an instrumented
+  Firecracker and uses the collected profile to group the code each microVM
+  executes, which reduces the resident size of the Firecracker binary by about
+  550 KiB per microVM. The binaries are functionally unchanged, but their layout
+  depends on the training run, so two builds of the same commit are no longer
+  byte-for-byte identical.
 - [#6228](https://github.com/firecracker-microvm/firecracker/pull/6228): Device
   hotplug now requires `pcie_hotplug_ports` to be set in the machine
   configuration, and only devices behind a PCIe root port can be hot-unplugged.

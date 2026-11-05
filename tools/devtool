@@ -444,12 +444,16 @@ cmd_help() {
     echo ""
     echo "Available commands:"
     echo ""
-    echo "    build [--debug|--release] [-l|--libc musl|gnu]"
+    echo "    build [--debug|--release] [--no-pgo] [-l|--libc musl|gnu]"
     echo "        Build the Firecracker binaries."
     echo "        Firecracker is built using the Rust build system (cargo). All arguments after --"
     echo "        will be passed through to cargo."
     echo "        --debug               Build the debug binaries. This is the default."
-    echo "        --release             Build the release binaries."
+    echo "        --release             Build the release binaries. Release (musl) binaries are"
+    echo "                              profile-guided optimized: an instrumented Firecracker is"
+    echo "                              built first and the training workload is run against it,"
+    echo "                              which needs KVM and the CI guest artifacts."
+    echo "        --no-pgo              Skip the profile-guided optimization of a release build."
     echo "        -l, --libc musl|gnu   Choose the libc flavor against which Firecracker will"
     echo "                              be linked. Default is musl."
     echo "        --ssh-keys            Provide the paths to the public and private SSH keys on the host"
@@ -577,6 +581,7 @@ cmd_build() {
     # By default, we'll build the debug binaries.
     profile="debug"
     libc="musl"
+    pgo=1
 
 
     # Parse any command line args.
@@ -585,6 +590,7 @@ cmd_build() {
             "-h"|"--help")  { cmd_help; exit 1;     } ;;
             "--debug")      { profile="debug";      } ;;
             "--release")    { profile="release";    } ;;
+            "--no-pgo")     { pgo=0;                } ;;
             "--rev")       { shift; revision=$1; } ;;
             "--ssh-keys")
                 shift
@@ -637,6 +643,22 @@ cmd_build() {
       extra_args="$extra_args --volume $tmp_dir:$tmp_dir:z"
     fi
 
+    # Release binaries are profile-guided optimized (see tools/release.sh).
+    release_args=""
+    host_workdir="${tmp_dir:-$FC_ROOT_DIR}"
+    if [ $pgo -eq 1 ] && [ "$profile" = "release" ]; then
+        if [ "$libc" != "musl" ]; then
+            say_warn "Skipping PGO: the training workload runs under the jailer, which needs musl."
+        elif ! grep -q -- "--pgo-use" "$host_workdir/tools/release.sh"; then
+            say_warn "Skipping PGO: revision $revision predates it."
+        else
+            # Keep the instrumented binaries and profiles of each revision apart.
+            pgo_tag="pgo${revision:+-${revision//\//_}}"
+            pgo_train "$workdir" "$host_workdir" "$pgo_tag" ${extra_args}
+            release_args="--pgo-use $CTR_FC_BUILD_DIR/$pgo_tag/profraw"
+        fi
+    fi
+
     # Run the cargo build process inside the container.
     # We don't need any special privileges for the build phase, so we run the
     # container as the current user/group.
@@ -645,7 +667,7 @@ cmd_build() {
         --workdir "$workdir" \
         ${extra_args} \
         -- \
-        ./tools/release.sh --libc $libc --profile $profile
+        ./tools/release.sh --libc $libc --profile $profile $release_args
     ret=$?
 
     # Running as root would have created some root-owned files under the build
@@ -664,13 +686,63 @@ cmd_build() {
     return $ret
 }
 
+# Profile-guided optimization for release builds: build instrumented binaries
+# from the checkout at $ctr_workdir ($host_workdir on the host, extra arguments
+# go to docker), run the training workload against them under the jailer, and
+# leave the profiles under build/$tag/profraw for `release.sh --pgo-use`.
+#
+# The workload comes from this checkout even when another revision is built
+# (`build --rev`), so the instrumented binaries are copied under this
+# checkout's build directory, which is what the test container mounts.
+pgo_train() {
+    local ctr_workdir=$1 host_workdir=$2 tag=$3
+    shift 3
+    local pgo_dir="$FC_ROOT_DIR/build/$tag"
+
+    ensure_build_dir
+    run_devctr \
+        --privileged \
+        --workdir "$ctr_workdir" \
+        "$@" \
+        -- \
+        ./tools/release.sh --libc musl --profile release --pgo-instrument
+    ok_or_die "Failed to build the PGO-instrumented binaries!"
+    if [ "$host_workdir/build/pgo" != "$pgo_dir" ]; then
+        rm -rf "$pgo_dir"
+        mkdir -p "$pgo_dir"
+        cp -r "$host_workdir/build/pgo/instrumented" "$pgo_dir/"
+    fi
+
+    say "Running the PGO training workload..."
+    # `build --rev` runs from the other revision's clone; the artifact paths
+    # are relative to this checkout.
+    pushd "$FC_ROOT_DIR" > /dev/null
+    cmd_ensure_current_artifacts
+    popd > /dev/null
+    acquire_shared_kvm_lock
+    # Same container setup as `test`: the jailer needs root, cgroups and netns.
+    run_devctr \
+        --privileged \
+        --security-opt seccomp=unconfined \
+        --ulimit nofile=4096:4096 \
+        --ulimit memlock=-1:-1 \
+        --workdir "$CTR_FC_ROOT_DIR" \
+        -- \
+        ./tools/test.sh -m nonci integration_tests/build/test_pgo_training.py \
+            --binary-dir "$CTR_FC_BUILD_DIR/$tag/instrumented"
+    ok_or_die "PGO training workload failed!"
+    cmd_fix_perms
+}
+
 function cmd_make_release {
     ensure_build_dir
+    pgo_train "$CTR_FC_ROOT_DIR" "$FC_ROOT_DIR" pgo
     run_devctr \
         --privileged \
         --workdir "$CTR_FC_ROOT_DIR" \
         -- \
-        ./tools/release.sh --libc musl --profile release --make-release
+        ./tools/release.sh --libc musl --profile release --make-release \
+            --pgo-use "$CTR_FC_BUILD_DIR/pgo/profraw"
     sudo chown -Rc $USER: release*
 }
 

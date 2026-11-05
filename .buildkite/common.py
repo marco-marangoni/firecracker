@@ -263,9 +263,14 @@ def random_str(k: int):
     return "".join(random.choices(string.hexdigits, k=k))
 
 
-def ab_revision_build(revision):
-    """Generate steps for building an A/B-test revision"""
-    return [f"./tools/devtool -y build --rev {revision} --release"]
+def ab_revision_build(revision, side):
+    """Generate steps for building an A/B-test revision
+
+    `REVISION_<side>_BUILD_OPTS` adds options to that side's `devtool build`,
+    e.g. `--no-pgo` to A/B-test the profile-guided optimization itself.
+    """
+    opts = os.environ.get(f"REVISION_{side}_BUILD_OPTS", "")
+    return [f"./tools/devtool -y build --rev {revision} --release {opts}".rstrip()]
 
 
 def shared_build():
@@ -281,16 +286,16 @@ def shared_build():
     if rev_a is not None:
         rev_b = os.environ.get("REVISION_B")
         assert rev_b is not None, "REVISION_B environment variable not set"
-        build_cmds = ab_revision_build(rev_a)
+        build_cmds = ab_revision_build(rev_a, "A")
         if rev_a != rev_b:
-            build_cmds += ab_revision_build(rev_b)
+            build_cmds += ab_revision_build(rev_b, "B")
     elif os.environ.get("BUILDKITE_MERGE_QUEUE_BASE_COMMIT"):
         build_cmds = ab_revision_build(
-            os.environ["BUILDKITE_MERGE_QUEUE_BASE_COMMIT"]
+            os.environ["BUILDKITE_MERGE_QUEUE_BASE_COMMIT"], "A"
         ) + ["./tools/devtool -y build --release"]
     elif os.environ.get("BUILDKITE_PULL_REQUEST", "false") != "false":
         build_cmds = ab_revision_build(
-            os.environ.get("BUILDKITE_PULL_REQUEST_BASE_BRANCH", "main")
+            os.environ.get("BUILDKITE_PULL_REQUEST_BASE_BRANCH", "main"), "A"
         ) + ["./tools/devtool -y build --release"]
     else:
         build_cmds = ["./tools/devtool -y build --release"]
